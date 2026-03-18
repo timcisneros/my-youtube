@@ -1,0 +1,214 @@
+      // --- Subtitle loading ---
+      window._subtitleList = [];
+      window._captionCues = [];
+      window._captionsVisible = false;
+
+      function parseVTT(text) {
+        var cues = [];
+        var blocks = text.replace(/\r\n/g, '\n').split('\n\n');
+        for (var i = 0; i < blocks.length; i++) {
+          var lines = blocks[i].trim().split('\n');
+          for (var j = 0; j < lines.length; j++) {
+            var match = lines[j].match(/^(\d{2}:\d{2}[:\.][\d.]+)\s*-->\s*(\d{2}:\d{2}[:\.][\d.]+)/);
+            if (match) {
+              var raw = lines.slice(j + 1).join('\n').trim();
+              if (!raw) break;
+              var plainText = raw.replace(/<[^>]+>/g, '').trim();
+              if (!plainText) break;
+              // Parse word-level <HH:MM:SS.mmm><c> tags from auto-captions
+              var words = [];
+              var cueStart = parseTimestamp(match[1]);
+              var re = /<(\d{2}:\d{2}[:\.][\d.]+)><c>(.*?)<\/c>/g;
+              var wm, firstTagIdx = -1;
+              while ((wm = re.exec(raw)) !== null) {
+                if (firstTagIdx < 0) firstTagIdx = wm.index;
+                words.push({ time: parseTimestamp(wm[1]), text: wm[2] });
+              }
+              // Leading text before first <c> tag gets the cue start time
+              if (words.length && firstTagIdx > 0) {
+                var leading = raw.substring(0, firstTagIdx).replace(/<[^>]+>/g, '').trim();
+                if (leading) words.unshift({ time: cueStart, text: leading });
+              }
+              cues.push({
+                start: cueStart,
+                end: parseTimestamp(match[2]),
+                text: plainText,
+                words: words.length > 0 ? words : null
+              });
+              break;
+            }
+          }
+        }
+        return cues;
+      }
+
+      function parseTimestamp(ts) {
+        var parts = ts.replace('.', ':').split(':');
+        if (parts.length === 3) parts.unshift('0');
+        return (+parts[0]) * 3600 + (+parts[1]) * 60 + (+parts[2]) + (+parts[3]) / 1000;
+      }
+
+      var _lastCueKey = '';
+      function renderCaptions() {
+        if (!window._captionsVisible || !window._captionCues.length) {
+          captionOverlay.textContent = '';
+          _lastCueKey = '';
+          return;
+        }
+        var t = video.currentTime;
+        var activeCue = null;
+        var visibleText = '';
+        for (var i = 0; i < window._captionCues.length; i++) {
+          var c = window._captionCues[i];
+          if (t >= c.start && t < c.end) {
+            activeCue = c;
+            if (c.words) {
+              var parts = [];
+              for (var w = 0; w < c.words.length; w++) {
+                if (t >= c.words[w].time) parts.push(c.words[w].text);
+                else break;
+              }
+              visibleText = parts.join('');
+            } else {
+              visibleText = c.text;
+            }
+            break;
+          }
+        }
+        if (!visibleText) {
+          captionOverlay.textContent = '';
+          _lastCueKey = '';
+          return;
+        }
+        // New cue — replace span (triggers scroll-up animation)
+        var cueKey = activeCue.start + ':' + activeCue.end;
+        if (cueKey !== _lastCueKey) {
+          _lastCueKey = cueKey;
+          captionOverlay.innerHTML = '';
+          var span = document.createElement('span');
+          span.textContent = visibleText;
+          captionOverlay.appendChild(span);
+        } else {
+          // Same cue — just update text (words appear in place)
+          var span = captionOverlay.querySelector('span');
+          if (span) span.textContent = visibleText;
+        }
+      }
+
+      var captionRaf;
+      var _lastCaptionTime = -1;
+      function startCaptionLoop() {
+        if (!window._captionsVisible || !window._captionCues || !window._captionCues.length) {
+          captionRaf = null;
+          return;
+        }
+        var ct = video.currentTime;
+        if (Math.abs(ct - _lastCaptionTime) > 0.05) {
+          _lastCaptionTime = ct;
+          renderCaptions();
+        }
+        captionRaf = requestAnimationFrame(startCaptionLoop);
+      }
+      function stopCaptionLoop() {
+        if (captionRaf) { cancelAnimationFrame(captionRaf); captionRaf = null; }
+        _lastCaptionTime = -1;
+        captionOverlay.textContent = '';
+      }
+
+      window._selectCaption = function (idx) {
+        if (idx < 0 || idx >= window._subtitleList.length) {
+          window._captionsVisible = false;
+          window._captionCues = [];
+          stopCaptionLoop();
+          window._activeCaptionIdx = -1;
+          rebuildCaptionSubmenu();
+          return Promise.resolve();
+        }
+        var sub = window._subtitleList[idx];
+        return fetch('/api/stream/<%= video.videoId %>/subtitles/' + sub.lang + '.vtt?token=' + streamToken)
+          .then(function (r) { return r.ok ? r.text() : ''; })
+          .then(function (vtt) {
+            window._captionCues = vtt ? parseVTT(vtt) : [];
+            window._captionsVisible = true;
+            window._activeCaptionIdx = idx;
+            startCaptionLoop();
+            rebuildCaptionSubmenu();
+          });
+      };
+
+      window._activeCaptionIdx = -1;
+
+      function rebuildCaptionSubmenu() {
+        var children = captionMenu.querySelectorAll('button:not(.player-back-btn)');
+        for (var i = 0; i < children.length; i++) children[i].remove();
+
+        function makeCheckmark() {
+          var svg = document.createElementNS(SVG_NS, 'svg');
+          svg.setAttribute('viewBox', '0 -960 960 960');
+          svg.setAttribute('fill', 'currentColor');
+          svg.classList.add('material-svg-icon', 'player-chosen-item');
+          svg.setAttribute('aria-hidden', 'true');
+          var p = document.createElementNS(SVG_NS, 'path');
+          p.setAttribute('d', 'm382-354 339-339q12-12 28-12t28 12q12 12 12 28.5T777-636L410-268q-12 12-28 12t-28-12L182-440q-12-12-11.5-28.5T183-497q12-12 28.5-12t28.5 12l142 143Z');
+          svg.appendChild(p);
+          return svg;
+        }
+
+        var langs = window._subtitleList;
+
+        for (var j = 0; j < langs.length; j++) {
+          (function (idx) {
+            var btn = document.createElement('button');
+            var span = document.createElement('span');
+            span.textContent = langs[idx].name || langs[idx].lang;
+            if (window._activeCaptionIdx === idx) {
+              span.classList.add('player-chosen-item');
+              btn.appendChild(makeCheckmark());
+            }
+            btn.appendChild(span);
+            btn.addEventListener('click', function () {
+              window._selectCaption(idx);
+              if (window._ccUpdateVisual) window._ccUpdateVisual(true);
+            });
+            captionMenu.appendChild(btn);
+          })(j);
+        }
+
+        var offBtn = document.createElement('button');
+        var offSpan = document.createElement('span');
+        offSpan.textContent = 'Off';
+        if (window._activeCaptionIdx === -1) {
+          offSpan.classList.add('player-chosen-item');
+          offBtn.appendChild(makeCheckmark());
+        }
+        offBtn.appendChild(offSpan);
+        offBtn.addEventListener('click', function () {
+          window._selectCaption(-1);
+          if (window._ccUpdateVisual) window._ccUpdateVisual(false);
+        });
+        captionMenu.appendChild(offBtn);
+
+        if (_captionOverflowStateSpan) {
+          _captionOverflowStateSpan.textContent = window._activeCaptionIdx >= 0
+            ? (langs[window._activeCaptionIdx].name || langs[window._activeCaptionIdx].lang)
+            : 'Off';
+        }
+      }
+
+      window._loadSubtitles = function () {
+        fetch('/api/stream/<%= video.videoId %>/subtitles?token=' + streamToken)
+          .then(function (r) { return r.ok ? r.json() : []; })
+          .then(function (langs) {
+            window._subtitleList = langs;
+            if (!langs.length) return;
+            fetch('/api/stream/<%= video.videoId %>/subtitles/' + langs[0].lang + '.vtt?token=' + streamToken)
+              .then(function (r) { return r.ok ? r.text() : ''; })
+              .then(function (vtt) {
+                if (vtt) window._captionCues = parseVTT(vtt);
+              })
+              .catch(function () {});
+            rebuildCaptionSubmenu();
+            updateCcVisual();
+          })
+          .catch(function () {});
+      };

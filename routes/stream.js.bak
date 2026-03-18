@@ -1,0 +1,1838 @@
+const express = require('express');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const { Readable } = require('stream');
+const { pipeline } = require('stream/promises');
+const fs = require('fs');
+const path = require('path');
+const { Agent: UndiciAgent, setGlobalDispatcher } = require('undici');
+const { ytdlpArgs, ytdlpBrowserArgs, refreshCookiesFile } = require('../ytdlp');
+const { cacheVideoDetailsFromInfo, getCachedDuration } = require('../youtube');
+const { fetchVideoMetaBatch } = require('../yt-meta');
+const { isYouTubeCdnUrl, extractViaInnertube, extractViaInvidious, fetchLiveStoryboardSpec, USER_AGENT } = require('../extractors');
+const { validateStreamToken } = require('../auth');
+const db = require('../db');
+const LRUMap = require('../lib/lru-map');
+const { SharedLRUMap, acquireLock, releaseLock, hasRedis, getRedisClient } = require('../lib/cache');
+const router = express.Router();
+
+// Validate :videoId params across all stream routes
+router.param('videoId', (req, res, next, value) => {
+  if (!/^[A-Za-z0-9_-]{11}$/.test(value)) return res.status(400).end('Invalid video ID');
+  next();
+});
+
+// Stream token auth — validates HMAC-signed token for all routes except
+// prefetch, status, poster, and thumb (lightweight/public endpoints)
+router.use('/:videoId', (req, res, next) => {
+  const suffix = req.path.split('/').pop();
+  if (suffix === 'prefetch' || suffix === 'status' || suffix === 'poster' || suffix === 'thumb') return next();
+  const token = req.query.token;
+  if (!token || !validateStreamToken(req.params.videoId, token)) {
+    return res.status(401).end();
+  }
+  next();
+});
+
+// Batch endpoints (no videoId param) — require token in body or skip auth
+// /durations and /durations-live are data-only, no extraction triggered
+
+// Persistent connection pool for YouTube CDN — reuses TCP+TLS across segment requests
+setGlobalDispatcher(new UndiciAgent({
+  keepAliveTimeout: 60_000,
+  keepAliveMaxTimeout: 120_000,
+  connections: 128,
+  pipelining: 1
+}));
+
+// Persistent download directory
+const DOWNLOADS_DIR = path.join(__dirname, '..', 'data', 'downloads');
+fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+
+const execFileAsync = promisify(execFile);
+
+// yt-dlp concurrency semaphore — caps parallel yt-dlp processes across all videos
+// When Redis is available, uses distributed INCR/DECR for cross-worker coordination
+const MAX_CONCURRENT_YTDLP = parseInt(process.env.MAX_CONCURRENT_YTDLP, 10) || 4;
+let activeYtdlp = 0;
+const ytdlpQueue = [];
+
+async function withYtdlpSlot(fn) {
+  if (hasRedis()) {
+    return _withYtdlpSlotRedis(fn);
+  }
+  // In-process semaphore (single-process mode)
+  if (activeYtdlp >= MAX_CONCURRENT_YTDLP) {
+    await new Promise(resolve => ytdlpQueue.push(resolve));
+  }
+  activeYtdlp++;
+  try {
+    return await fn();
+  } finally {
+    activeYtdlp--;
+    if (ytdlpQueue.length) ytdlpQueue.shift()();
+  }
+}
+
+async function _withYtdlpSlotRedis(fn) {
+  const redis = getRedisClient();
+  const key = 'ytdlp:semaphore';
+  // Poll until a slot opens
+  while (true) {
+    const count = await redis.incr(key);
+    // Set safety TTL on first use
+    if (count === 1) await redis.expire(key, 60);
+    if (count <= MAX_CONCURRENT_YTDLP) break;
+    await redis.decr(key);
+    await new Promise(r => setTimeout(r, 200 + Math.random() * 300));
+  }
+  try {
+    return await fn();
+  } finally {
+    await redis.decr(key).catch(() => {});
+  }
+}
+
+// Privacy-safe headers for outbound proxy requests — no Referer, no Cookie, minimal UA
+const PROXY_HEADERS = { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', Referer: '', Cookie: '' };
+
+// Fetch with connection timeout (doesn't kill active streams, just prevents hanging on connect)
+function fetchWithConnTimeout(url, opts, ms) {
+  ms = ms || 15000;
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), ms);
+  const merged = { ...opts, signal: c.signal };
+  return fetch(url, merged).then(resp => { clearTimeout(t); return resp; }, err => { clearTimeout(t); throw err; });
+}
+
+// Strip yt-dlp http_headers down to privacy-safe defaults.
+// yt-dlp returns headers like Accept-Language (leaks locale), Sec-Fetch-Mode (fingerprints
+// extraction), and User-Agent. CDN URLs are pre-signed so no auth headers are needed.
+function sanitizeHeaders() {
+  return { ...PROXY_HEADERS };
+}
+
+// Errors expected when the client disconnects mid-stream (e.g. page refresh)
+function isClientGone(err) {
+  return err.code === 'ERR_STREAM_PREMATURE_CLOSE'
+    || err.code === 'ERR_STREAM_DESTROYED'
+    || err.code === 'ECONNRESET'
+    || err.code === 'ERR_STREAM_WRITE_AFTER_END'
+    || (err.message && err.message.includes('closed or destroyed'));
+}
+
+// Cache yt-dlp output per videoId (TTL 4 hours)
+const formatCache = new SharedLRUMap(200, 'fmt');
+// Cache generated MPD per videoId
+const mpdCache = new SharedLRUMap(500, 'mpd');
+// Fast lookup: "videoId:itag" → direct YouTube CDN URL
+const urlLookup = new SharedLRUMap(2000, 'url');
+// Cache MP4 probe results to avoid redundant Range requests for same format
+const mp4ProbeCache = new LRUMap(500);
+// Deduplicates concurrent async calls for the same key.
+// While a call for key K is in-flight, subsequent calls return the same promise.
+function dedup(map, key, fn) {
+  if (map.has(key)) return map.get(key);
+  const promise = fn();
+  map.set(key, promise);
+  promise.finally(() => map.delete(key));
+  return promise;
+}
+const extractionInflight = new Map();
+const CACHE_TTL = 4 * 60 * 60 * 1000;
+const PROACTIVE_REFRESH_AGE = 3 * 60 * 60 * 1000; // refresh in background when cache older than 3h
+const MAX_BG_DOWNLOADS = 4;
+const BG_MAX_AGE = 60 * 60 * 1000; // 1 hour
+
+// Background download manager: "videoId:itag" → { filePath, bytesDownloaded, totalSize, done, startedAt, abort }
+const bgDownloads = new Map();
+
+function startBgDownload(videoId, itag, url, headers, meta) {
+  const key = `${videoId}:${itag}`;
+  if (bgDownloads.has(key)) return;
+
+  // Cap concurrent downloads
+  let active = 0;
+  for (const v of bgDownloads.values()) { if (!v.done) active++; }
+  if (active >= MAX_BG_DOWNLOADS) return;
+
+  const filePath = path.join(DOWNLOADS_DIR, `mycache-${videoId}-${itag}.dat`);
+  const entry = { filePath, bytesDownloaded: 0, totalSize: 0, done: false, startedAt: Date.now(), abort: null };
+  bgDownloads.set(key, entry);
+
+  // Persist to DB if metadata provided (first format triggers the upsert)
+  if (meta) {
+    db.upsertDownload(videoId, meta.title, meta.channelTitle, meta.thumbnail);
+  }
+
+  const controller = new AbortController();
+  entry.abort = () => controller.abort();
+
+  let lastDbUpdate = 0;
+
+  // Auto-abort if download stalls for 2 minutes (no data received)
+  let stallTimer = setTimeout(() => controller.abort(), 120_000);
+
+  (async () => {
+    try {
+      const resp = await fetchWithConnTimeout(url, { headers: { ...headers }, signal: controller.signal });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const cl = resp.headers.get('content-length');
+      if (cl) entry.totalSize = parseInt(cl, 10);
+      const ws = fs.createWriteStream(filePath);
+      for await (const chunk of resp.body) {
+        clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => controller.abort(), 120_000);
+        ws.write(chunk);
+        entry.bytesDownloaded += chunk.length;
+        // Update DB progress every ~1MB
+        if (entry.bytesDownloaded - lastDbUpdate > 1048576) {
+          lastDbUpdate = entry.bytesDownloaded;
+          // Aggregate all format downloads for this video
+          const agg = aggregateProgress(videoId);
+          db.updateDownloadProgress(videoId, agg.downloadedBytes, agg.totalBytes);
+        }
+      }
+      ws.end();
+      clearTimeout(stallTimer);
+      await new Promise((resolve, reject) => { ws.on('finish', resolve); ws.on('error', reject); });
+      entry.done = true;
+      console.log(`[bg-cache] ${key} complete (${(entry.bytesDownloaded / 1048576).toFixed(1)} MB)`);
+      // Check if all formats for this video are done
+      if (allFormatsDone(videoId)) {
+        db.completeDownload(videoId);
+      }
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        console.error(`[bg-cache] ${key} failed:`, err.message);
+        db.failDownload(videoId);
+      }
+      cleanupBgDownload(key);
+    }
+  })();
+}
+
+function aggregateProgress(videoId) {
+  let downloadedBytes = 0, totalBytes = 0;
+  for (const [key, entry] of bgDownloads) {
+    if (key.startsWith(videoId + ':')) {
+      downloadedBytes += entry.bytesDownloaded;
+      totalBytes += entry.totalSize;
+    }
+  }
+  return { downloadedBytes, totalBytes };
+}
+
+function allFormatsDone(videoId) {
+  for (const [key, entry] of bgDownloads) {
+    if (key.startsWith(videoId + ':') && !entry.done) return false;
+  }
+  return true;
+}
+
+function cleanupBgDownload(key) {
+  const entry = bgDownloads.get(key);
+  if (!entry) return;
+  if (entry.abort) try { entry.abort(); } catch {}
+  // Only delete the file if the download was incomplete
+  if (!entry.done) {
+    try { fs.unlinkSync(entry.filePath); } catch {}
+  }
+  bgDownloads.delete(key);
+}
+
+// Periodic cleanup: evict stuck downloads + sweep ALL TTL-based caches
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of bgDownloads) {
+    if (!entry.done && now - entry.startedAt > BG_MAX_AGE) {
+      console.log(`[bg-cache] evicting stuck ${key}`);
+      cleanupBgDownload(key);
+    }
+  }
+  // Sweep all TTL-based caches — prevents unbounded growth from one-time videos
+  for (const [key, entry] of formatCache) {
+    if (now > entry.expires) formatCache.delete(key);
+  }
+  for (const [key, entry] of mpdCache) {
+    if (now > entry.expires) mpdCache.delete(key);
+  }
+  for (const [key, entry] of urlLookup) {
+    if (now > entry.expires) urlLookup.delete(key);
+  }
+  for (const [key, entry] of hlsCache) {
+    if (now > entry.expires) hlsCache.delete(key);
+  }
+  for (const [key, entry] of vttCache) {
+    if (now > entry.expires) vttCache.delete(key);
+  }
+  for (const [key, entry] of liveStoryboardCache) {
+    if (now - entry.createdAt > 30 * 60 * 1000) liveStoryboardCache.delete(key);
+  }
+  for (const [key, entry] of storyboardUrlCache) {
+    if (now - entry.createdAt > CACHE_TTL) storyboardUrlCache.delete(key);
+  }
+  // extractionStatus entries should clear themselves, but sweep stale ones (>5min) as safety net
+  for (const [key, entry] of extractionStatus) {
+    if (now - entry.ts > 5 * 60 * 1000) extractionStatus.delete(key);
+  }
+}, 5 * 60 * 1000);
+
+// On startup: rebuild bgDownloads map from DB for completed downloads
+(function rebuildFromDb() {
+  const downloads = db.getAllDownloads();
+  for (const dl of downloads) {
+    if (dl.status !== 'complete') continue;
+    // Find all cached files for this video
+    try {
+      const files = fs.readdirSync(DOWNLOADS_DIR).filter(f => f.startsWith('mycache-' + dl.video_id + '-'));
+      for (const f of files) {
+        const m = f.match(/^mycache-(.+)-(.+)\.dat$/);
+        if (!m) continue;
+        const key = `${m[1]}:${m[2]}`;
+        const filePath = path.join(DOWNLOADS_DIR, f);
+        const stat = fs.statSync(filePath);
+        bgDownloads.set(key, {
+          filePath,
+          bytesDownloaded: stat.size,
+          totalSize: stat.size,
+          done: true,
+          startedAt: Date.now(),
+          abort: null
+        });
+      }
+    } catch {}
+  }
+  if (bgDownloads.size > 0) {
+    console.log(`[bg-cache] rebuilt ${bgDownloads.size} entries from DB`);
+  }
+})();
+
+// Stale-while-revalidate: return expired data immediately, refresh in background
+function getCached(videoId, { staleOk = false } = {}) {
+  const entry = formatCache.get(videoId);
+  if (!entry) return null;
+  if (Date.now() < entry.expires) return entry.data;
+  // Entry is expired — serve stale if allowed, trigger background refresh
+  if (staleOk) {
+    if (!extractionInflight.has(videoId)) {
+      // Keep stale entry — extractFormats overwrites on success via setCache.
+      // If refresh fails, stale data is still available for the next caller.
+      extractFormats(videoId).catch(err => console.warn(`[stale-refresh ${videoId}]`, err.message));
+    }
+    return entry.data;
+  }
+  formatCache.delete(videoId);
+  return null;
+}
+
+function setCache(videoId, data) {
+  formatCache.set(videoId, { data, expires: Date.now() + CACHE_TTL });
+}
+
+// Level 1 & 2: yt-dlp with cookies → yt-dlp without cookies
+async function extractViaYtdlp(videoId) {
+  return withYtdlpSlot(async () => {
+  let stdout;
+  try {
+    const result = await execFileAsync('yt-dlp', [
+      ...ytdlpArgs(), '--write-auto-subs', '-j', '--', videoId
+    ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
+    if (result.stderr) console.warn(`[yt-dlp ${videoId}]`, result.stderr.trim());
+    stdout = result.stdout;
+  } catch (err) {
+    const msg = err.stderr || err.message || '';
+    // Truly unavailable videos — don't bother with fallbacks
+    if (/live event will begin|Premieres in|is not currently live/i.test(msg)) {
+      return { formats: [], duration: 0, _unavailable: msg, _permanent: true };
+    }
+    // Bot detection → try fresh browser cookies (Level 2)
+    if (/Sign in to confirm you're not a bot|page needs to be reloaded/i.test(msg)) {
+      const browserArgs = ytdlpBrowserArgs();
+      if (browserArgs) {
+        console.warn(`[yt-dlp ${videoId}] bot detection, retrying with browser cookies`);
+        try {
+          const retry = await execFileAsync('yt-dlp', [
+            ...browserArgs, '--write-auto-subs', '-j', '--', videoId
+          ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
+          if (retry.stderr) console.warn(`[yt-dlp ${videoId}]`, retry.stderr.trim());
+          stdout = retry.stdout;
+          // Browser cookies worked — refresh cookies.txt in background so Level 1 works next time
+          refreshCookiesFile();
+        } catch {
+          return null; // fall through to next backend
+        }
+      } else {
+        return null; // fall through to next backend
+      }
+    } else if (/rate.?limit|isn't available, try again/i.test(msg)) {
+      return null; // fall through to next backend
+    } else {
+      // Cookie extraction problem → retry without cookies
+      const args = ytdlpArgs();
+      const hasCookieFlag = args.includes('--cookies-from-browser') || args.includes('--cookies');
+      const isCookieError = /could not extract cookies|cookie.*decrypt|keyring|secretstorage/i.test(msg);
+      if (hasCookieFlag && isCookieError) {
+        console.warn(`[yt-dlp ${videoId}] cookie extraction failed, retrying without cookies`);
+        try {
+          const retry = await execFileAsync('yt-dlp', [
+            '--write-auto-subs', '-j', '--', videoId
+          ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
+          if (retry.stderr) console.warn(`[yt-dlp ${videoId}]`, retry.stderr.trim());
+          stdout = retry.stdout;
+        } catch {
+          return null; // fall through to next backend
+        }
+      } else {
+        return null; // fall through to next backend
+      }
+    }
+  }
+  if (!stdout) return null;
+  const info = JSON.parse(stdout);
+  info._extractedVia = 'yt-dlp';
+  return info;
+  });
+}
+
+// Level 3: yt-dlp with alternative clients (no cookies, tries multiple client combos)
+const ALT_CLIENTS = [
+  'android_vr,web_safari',
+  'web_creator',
+  'mweb',
+  'tv',
+  'ios',
+];
+
+async function extractViaYtdlpAlt(videoId) {
+  return withYtdlpSlot(async () => {
+  for (const clients of ALT_CLIENTS) {
+    try {
+      const result = await execFileAsync('yt-dlp', [
+        '--no-warnings',
+        '--extractor-args', 'youtube:player_client=' + clients,
+        '-j', '--', videoId
+      ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
+      if (result.stderr) console.warn(`[yt-dlp-alt ${videoId}]`, result.stderr.trim());
+      const info = JSON.parse(result.stdout);
+      const fmts = (info.formats || []).filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http'));
+      if (fmts.length === 0) continue;
+      info._extractedVia = 'yt-dlp-alt:' + clients;
+      console.log(`[yt-dlp-alt ${videoId}] ${clients} returned ${fmts.length} direct formats`);
+      return info;
+    } catch (err) {
+      const msg = (err.stderr || err.message || '').toString().slice(0, 100);
+      // Bot detection = all clients on this IP will fail, stop trying
+      if (/Sign in to confirm|not a bot|page needs to be reloaded/i.test(msg)) {
+        console.warn(`[yt-dlp-alt ${videoId}] ${clients} bot-detected, skipping remaining clients`);
+        return null;
+      }
+      console.warn(`[yt-dlp-alt ${videoId}] ${clients} failed: ${msg}`);
+    }
+  }
+  return null;
+  });
+}
+
+// Extraction status visible to the client via /status endpoint
+const extractionStatus = new LRUMap(100);
+
+async function extractFormats(videoId) {
+  const cached = getCached(videoId);
+  if (cached) return cached;
+
+  // Cross-worker dedup: check if another worker already has the result in Redis
+  if (hasRedis()) {
+    const redisEntry = await formatCache.getAsync(videoId);
+    if (redisEntry && redisEntry.data && Date.now() < redisEntry.expires) return redisEntry.data;
+
+    // Try to acquire extraction lock — if another worker is extracting, wait for result
+    const lockAcquired = await acquireLock(`extract:${videoId}`, 60000);
+    if (!lockAcquired) {
+      // Another worker is extracting — poll Redis for result
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 1000 + Math.random() * 500));
+        const entry = await formatCache.getAsync(videoId);
+        if (entry && entry.data && Date.now() < entry.expires) return entry.data;
+      }
+      // Timeout — fall through and extract ourselves
+    }
+  }
+
+  return dedup(extractionInflight, videoId, async () => {
+    // Try extraction queue (separate worker process) if available
+    const { hasQueue: hasExtractionQueue, enqueueExtraction } = require('../lib/extraction-queue');
+    if (hasExtractionQueue()) {
+      try {
+        notifyExtractionStep(videoId, 'queue');
+        const result = await enqueueExtraction(videoId, 60000);
+        if (result && result.formats) {
+          const fmts = result.formats || [];
+          const hlsCount = fmts.filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.vcodec && f.vcodec !== 'none').length;
+          const directCount = fmts.filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http')).length;
+          console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct) via extraction-worker (${result._extractedVia || 'unknown'})`);
+          setCache(videoId, result);
+          cacheVideoDetailsFromInfo(videoId, result);
+          releaseLock(`extract:${videoId}`).catch(() => {});
+          return result;
+        }
+        // Queue returned empty/null — fall through to in-process extraction
+        console.warn(`[stream ${videoId}] extraction queue returned no result, falling back to in-process`);
+      } catch (err) {
+        console.warn(`[stream ${videoId}] extraction queue error, falling back to in-process:`, err.message);
+      }
+    }
+
+    // Level 1 & 2: yt-dlp (with cookies → browser cookies)
+    notifyExtractionStep(videoId,'yt-dlp');
+    let info = await extractViaYtdlp(videoId);
+
+    // If permanently unavailable (livestream, premiere), cache and return immediately
+    if (info && info._permanent) {
+      delete info._permanent;
+      notifyExtractionDone(videoId);
+      setCache(videoId, info);
+      return info;
+    }
+
+    // Level 3: yt-dlp with alternative client
+    if (!info) {
+      notifyExtractionStep(videoId,'yt-dlp-alt');
+      console.warn(`[stream ${videoId}] yt-dlp failed, trying alt client`);
+      info = await extractViaYtdlpAlt(videoId);
+    }
+
+    // Level 4: Innertube /player API (ANDROID_VR client)
+    if (!info) {
+      notifyExtractionStep(videoId,'innertube');
+      console.warn(`[stream ${videoId}] yt-dlp-alt failed, trying Innertube`);
+      info = await extractViaInnertube(videoId);
+    }
+
+    // Level 5: Invidious API (third-party extraction)
+    if (!info) {
+      notifyExtractionStep(videoId,'invidious');
+      console.warn(`[stream ${videoId}] Innertube failed, trying Invidious`);
+      info = await extractViaInvidious(videoId);
+    }
+
+    // All backends failed
+    if (!info) {
+      console.error(`[stream ${videoId}] all extraction backends failed`);
+      const empty = { formats: [], duration: 0, _unavailable: 'All extraction backends failed. Try again in a few minutes.' };
+      formatCache.set(videoId, { data: empty, expires: Date.now() + 2 * 60 * 1000 });
+      return empty;
+    }
+
+    const fmts = info.formats || [];
+    const hlsCount = fmts.filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.vcodec && f.vcodec !== 'none').length;
+    const directCount = fmts.filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http')).length;
+    console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct), duration=${info.duration}s via ${info._extractedVia || 'yt-dlp'}`);
+    setCache(videoId, info);
+    // Populate video details cache so /watch/details can return instantly
+    cacheVideoDetailsFromInfo(videoId, info);
+    releaseLock(`extract:${videoId}`).catch(() => {});
+    return info;
+  });
+}
+
+// Probe MP4 byte ranges (init + index) by walking box headers
+async function probeMP4Ranges(url, headers) {
+  let offset = 0, initEnd = 0, sidxStart = -1, sidxEnd = -1;
+
+  // Fetch a chunk starting at offset, return a Buffer
+  async function fetchChunk(start, size) {
+    const resp = await fetchWithConnTimeout(url, { headers: { ...headers, Range: `bytes=${start}-${start + size - 1}` } }, 8000);
+    if (!resp.ok && resp.status !== 206) return null;
+    return Buffer.from(await resp.arrayBuffer());
+  }
+
+  // First fetch — most YouTube MP4s have ftyp+moov+sidx within the first few KB
+  let buf = await fetchChunk(0, 4096);
+  if (!buf) return null;
+
+  while (true) {
+    // Need at least 8 bytes for a box header
+    if (offset + 8 > buf.length) {
+      // Fetch more from where we left off
+      const more = await fetchChunk(offset, 4096);
+      if (!more || more.length < 8) break;
+      buf = Buffer.concat([buf, more]);
+    }
+
+    let size = buf.readUInt32BE(offset);
+    const type = buf.toString('ascii', offset + 4, offset + 8);
+    if (size === 1) {
+      if (offset + 16 > buf.length) {
+        const more = await fetchChunk(buf.length, 4096);
+        if (!more) break;
+        buf = Buffer.concat([buf, more]);
+        if (offset + 16 > buf.length) break;
+      }
+      const bigSize = buf.readBigUInt64BE(offset + 8);
+      if (bigSize > BigInt(Number.MAX_SAFE_INTEGER)) break;
+      size = Number(bigSize);
+    }
+    if (size === 0 || size < 8) break;
+
+    if (type === 'moov') initEnd = offset + size - 1;
+    else if (type === 'sidx') { sidxStart = offset; sidxEnd = offset + size - 1; }
+
+    if (sidxStart >= 0 && initEnd > 0) break;
+
+    // Skip to next box — don't need to download the box body
+    offset += size;
+  }
+
+  return (initEnd > 0 && sidxStart >= 0) ? { initRange: '0-' + initEnd, indexRange: sidxStart + '-' + sidxEnd } : null;
+}
+
+function formatDuration(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = (sec % 60).toFixed(3);
+  return 'PT' + (h ? h + 'H' : '') + (m ? m + 'M' : '') + s + 'S';
+}
+
+function escapeXML(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function generateMPD(videoId, duration, formats, rangeMap) {
+  const dur = formatDuration(duration);
+  let xml = `<?xml version="1.0" encoding="UTF-8"?>\n<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="${dur}" minBufferTime="PT2S">\n<Period duration="${dur}">\n`;
+
+  // Video AdaptationSet
+  const videos = formats.filter(f => f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none'));
+  if (videos.length) {
+    xml += `<AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">\n`;
+    for (const f of videos) {
+      const r = rangeMap[f.format_id];
+      if (!r) continue;
+      xml += `<Representation id="${escapeXML(f.format_id)}" bandwidth="${f.tbr ? Math.round(f.tbr * 1000) : 0}" width="${f.width || 0}" height="${f.height || 0}" codecs="${escapeXML(f.vcodec)}">\n`;
+      xml += `<BaseURL>/api/stream/${videoId}/fmt/${f.format_id}</BaseURL>\n`;
+      xml += `<SegmentBase indexRange="${r.indexRange}"><Initialization range="${r.initRange}"/></SegmentBase>\n`;
+      xml += `</Representation>\n`;
+    }
+    xml += `</AdaptationSet>\n`;
+  }
+
+  // Audio AdaptationSet
+  const audios = formats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
+  if (audios.length) {
+    xml += `<AdaptationSet mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1">\n`;
+    for (const f of audios) {
+      const r = rangeMap[f.format_id];
+      if (!r) continue;
+      xml += `<Representation id="${escapeXML(f.format_id)}" bandwidth="${f.tbr ? Math.round(f.tbr * 1000) : 0}" codecs="${escapeXML(f.acodec)}" audioSamplingRate="${f.asr || 44100}">\n`;
+      xml += `<BaseURL>/api/stream/${videoId}/fmt/${f.format_id}</BaseURL>\n`;
+      xml += `<SegmentBase indexRange="${r.indexRange}"><Initialization range="${r.initRange}"/></SegmentBase>\n`;
+      xml += `</Representation>\n`;
+    }
+    xml += `</AdaptationSet>\n`;
+  }
+
+  xml += `</Period>\n</MPD>`;
+  return xml;
+}
+
+// In-flight MPD build promises to deduplicate concurrent buildMPD calls
+const mpdInflight = new Map();
+
+// Build (or return cached) MPD for a videoId
+async function buildMPD(videoId) {
+  const cached = mpdCache.get(videoId);
+  if (cached && Date.now() < cached.expires) return cached.data;
+
+  // Check Redis for cross-worker cache hit before rebuilding
+  if (hasRedis()) {
+    const redisEntry = await mpdCache.getAsync(videoId);
+    if (redisEntry && redisEntry.data && Date.now() < redisEntry.expires) return redisEntry.data;
+  }
+
+  return dedup(mpdInflight, videoId, async () => {
+    const info = await extractFormats(videoId);
+    if (info._unavailable) { notifyExtractionDone(videoId); return { unavailable: info._unavailable }; }
+    notifyExtractionStep(videoId, 'building');
+
+    try {
+    const isDirect = f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http');
+    const allFmts = (info.formats || []).filter(f => isDirect(f));
+
+    // Try DASH first — separate video-only + audio-only MP4 streams
+    const videoFmts = allFmts.filter(f => f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none'));
+    const audioFmts = allFmts.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
+    const mp4Video = videoFmts.filter(f => f.ext === 'mp4');
+    const mp4Audio = audioFmts.filter(f => f.ext === 'm4a');
+
+    if (mp4Video.length && mp4Audio.length) {
+      // Clear stale urlLookup entries atomically before repopulating — this avoids
+      // a window where urlLookup is empty while buildMPD is still running
+      for (const [key] of urlLookup) {
+        if (key.startsWith(videoId + ':')) urlLookup.delete(key);
+      }
+      // Cache URLs for all adaptive formats
+      for (const f of [...mp4Video, ...mp4Audio]) {
+        urlLookup.set(`${videoId}:${f.format_id}`, { url: f.url, headers: sanitizeHeaders(f.http_headers), expires: Date.now() + CACHE_TTL });
+      }
+
+      // Probe each format for its own init/index byte ranges
+      const rangeMap = {};
+      // Check probe cache for already-probed formats
+      await Promise.all([...mp4Video, ...mp4Audio].map(async (f) => {
+        const probeKey = `${videoId}:${f.format_id}`;
+        const cached = mp4ProbeCache.get(probeKey);
+        if (cached) { rangeMap[f.format_id] = cached; return; }
+        try {
+          const ranges = await probeMP4Ranges(f.url, sanitizeHeaders(f.http_headers));
+          if (ranges) {
+            rangeMap[f.format_id] = ranges;
+            mp4ProbeCache.set(probeKey, ranges);
+          }
+        } catch (e) { if (e.name !== 'AbortError') console.warn(`[stream ${videoId}] probe failed for ${f.format_id}:`, e.message); }
+      }));
+
+      const hasRanges = Object.keys(rangeMap).length > 0;
+      if (hasRanges) {
+        const mpd = generateMPD(videoId, info.duration || 0, [...mp4Video, ...mp4Audio], rangeMap);
+        const videoCount = mp4Video.filter(f => rangeMap[f.format_id]).length;
+        const audioCount = mp4Audio.filter(f => rangeMap[f.format_id]).length;
+        const via = info._extractedVia || 'yt-dlp';
+        console.log(`[stream ${videoId}] using DASH (${videoCount} video + ${audioCount} audio), duration=${info.duration}s via ${via}`);
+        mpdCache.set(videoId, { data: mpd, meta: { playback: 'dash', via }, expires: Date.now() + CACHE_TTL });
+        return mpd;
+      }
+    }
+
+    // HLS fallback
+    const hlsCandidates = (info.formats || [])
+      .filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.url && f.vcodec && f.vcodec !== 'none')
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const origLang = info.language || '';
+    const isOrigHls = f => (f.format_note && /original/i.test(f.format_note))
+      || (origLang && f.language && f.language.split('-')[0] === origLang.split('-')[0]);
+    const hlsFmt = hlsCandidates.find(f => isOrigHls(f)) || hlsCandidates[0];
+
+    if (hlsFmt) {
+      const via = info._extractedVia || 'yt-dlp';
+      console.log(`[stream ${videoId}] using HLS (${hlsFmt.height || '?'}p), duration=${info.duration}s via ${via}`);
+      hlsCache.set(videoId, { url: hlsFmt.manifest_url || hlsFmt.url, headers: sanitizeHeaders(hlsFmt.http_headers), expires: Date.now() + CACHE_TTL });
+      const hlsResult = { hls: `/api/stream/${videoId}/hls.m3u8`, via };
+      mpdCache.set(videoId, { data: hlsResult, meta: { playback: 'hls', via }, expires: Date.now() + CACHE_TTL });
+      return hlsResult;
+    }
+
+    // Progressive fallback
+    const muxed = allFmts
+      .filter(f => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    if (muxed) {
+      const via = info._extractedVia || 'yt-dlp';
+      urlLookup.set(`${videoId}:${muxed.format_id}`, { url: muxed.url, headers: sanitizeHeaders(muxed.http_headers), expires: Date.now() + CACHE_TTL });
+      const result = { progressive: `/api/stream/${videoId}/progressive`, via };
+      mpdCache.set(videoId, { data: result, meta: { playback: 'progressive', via }, expires: Date.now() + CACHE_TTL });
+      console.log(`[stream ${videoId}] using progressive (${muxed.height || '?'}p), duration=${info.duration}s via ${via}`);
+      return result;
+    }
+
+    return null;
+    } finally {
+      notifyExtractionDone(videoId);
+    }
+  });
+}
+
+// HLS manifest URL cache
+const hlsCache = new SharedLRUMap(300, 'hls');
+
+// GET /api/stream/:videoId/dash.mpd
+router.get('/:videoId/dash.mpd', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    // Extraction rate limit — only when not already cached
+    if (!formatCache.has(videoId) && req.app.extractionRateCheck && !req.app.extractionRateCheck(req.ip)) {
+      res.set('Retry-After', '60');
+      return res.status(429).end('Extraction rate limit exceeded');
+    }
+    // ?refresh=1 forces fresh extraction (used by client-side recovery)
+    if (req.query.refresh) {
+      // Evict MPD and format caches — urlLookup is cleared atomically inside
+      // buildMPD right before repopulation, so in-flight segment requests from
+      // a previous Shaka load don't hit an empty lookup window.
+      mpdCache.delete(videoId);
+      formatCache.delete(videoId);
+    }
+    const result = await buildMPD(videoId);
+    if (!result) return res.status(404).json({ error: 'No suitable formats found' });
+
+    // Unavailable video (upcoming livestream, premiere, etc.)
+    if (typeof result === 'object' && result.unavailable) {
+      return res.status(404).json({ error: result.unavailable });
+    }
+
+    // Include stream chain metadata in a response header for the player UI
+    const cached = mpdCache.get(videoId);
+    if (cached && cached.meta) {
+      res.set('X-Stream-Via', cached.meta.via + '/' + cached.meta.playback);
+    }
+
+    // HLS or progressive fallback
+    if (typeof result === 'object' && (result.hls || result.progressive)) {
+      return res.json(result);
+    }
+    res.set('Content-Type', 'application/dash+xml');
+    res.set('Cache-Control', 'no-cache');
+    res.send(result);
+  } catch (err) {
+    console.error('MPD generation failed:', err.message);
+    res.status(502).json({ error: 'Failed to extract stream info' });
+  }
+});
+
+// DASH format proxy — streams individual adaptive format by format_id
+router.get('/:videoId/fmt/:formatId', async (req, res) => {
+  try {
+    const { videoId, formatId } = req.params;
+
+    // Check Redis segment cache for hot videos
+    const segmentCache = require('../lib/segment-cache');
+    const cached = await segmentCache.getSegment(videoId, formatId, req.headers.range);
+    if (cached) {
+      res.status(cached.status);
+      if (cached.contentType) res.set('Content-Type', cached.contentType);
+      if (cached.contentRange) res.set('Content-Range', cached.contentRange);
+      res.set('Content-Length', String(cached.contentLength));
+      res.set('X-Segment-Cache', 'hit');
+      return res.end(cached.data);
+    }
+
+    let entry = urlLookup.get(`${videoId}:${formatId}`);
+    if (!entry || Date.now() > entry.expires) {
+      // URL missing or expired — rebuild MPD to repopulate urlLookup
+      mpdCache.delete(videoId);
+      formatCache.delete(videoId);
+      await buildMPD(videoId);
+      entry = urlLookup.get(`${videoId}:${formatId}`);
+      if (!entry) return res.status(404).json({ error: 'Format not found' });
+    }
+
+    const headers = { ...(entry.headers || {}) };
+    if (req.headers.range) headers.Range = req.headers.range;
+
+    const upstream = await fetchWithConnTimeout(entry.url, { headers });
+    if (!upstream.ok && upstream.status !== 206) {
+      await upstream.body?.cancel().catch(() => {});
+      if (upstream.status >= 500) res.set('Retry-After', '2');
+      return res.status(upstream.status).end();
+    }
+
+    res.status(upstream.status);
+    if (upstream.headers.get('content-type')) res.set('Content-Type', upstream.headers.get('content-type'));
+    if (upstream.headers.get('content-length')) res.set('Content-Length', upstream.headers.get('content-length'));
+    if (upstream.headers.get('content-range')) res.set('Content-Range', upstream.headers.get('content-range'));
+    if (upstream.headers.get('accept-ranges')) res.set('Accept-Ranges', upstream.headers.get('accept-ranges'));
+    // Forward CDN cache headers so browsers can cache segments
+    for (const h of ['cache-control', 'etag', 'last-modified', 'expires']) {
+      if (upstream.headers.get(h)) res.set(h, upstream.headers.get(h));
+    }
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('X-Segment-Cache', 'miss');
+
+    const nodeStream = Readable.fromWeb(upstream.body, { highWaterMark: 256 * 1024 });
+    const cl = parseInt(upstream.headers.get('content-length') || '0', 10);
+    const shouldCache = cl > 0 && cl <= 2 * 1024 * 1024;
+
+    if (shouldCache) {
+      const { Transform } = require('stream');
+      const chunks = [];
+      const collector = new Transform({
+        transform(chunk, enc, cb) { chunks.push(chunk); this.push(chunk); cb(); },
+        flush(cb) {
+          segmentCache.putSegment(videoId, formatId, req.headers.range, Buffer.concat(chunks), {
+            contentType: upstream.headers.get('content-type'),
+            contentRange: upstream.headers.get('content-range'),
+            status: upstream.status,
+          }).catch(() => {});
+          cb();
+        }
+      });
+      await pipeline(nodeStream, collector, res);
+    } else {
+      await pipeline(nodeStream, res);
+    }
+  } catch (err) {
+    if (err.name !== 'AbortError' && !isClientGone(err)) {
+      console.error(`[fmt proxy] ${req.params.videoId}/${req.params.formatId}:`, err.message);
+    }
+    if (!res.headersSent) res.status(502).json({ error: 'Stream proxy failed' });
+  }
+});
+
+// Rewrite URLs in an HLS manifest so they go through our proxy,
+// filter out dubbed-audio stream variants, and deduplicate by resolution
+// (keep only the highest-bandwidth variant per resolution height).
+// Cache rewritten HLS manifests to avoid re-parsing on every request
+const hlsRewriteCache = new LRUMap(200);
+
+function rewriteHLS(body, videoId, baseUrl) {
+  const cacheKey = videoId + ':' + body.length;
+  const cached = hlsRewriteCache.get(cacheKey);
+  if (cached) return cached;
+  const proxyBase = '/api/stream/' + videoId + '/hls-proxy?u=';
+  const lines = body.split('\n');
+
+  // First pass: parse #EXT-X-STREAM-INF + URL pairs, extract resolution & bandwidth
+  const variants = [];  // { infoLine, urlLine, height, bandwidth }
+  const otherLines = []; // non-variant lines (headers, comments, media playlists, etc.)
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith('#EXT-X-STREAM-INF')) {
+      // Skip dubbed-auto variants
+      if (/EgtkdWJiZWQtYXV0bw/.test(trimmed)) {
+        i++; // skip the URL line too
+        continue;
+      }
+      const urlLine = (i + 1 < lines.length) ? lines[i + 1] : '';
+      i++; // consume the URL line
+
+      // Extract RESOLUTION=WxH
+      const resMatch = trimmed.match(/RESOLUTION=(\d+)x(\d+)/);
+      const height = resMatch ? parseInt(resMatch[2], 10) : 0;
+      // Extract BANDWIDTH=N
+      const bwMatch = trimmed.match(/BANDWIDTH=(\d+)/);
+      const bandwidth = bwMatch ? parseInt(bwMatch[1], 10) : 0;
+
+      variants.push({ infoLine: lines[i - 1], urlLine, height, bandwidth });
+    } else {
+      otherLines.push(lines[i]);
+    }
+  }
+
+  // Deduplicate: keep only the highest-bandwidth variant per resolution height
+  const bestByHeight = new Map();
+  for (const v of variants) {
+    const key = v.height || v.bandwidth; // fall back to bandwidth if no resolution
+    if (!bestByHeight.has(key) || v.bandwidth > bestByHeight.get(key).bandwidth) {
+      bestByHeight.set(key, v);
+    }
+  }
+  const kept = [...bestByHeight.values()];
+
+  // Second pass: reconstruct the manifest with proxy URLs
+  const filtered = [];
+  for (const line of otherLines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      filtered.push(line.replace(/URI="([^"]+)"/g, function (_, uri) {
+        var abs = uri.startsWith('http') ? uri : new URL(uri, baseUrl).href;
+        return 'URI="' + proxyBase + encodeURIComponent(abs) + '"';
+      }));
+    } else {
+      var abs = trimmed.startsWith('http') ? trimmed : new URL(trimmed, baseUrl).href;
+      filtered.push(proxyBase + encodeURIComponent(abs));
+    }
+  }
+
+  // Insert deduplicated variant lines (info + proxied URL)
+  const variantLines = [];
+  for (const v of kept) {
+    variantLines.push(v.infoLine);
+    const trimmedUrl = v.urlLine.trim();
+    if (trimmedUrl) {
+      const abs = trimmedUrl.startsWith('http') ? trimmedUrl : new URL(trimmedUrl, baseUrl).href;
+      variantLines.push(proxyBase + encodeURIComponent(abs));
+    }
+  }
+
+  // Place variant lines after header lines (before any trailing content)
+  // Find the last header line (before first non-header non-empty line)
+  let insertIdx = filtered.length;
+  for (let i = 0; i < filtered.length; i++) {
+    const t = filtered[i].trim();
+    if (t && !t.startsWith('#')) {
+      insertIdx = i;
+      break;
+    }
+  }
+  filtered.splice(insertIdx, 0, ...variantLines);
+
+  const result = filtered.join('\n');
+  hlsRewriteCache.set(cacheKey, result);
+  return result;
+}
+
+// HLS manifest proxy — rewrites segment URLs to go through our proxy
+router.get('/:videoId/hls.m3u8', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    let entry = hlsCache.get(videoId);
+    if (!entry || Date.now() > entry.expires) return res.status(404).json({ error: 'HLS not available' });
+    let upstream = await fetchWithConnTimeout(entry.url, { headers: entry.headers });
+
+    // If the master manifest URL expired, re-extract fresh HLS URL and retry
+    if (upstream.status === 403 || upstream.status === 410) {
+      await upstream.body?.cancel().catch(() => {});
+      hlsCache.delete(videoId);
+      formatCache.delete(videoId);
+      mpdCache.delete(videoId);
+      const info = await extractFormats(videoId);
+      const hlsRefresh = (info.formats || [])
+        .filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.url && f.vcodec && f.vcodec !== 'none')
+        .sort((a, b) => (b.height || 0) - (a.height || 0));
+      const rLang = info.language || '';
+      const isOrigR = f => (f.format_note && /original/i.test(f.format_note))
+        || (rLang && f.language && f.language.split('-')[0] === rLang.split('-')[0]);
+      const hlsFmt = hlsRefresh.find(f => isOrigR(f)) || hlsRefresh[0];
+      if (!hlsFmt) return res.status(404).json({ error: 'HLS not available after refresh' });
+      entry = { url: hlsFmt.manifest_url || hlsFmt.url, headers: sanitizeHeaders(hlsFmt.http_headers), expires: Date.now() + CACHE_TTL };
+      hlsCache.set(videoId, entry);
+      upstream = await fetchWithConnTimeout(entry.url, { headers: entry.headers });
+    }
+
+    if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => {});
+      return res.status(upstream.status).end();
+    }
+    let body = await upstream.text();
+    body = rewriteHLS(body, videoId, entry.url);
+    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    res.set('Cache-Control', 'no-cache');
+    res.send(body);
+  } catch (err) {
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// HLS segment/sub-manifest proxy — use query param since encoded URLs are too long for path params
+router.get('/:videoId/hls-proxy', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const url = req.query.u;
+    if (!url || (!url.startsWith('https://') && !url.startsWith('http://'))) return res.status(400).end();
+    // SSRF protection: only allow YouTube/Google video CDN domains
+    if (!isYouTubeCdnUrl(url)) {
+      return res.status(403).end('Forbidden: domain not allowed');
+    }
+    let entry = hlsCache.get(videoId);
+    const headers = entry ? { ...entry.headers } : {};
+    if (req.headers.range) headers.Range = req.headers.range;
+    let upstream = await fetchWithConnTimeout(url, { headers });
+
+    // If the segment URL expired, invalidate caches so the next manifest
+    // request (from Shaka's HLS parser) triggers a fresh extraction via
+    // the /hls.m3u8 route.  Return 410 to signal Shaka that this URL is
+    // permanently gone — it will re-fetch the manifest and get new segment URLs.
+    if (upstream.status === 403 || upstream.status === 410) {
+      await upstream.body?.cancel().catch(() => {});
+      hlsCache.delete(videoId);
+      formatCache.delete(videoId);
+      mpdCache.delete(videoId);
+      // Pre-warm: trigger extraction so next manifest fetch is instant
+      extractFormats(videoId).catch(err => console.warn(`[pre-warm ${videoId}]`, err.message));
+      return res.status(410).end();
+    }
+
+    if (!upstream.ok && upstream.status !== 206) {
+      await upstream.body?.cancel().catch(() => {});
+      if (upstream.status >= 500) res.set('Retry-After', '2');
+      return res.status(upstream.status).end();
+    }
+    res.status(upstream.status);
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    for (const h of ['content-length', 'content-range', 'accept-ranges']) {
+      if (upstream.headers.get(h)) res.set(h, upstream.headers.get(h));
+    }
+    // If it's a sub-manifest, rewrite URLs too (check content-type only, not URL path)
+    if (ct && ct.includes('mpegurl')) {
+      let body = await upstream.text();
+      body = rewriteHLS(body, req.params.videoId, url);
+      res.set('Content-Type', 'application/vnd.apple.mpegurl');
+      res.send(body);
+    } else {
+      const nodeStream = Readable.fromWeb(upstream.body);
+      await pipeline(nodeStream, res);
+    }
+  } catch (err) {
+    if (isClientGone(err)) return;
+    console.error('[hls-proxy] error:', err.message);
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// In-memory VTT cache: "videoId:lang" → { vtt: string, expires: number }
+const vttCache = new SharedLRUMap(100, 'vtt');
+const VTT_CACHE_TTL = 4 * 60 * 60 * 1000;
+
+// Download VTT via yt-dlp and cache it. Returns the VTT string or null.
+async function fetchVttViaDlp(videoId, lang, isAuto) {
+  const cacheKey = `${videoId}:${lang}`;
+  const cached = vttCache.get(cacheKey);
+  if (cached && Date.now() < cached.expires) return cached.vtt;
+
+  const os = require('os');
+  const tmpBase = path.join(os.tmpdir(), `sub-${videoId}-${lang}-${Date.now()}`);
+  const subArgs = [
+    ...ytdlpArgs(), '--skip-download', '--sub-format', 'vtt', '-o', tmpBase,
+  ];
+  if (isAuto) {
+    subArgs.push('--write-auto-subs', '--sub-langs', lang);
+  } else {
+    subArgs.push('--write-subs', '--sub-langs', lang);
+  }
+  subArgs.push('--', videoId);
+
+  try {
+    return await withYtdlpSlot(async () => {
+      await execFileAsync('yt-dlp', subArgs, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
+      const vttPath = `${tmpBase}.${lang}.vtt`;
+      if (!fs.existsSync(vttPath)) return null;
+      const vtt = fs.readFileSync(vttPath, 'utf-8');
+      try { fs.unlinkSync(vttPath); } catch {}
+      vttCache.set(cacheKey, { vtt, expires: Date.now() + VTT_CACHE_TTL });
+      return vtt;
+    });
+  } catch (e) {
+    console.error(`[subtitles] yt-dlp failed for ${videoId}/${lang}:`, e.message);
+    return null;
+  }
+}
+
+// Subtitle VTT proxy — serves cached VTT content (pre-fetched by /subtitles listing)
+router.get('/:videoId/subtitles/:lang.vtt', async (req, res) => {
+  try {
+    const { videoId, lang } = req.params;
+    if (!/^[a-zA-Z0-9_-]{1,20}$/.test(videoId) || !/^[a-zA-Z0-9_-]{1,20}$/.test(lang)) {
+      return res.status(400).json({ error: 'Invalid parameters' });
+    }
+
+    // Check cache first (populated by the /subtitles listing endpoint)
+    const cacheKey = `${videoId}:${lang}`;
+    const cached = vttCache.get(cacheKey);
+    if (cached && Date.now() < cached.expires) {
+      res.set('Content-Type', 'text/vtt; charset=utf-8');
+      res.set('Cache-Control', 'private, max-age=3600');
+      return res.send(cached.vtt);
+    }
+
+    // Fallback: download via yt-dlp on demand
+    const info = getCached(videoId, { staleOk: true }) || await extractFormats(videoId);
+    const subs = info.subtitles || {};
+    const isAuto = !subs[lang];
+    const vtt = await fetchVttViaDlp(videoId, lang, isAuto);
+    if (!vtt) return res.status(404).json({ error: 'Caption not available' });
+
+    res.set('Content-Type', 'text/vtt; charset=utf-8');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.send(vtt);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    console.error('[subtitles] error:', err.message);
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// Subtitle listing — returns available languages
+// Mirrors DASH MPD logic: all manual subtitles + auto-generated English only
+router.get('/:videoId/subtitles', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const info = getCached(videoId, { staleOk: true }) || await extractFormats(videoId);
+    const subs = info.subtitles || {};
+    const auto = info.automatic_captions || {};
+    const displayNames = new Intl.DisplayNames(['en'], { type: 'language' });
+    const langs = [];
+    const manualLangs = new Set();
+    // Manual subtitles first
+    for (const lang of Object.keys(subs)) {
+      if (subs[lang].some(t => t.ext === 'vtt')) {
+        let name;
+        try { name = displayNames.of(lang); } catch { name = lang; }
+        langs.push({ lang, name, auto: false });
+        manualLangs.add(lang);
+      }
+    }
+    // Add auto-generated English if no manual English exists
+    if (!manualLangs.has('en')) {
+      var autoEn = auto['en'] || auto['en-orig'];
+      if (autoEn && autoEn.some(t => t.ext === 'vtt')) {
+        var autoKey = auto['en'] ? 'en' : 'en-orig';
+        langs.push({ lang: autoKey, name: 'English (auto)', auto: true });
+      }
+    }
+    // Kick off VTT pre-fetch in background (capped to avoid semaphore starvation)
+    const VTT_PREFETCH_LIMIT = 3;
+    for (const sub of langs.slice(0, VTT_PREFETCH_LIMIT)) {
+      fetchVttViaDlp(videoId, sub.lang, sub.auto).catch(err => console.warn(`[vtt-prefetch ${videoId}/${sub.lang}]`, err.message));
+    }
+    res.json(langs);
+  } catch (err) {
+    if (!res.headersSent) res.status(502).json({ error: 'Failed to list subtitles' });
+  }
+});
+
+// Prefetch endpoint — called early by the page to warm caches
+// buildMPD deduplicates via mpdInflight, so no concurrency guard needed
+router.get('/:videoId/prefetch', async (req, res) => {
+  const { videoId } = req.params;
+  res.status(204).end();
+  if (getCached(videoId)) return;
+  // Extraction rate limit
+  if (req.app.extractionRateCheck && !req.app.extractionRateCheck(req.ip)) return;
+  buildMPD(videoId).catch(err => console.warn(`[prefetch ${videoId}]`, err.message));
+});
+
+// SSE: push extraction progress to the client as backends are tried
+const extractionListeners = new Map(); // videoId → Set<res>
+
+function notifyExtractionStep(videoId, step) {
+  extractionStatus.set(videoId, { step, ts: Date.now() });
+  // WebSocket notification
+  const wsStatus = require('../lib/ws-status');
+  if (wsStatus.isAvailable()) wsStatus.notify(videoId, { step });
+  // SSE notification
+  const listeners = extractionListeners.get(videoId);
+  if (listeners) {
+    for (const res of listeners) {
+      try {
+        res.write(`data: ${JSON.stringify({ step })}\n\n`);
+        if (typeof res.flush === 'function') res.flush();
+      } catch { listeners.delete(res); }
+    }
+    if (listeners.size === 0) extractionListeners.delete(videoId);
+  }
+}
+
+function notifyExtractionDone(videoId) {
+  extractionStatus.delete(videoId);
+  // WebSocket notification
+  const wsStatus = require('../lib/ws-status');
+  if (wsStatus.isAvailable()) wsStatus.notify(videoId, { done: true });
+  // SSE notification
+  const listeners = extractionListeners.get(videoId);
+  if (listeners) {
+    for (const res of listeners) {
+      try {
+        res.write('event: done\ndata: {}\n\n');
+        res.end();
+      } catch {}
+    }
+    extractionListeners.delete(videoId);
+  }
+}
+
+router.get('/:videoId/status', (req, res) => {
+  const { videoId } = req.params;
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders();
+  // Send current step immediately if extraction is in-flight
+  const current = extractionStatus.get(videoId);
+  if (current) {
+    res.write(`data: ${JSON.stringify({ step: current.step })}\n\n`);
+    if (typeof res.flush === 'function') res.flush();
+  }
+  // Keep connection open — extraction may start soon (e.g. manifest request pending)
+  // Auto-close after 30s if no extraction happens
+  if (!extractionListeners.has(videoId)) extractionListeners.set(videoId, new Set());
+  extractionListeners.get(videoId).add(res);
+  const timeout = setTimeout(() => {
+    res.write('event: done\ndata: {}\n\n');
+    res.end();
+    const set = extractionListeners.get(videoId);
+    if (set) { set.delete(res); if (set.size === 0) extractionListeners.delete(videoId); }
+  }, 30000);
+  req.on('close', () => {
+    clearTimeout(timeout);
+    const set = extractionListeners.get(videoId);
+    if (set) { set.delete(res); if (set.size === 0) extractionListeners.delete(videoId); }
+  });
+});
+
+// Look up a cached format URL + headers (sync, returns null if missing/expired)
+function resolveFormat(videoId, itag) {
+  const lookup = urlLookup.get(`${videoId}:${itag}`);
+  if (lookup && Date.now() < lookup.expires) return { url: lookup.url, cdnHeaders: lookup.headers || {} };
+  return null;
+}
+
+// Evict all caches for a videoId so the next extractFormats call fetches fresh data
+function evictVideoCache(videoId, oldUrl) {
+  formatCache.delete(videoId);
+  mpdCache.delete(videoId);
+  // Remove all urlLookup entries and bg downloads for this video
+  for (const [key] of urlLookup) {
+    if (key.startsWith(videoId + ':')) urlLookup.delete(key);
+  }
+  for (const [key] of bgDownloads) {
+    if (key.startsWith(videoId + ':')) cleanupBgDownload(key);
+  }
+}
+
+// Parse "bytes=START-END" from Range header
+function parseRange(rangeHeader) {
+  const m = rangeHeader && rangeHeader.match(/^bytes=(\d+)-(\d*)$/);
+  if (!m) return null;
+  return { start: parseInt(m[1], 10), end: m[2] ? parseInt(m[2], 10) : -1 };
+}
+
+// GET /api/stream/:videoId/progressive — serve best muxed MP4 for native playback fallback
+router.get('/:videoId/progressive', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const info = await extractFormats(videoId);
+    const formats = info.formats || [];
+    const isDirect = f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http');
+    // Pick best muxed MP4 (has both video + audio)
+    const muxed = formats
+      .filter(f => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' && isDirect(f) && (f.ext === 'mp4' || f.ext === 'm4a' || (f.container && f.container.startsWith('mp4'))))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const fmt = muxed[0] || formats.filter(f => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none' && isDirect(f))
+      .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+    if (!fmt || !fmt.url) return res.status(404).json({ error: 'No progressive format' });
+
+    const headers = { ...sanitizeHeaders(fmt.http_headers) };
+    if (req.headers.range) headers['Range'] = req.headers.range;
+
+    const upstream = await fetch(fmt.url, { headers });
+    res.status(upstream.status);
+    const fwd = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    for (const h of fwd) {
+      const val = upstream.headers.get(h);
+      if (val) res.set(h, val);
+    }
+    res.set('Accept-Ranges', 'bytes');
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    console.error('[progressive] error:', err.message);
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// GET /api/stream/:videoId/proxy/:itag
+router.get('/:videoId/proxy/:itag', async (req, res) => {
+  try {
+    const { videoId, itag } = req.params;
+
+    // Resolve format URL + CDN headers (cached or fresh)
+    let fmtUrl, cdnHeaders = {};
+    const resolved = resolveFormat(videoId, itag);
+    if (resolved) {
+      fmtUrl = resolved.url;
+      cdnHeaders = resolved.cdnHeaders;
+
+      // Proactive refresh: if cache entry is old, trigger background re-extraction
+      const cacheEntry = formatCache.get(videoId);
+      if (cacheEntry) {
+        const age = (cacheEntry.expires - Date.now());
+        // age is time remaining; if less than (TTL - PROACTIVE_REFRESH_AGE) remains, it's old
+        if (age < CACHE_TTL - PROACTIVE_REFRESH_AGE && !extractionInflight.has(videoId)) {
+          formatCache.delete(videoId);
+          extractFormats(videoId).catch(err => console.warn(`[proactive-refresh ${videoId}]`, err.message));
+        }
+      }
+    } else {
+      const info = await extractFormats(videoId);
+      const fmt = (info.formats || []).find(f => String(f.format_id) === String(itag));
+      if (!fmt || !fmt.url) return res.status(404).json({ error: 'Format not found' });
+      fmtUrl = fmt.url;
+      cdnHeaders = sanitizeHeaders(fmt.http_headers);
+    }
+
+    // Check if requested bytes are available from background download cache
+    const range = parseRange(req.headers.range);
+    const bg = bgDownloads.get(`${videoId}:${itag}`);
+    if (bg && range && range.start >= 0) {
+      const effectiveEnd = range.end >= 0 ? range.end : bg.bytesDownloaded - 1;
+      if (effectiveEnd < bg.bytesDownloaded && range.start <= effectiveEnd) {
+        const slice = effectiveEnd - range.start + 1;
+        res.status(206);
+        res.set('Content-Type', 'application/octet-stream');
+        res.set('Content-Length', String(slice));
+        res.set('Content-Range', `bytes ${range.start}-${effectiveEnd}/${bg.totalSize || '*'}`);
+        res.set('Accept-Ranges', 'bytes');
+        res.set('Cache-Control', 'private, max-age=3600');
+        res.set('Vary', 'Range');
+        const stream = fs.createReadStream(bg.filePath, { start: range.start, end: effectiveEnd });
+        return pipeline(stream, res);
+      }
+    }
+
+    const headers = { ...cdnHeaders };
+    if (req.headers.range) {
+      headers['Range'] = req.headers.range;
+    }
+
+    let upstream = await fetchWithConnTimeout(fmtUrl, { headers });
+
+    // If YouTube CDN rejected the URL (expired/throttled), evict caches and retry once
+    // Circuit breaker: deduplicate re-extraction when many users hit the same expired URL
+    if (upstream.status === 403 || upstream.status === 410) {
+      await upstream.body?.cancel().catch(() => {});
+      evictVideoCache(videoId, fmtUrl);
+      const info = await dedup(extractionInflight, `refresh:${videoId}`, () => extractFormats(videoId));
+      const fmt = (info.formats || []).find(f => String(f.format_id) === String(itag));
+      if (!fmt || !fmt.url) return res.status(404).json({ error: 'Format not found after refresh' });
+      fmtUrl = fmt.url;
+      cdnHeaders = sanitizeHeaders(fmt.http_headers);
+      urlLookup.set(`${videoId}:${itag}`, { url: fmtUrl, headers: cdnHeaders, expires: Date.now() + CACHE_TTL });
+      upstream = await fetchWithConnTimeout(fmtUrl, { headers: { ...cdnHeaders, ...(req.headers.range ? { Range: req.headers.range } : {}) } });
+    }
+
+    res.status(upstream.status);
+    const fwd = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
+    for (const h of fwd) {
+      const val = upstream.headers.get(h);
+      if (val) res.set(h, val);
+    }
+    res.set('Accept-Ranges', 'bytes');
+    res.set('Cache-Control', 'private, max-age=3600');
+    res.set('Vary', 'Range');
+
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    console.error('Proxy error:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Proxy failed' });
+    }
+  }
+});
+
+// GET /api/stream/:videoId/poster
+// Uses predictable YouTube thumbnail URL — no yt-dlp needed
+router.get('/:videoId/poster', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    // hq720.jpg is 1280x720, always available, fills widescreen — single fetch
+    const upstream = await fetch(`https://i.ytimg.com/vi/${videoId}/hq720.jpg`, { headers: PROXY_HEADERS });
+    if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => {});
+      if (!res.headersSent) res.status(upstream.status).end();
+      return;
+    }
+
+    res.status(upstream.status);
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=86400');
+
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    console.error('Poster proxy error:', err.message);
+    if (!res.headersSent) {
+      res.status(502).json({ error: 'Poster failed' });
+    }
+  }
+});
+
+// GET /api/stream/:videoId/duration — returns video duration in seconds
+// POST /api/stream/durations — batch duration lookup (cache + DB only, no yt-dlp)
+router.post('/durations', express.json(), (req, res) => {
+  const { ids } = req.body || {};
+  if (!Array.isArray(ids) || ids.length === 0) return res.json({});
+  const validIds = ids.filter(id => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 50);
+
+  // Check memory caches first
+  const result = {};
+  const remaining = [];
+  for (const videoId of validIds) {
+    const info = getCached(videoId, { staleOk: true });
+    if (info && info.duration) { result[videoId] = info.duration; continue; }
+    const dur = getCachedDuration(videoId);
+    if (dur) { result[videoId] = dur; continue; }
+    remaining.push(videoId);
+  }
+
+  // Check DB for anything not in memory
+  if (remaining.length > 0) {
+    const dbDurations = db.getDurations(remaining);
+    Object.assign(result, dbDurations);
+  }
+
+  res.set('Cache-Control', 'public, max-age=300');
+  res.json(result);
+});
+
+// SSE endpoint — streams durations as yt-dlp resolves them, one by one
+router.get('/durations-live', (req, res) => {
+  const raw = (req.query.ids || '').toString();
+  const ids = raw.split(',').filter(id => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 50);
+  if (!ids.length) return res.status(400).end();
+
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no'  // disable nginx buffering
+  });
+  res.flushHeaders();
+
+  // Immediately send durations already in DB
+  const dbDurations = db.getDurations(ids);
+  const dbStatuses = db.getLiveStatuses(ids);
+  const missing = [];
+  for (const id of ids) {
+    if (dbDurations[id]) {
+      const msg = { id, duration: dbDurations[id] };
+      if (dbStatuses[id] && dbStatuses[id] !== 'not_live') msg.live_status = dbStatuses[id];
+      res.write(`data: ${JSON.stringify(msg)}\n\n`);
+    } else {
+      missing.push(id);
+    }
+  }
+  if (typeof res.flush === 'function') res.flush();
+
+  if (!missing.length) {
+    res.write('event: done\ndata: {}\n\n');
+    return res.end();
+  }
+
+  // Fetch via yt-meta (internal API → page scrape → yt-dlp fallback chain)
+  let closed = false;
+  req.on('close', () => { closed = true; });
+
+  (async () => {
+    try {
+      const results = await fetchVideoMetaBatch(missing);
+      for (const id of missing) {
+        if (closed) return;
+        const meta = results.get(id);
+        if (meta) {
+          db.setDuration(id, meta.duration, meta.liveStatus);
+          const msg = { id, duration: meta.duration };
+          if (meta.liveStatus !== 'not_live') msg.live_status = meta.liveStatus;
+          res.write(`data: ${JSON.stringify(msg)}\n\n`);
+          if (typeof res.flush === 'function') res.flush();
+        }
+      }
+    } catch (err) {
+      console.error('[durations-live] error:', err.message);
+    }
+    if (!closed) {
+      res.write('event: done\ndata: {}\n\n');
+      res.end();
+    }
+  })();
+});
+
+router.get('/:videoId/duration', async (req, res) => {
+  const { videoId } = req.params;
+  // Check memory caches first
+  const info = getCached(videoId, { staleOk: true });
+  if (info && info.duration) {
+    res.set('Cache-Control', 'public, max-age=86400');
+    return res.json({ duration: info.duration });
+  }
+  const dur = getCachedDuration(videoId);
+  if (dur) {
+    res.set('Cache-Control', 'public, max-age=86400');
+    return res.json({ duration: dur });
+  }
+  // Check DB
+  const dbDur = db.getDuration(videoId);
+  if (dbDur) {
+    res.set('Cache-Control', 'public, max-age=86400');
+    return res.json({ duration: dbDur });
+  }
+  // Fetch via yt-dlp (single video only, not batch)
+  try {
+    const { stdout } = await execFileAsync('yt-dlp', [
+      ...ytdlpArgs(), '--print', 'duration', '--no-warnings', '--', videoId
+    ], { timeout: 15000 });
+    const d = parseFloat(stdout.trim());
+    if (!isNaN(d)) db.setDuration(videoId, d);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.json({ duration: isNaN(d) ? null : d });
+  } catch {
+    res.json({ duration: null });
+  }
+});
+
+// GET /api/stream/:videoId/thumb — lightweight thumbnail proxy for grid views (320x180)
+router.get('/:videoId/thumb', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const upstream = await fetch(`https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`, { headers: PROXY_HEADERS });
+    if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => {});
+      if (!res.headersSent) res.status(upstream.status).end();
+      return;
+    }
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=86400');
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// Cached wrapper around extractors.fetchLiveStoryboardSpec
+async function getLiveStoryboardSpec(videoId) {
+  const cached = liveStoryboardCache.get(videoId);
+  if (cached && Date.now() - cached.createdAt < 30 * 60 * 1000) return cached;
+  try {
+    const spec = await fetchLiveStoryboardSpec(videoId);
+    if (!spec) return null;
+    spec.createdAt = Date.now();
+    liveStoryboardCache.set(videoId, spec);
+    return spec;
+  } catch {
+    return null;
+  }
+}
+
+// GET /api/stream/:videoId/storyboard
+// Returns YouTube storyboard metadata (sprite sheet URLs + layout info)
+router.get('/:videoId/storyboard', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const info = getCached(videoId, { staleOk: true }) || await extractFormats(videoId);
+
+    // yt-dlp puts storyboard data in formats with protocol "mhtml" or in storyboards field
+    const sbFormats = (info.formats || []).filter(f =>
+      f.protocol === 'mhtml' && f.fragments && f.fragments.length > 0
+    );
+
+    if (sbFormats.length > 0) {
+      // VOD storyboard
+      const sb = sbFormats.reduce((a, b) => ((a.height || 0) > (b.height || 0) ? a : b));
+      const cols = sb.columns || 10;
+      const rows = sb.rows || 10;
+      const thumbW = sb.width || 160;
+      const thumbH = sb.height || 90;
+      const framesPerSheet = cols * rows;
+      const sheets = sb.fragments.map(f => f.url || f.path);
+      const fragDuration = sb.fragments[0] && sb.fragments[0].duration;
+      let interval, totalFrames;
+      if (fragDuration) {
+        interval = fragDuration / framesPerSheet;
+        totalFrames = Math.ceil((info.duration || 0) / interval);
+      } else {
+        totalFrames = sheets.length * framesPerSheet;
+        interval = info.duration ? info.duration / totalFrames : 2;
+      }
+      return res.json({
+        sheets: sheets.map((url, i) => `/api/stream/${videoId}/storyboard/${i}`),
+        cols, rows, thumbW, thumbH, interval, totalFrames
+      });
+    }
+
+    // Live storyboard — fetch spec from Innertube
+    const liveSpec = await getLiveStoryboardSpec(videoId);
+    if (liveSpec) {
+      return res.json({
+        live: true,
+        urlTemplate: `/api/stream/${videoId}/storyboard/live/`,
+        cols: liveSpec.cols,
+        rows: liveSpec.rows,
+        thumbW: liveSpec.thumbW,
+        thumbH: liveSpec.thumbH,
+        interval: 2,
+      });
+    }
+
+    res.status(404).json({ error: 'No storyboard available' });
+  } catch (err) {
+    console.error('Storyboard metadata error:', err.message);
+    res.status(404).json({ error: 'No storyboard available' });
+  }
+});
+
+// GET /api/stream/:videoId/chapters
+// Returns chapter markers from yt-dlp metadata or parsed from description
+router.get('/:videoId/chapters', async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const info = getCached(videoId, { staleOk: true }) || await extractFormats(videoId);
+
+    // Priority 1: yt-dlp structured chapters
+    if (info.chapters && info.chapters.length > 0) {
+      return res.json(info.chapters);
+    }
+
+    // Priority 2: parse timestamps from description
+    if (info.description) {
+      const chapters = parseDescriptionChapters(info.description, info.duration);
+      if (chapters.length > 0) return res.json(chapters);
+    }
+
+    res.json([]);
+  } catch (err) {
+    console.error('Chapters error:', err.message);
+    res.json([]);
+  }
+});
+
+// Parse chapter timestamps from video description text
+function parseDescriptionChapters(description, duration) {
+  const lines = description.split('\n');
+  const entries = [];
+  // Match patterns like "0:00 Intro", "1:23:45 - Finale", "(0:00) Intro"
+  const re = /(?:^|\()\s*(\d{1,2}:(?:\d{2}:)?\d{2})\s*\)?\s*[-–—]?\s*(.+)/;
+
+  for (const line of lines) {
+    const m = line.match(re);
+    if (!m) continue;
+    const parts = m[1].split(':').map(Number);
+    let seconds;
+    if (parts.length === 3) seconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
+    else seconds = parts[0] * 60 + parts[1];
+    const title = m[2].trim();
+    if (title) entries.push({ start_time: seconds, title });
+  }
+
+  if (entries.length < 2) return [];
+
+  // Sort by start_time and compute end_time
+  entries.sort((a, b) => a.start_time - b.start_time);
+  for (let i = 0; i < entries.length; i++) {
+    entries[i].end_time = i + 1 < entries.length
+      ? entries[i + 1].start_time
+      : (duration || entries[i].start_time);
+  }
+
+  return entries;
+}
+
+// Storyboard sheet cache: videoId → array of YouTube URLs
+const storyboardUrlCache = new LRUMap(500);
+// Live storyboard spec cache: videoId → { urlTemplate, thumbW, thumbH, cols, rows, createdAt }
+const liveStoryboardCache = new LRUMap(100);
+
+// GET /api/stream/:videoId/storyboard/live/:seq — proxy a live storyboard sheet
+router.get('/:videoId/storyboard/live/:seq', async (req, res) => {
+  try {
+    const { videoId, seq } = req.params;
+    const seqNum = parseInt(seq, 10);
+    if (isNaN(seqNum) || seqNum < 0) return res.status(400).end();
+    const spec = await getLiveStoryboardSpec(videoId);
+    if (!spec) return res.status(404).json({ error: 'No live storyboard' });
+    const url = spec.urlTemplate.replace('M$M', 'M' + seqNum);
+    // Validate domain
+    if (!isYouTubeCdnUrl(url)) return res.status(403).end();
+    const upstream = await fetch(url, { headers: PROXY_HEADERS });
+    if (!upstream.ok) return res.status(upstream.status).end();
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=300');
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    if (!res.headersSent) res.status(502).end();
+  }
+});
+
+// GET /api/stream/:videoId/storyboard/:index — proxy a sprite sheet image
+router.get('/:videoId/storyboard/:index', async (req, res) => {
+  try {
+    const { videoId, index } = req.params;
+    const idx = parseInt(index, 10);
+
+    // Get or cache the YouTube URLs
+    let urls = storyboardUrlCache.get(videoId)?.data;
+    if (!urls) {
+      const info = await extractFormats(videoId);
+      const sbFormats = (info.formats || []).filter(f =>
+        f.protocol === 'mhtml' && f.fragments && f.fragments.length > 0
+      );
+      if (sbFormats.length === 0) return res.status(404).json({ error: 'No storyboard' });
+      const sb = sbFormats.reduce((a, b) => ((a.height || 0) > (b.height || 0) ? a : b));
+      urls = sb.fragments.map(f => f.url || f.path);
+      storyboardUrlCache.set(videoId, { data: urls, createdAt: Date.now() });
+    }
+
+    if (idx < 0 || idx >= urls.length) return res.status(404).json({ error: 'Sheet not found' });
+
+    const upstream = await fetch(urls[idx], { headers: PROXY_HEADERS });
+    if (!upstream.ok) {
+      await upstream.body?.cancel().catch(() => {});
+      return res.status(upstream.status).end();
+    }
+
+    const ct = upstream.headers.get('content-type');
+    if (ct) res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=86400');
+
+    const nodeStream = Readable.fromWeb(upstream.body);
+    await pipeline(nodeStream, res);
+  } catch (err) {
+    if (isClientGone(err)) return;
+    console.error('Storyboard proxy error:', err.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Storyboard proxy failed' });
+  }
+});
+
+// POST /api/stream/:videoId/cache — trigger background download of all formats
+router.post('/:videoId/cache', express.json(), async (req, res) => {
+  try {
+    const { videoId } = req.params;
+    const info = getCached(videoId, { staleOk: true });
+    if (!info) return res.status(404).end();
+    // Pick formats with direct HTTP URLs (not HLS manifests) for background download
+    const formats = info.formats || [];
+    const isDirect = f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http');
+    const videoFmts = formats
+      .filter(f => f.vcodec && f.vcodec !== 'none' && isDirect(f))
+      .sort((a, b) => (b.height || 0) - (a.height || 0));
+    const audioFmt = formats
+      .filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none') && isDirect(f))
+      .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0] || null;
+    const all = audioFmt ? [videoFmts[0], audioFmt].filter(Boolean) : videoFmts.slice(0, 1);
+    const meta = req.body && req.body.title ? { title: req.body.title, channelTitle: req.body.channelTitle, thumbnail: req.body.thumbnail } : null;
+    let first = true;
+    for (const fmt of all) {
+      const key = `${videoId}:${fmt.format_id}`;
+      if (!bgDownloads.has(key) && fmt.url) {
+        startBgDownload(videoId, fmt.format_id, fmt.url, sanitizeHeaders(fmt.http_headers), first ? meta : null);
+        first = false;
+      }
+    }
+    res.status(204).end();
+  } catch (err) {
+    console.error('[cache trigger] error:', err.message);
+    if (!res.headersSent) res.status(500).end();
+  }
+});
+
+// GET /api/stream/:videoId/cache/status — download status
+router.get('/:videoId/cache/status', (req, res) => {
+  const { videoId } = req.params;
+  // Aggregate from in-memory map
+  let downloadedBytes = 0, totalBytes = 0, hasEntries = false;
+  for (const [key, entry] of bgDownloads) {
+    if (key.startsWith(videoId + ':')) {
+      hasEntries = true;
+      downloadedBytes += entry.bytesDownloaded;
+      totalBytes += entry.totalSize;
+    }
+  }
+  // Also check DB for persisted status
+  const dbRow = db.getDownload(videoId);
+  if (dbRow && dbRow.status === 'complete') {
+    return res.json({ status: 'complete', downloadedBytes: dbRow.downloaded_bytes, totalBytes: dbRow.total_bytes, percent: 100 });
+  }
+  if (dbRow && dbRow.status === 'error') {
+    return res.json({ status: 'error', downloadedBytes: 0, totalBytes: 0, percent: 0 });
+  }
+  if (hasEntries) {
+    const allDone = allFormatsDone(videoId);
+    const percent = totalBytes > 0 ? Math.round(downloadedBytes / totalBytes * 100) : 0;
+    return res.json({ status: allDone ? 'complete' : 'downloading', downloadedBytes, totalBytes, percent });
+  }
+  res.json({ status: 'none', downloadedBytes: 0, totalBytes: 0, percent: 0 });
+});
+
+module.exports = router;
+module.exports.bgDownloads = bgDownloads;
+module.exports.cleanupBgDownload = cleanupBgDownload;
+module.exports.extractFormats = extractFormats;
+module.exports.buildMPD = buildMPD;

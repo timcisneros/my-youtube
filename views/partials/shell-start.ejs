@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <%- include('head') %>
+<% if (typeof extraHead !== 'undefined') { %><%- extraHead %><% } %>
+</head>
+<body>
+  <%- include('nav') %>
+  <main class="container<%= typeof mainClass !== 'undefined' && mainClass ? ' ' + mainClass : '' %>">

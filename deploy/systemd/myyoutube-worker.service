@@ -1,0 +1,47 @@
+[Unit]
+Description=my-youtube extraction worker (BullMQ)
+Documentation=https://github.com/your-org/my-youtube
+After=network.target redis.service
+Wants=redis.service
+Requires=redis.service
+
+[Service]
+Type=simple
+User=myyoutube
+Group=myyoutube
+WorkingDirectory=/opt/myyoutube/app
+ExecStart=/usr/bin/node extraction-worker.js
+EnvironmentFile=/etc/myyoutube/env
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/myyoutube/app/data
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# Resource limits — extraction workers are CPU/memory intensive
+LimitNOFILE=65535
+LimitNPROC=4096
+MemoryMax=6G
+TasksMax=256
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=myyoutube-worker
+
+# Graceful shutdown: let in-flight extractions finish
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,55 @@
+    // Linkify URLs in the description using safe DOM manipulation
+    function youtubeUrlToLocal(url) {
+      try {
+        var u = new URL(url);
+        var host = u.hostname.replace(/^(www|m)\./, '');
+        if (host === 'youtube.com') {
+          var v = u.searchParams.get('v');
+          if (u.pathname === '/watch' && v) return '/watch?v=' + v + (u.searchParams.get('t') ? '&t=' + u.searchParams.get('t') : '');
+          if (u.pathname.startsWith('/channel/')) return u.pathname;
+          if (u.pathname.startsWith('/@')) return '/channel/' + u.pathname.slice(1);
+          if (u.pathname.startsWith('/shorts/')) return '/watch?v=' + u.pathname.slice(8);
+        }
+        if (host === 'youtu.be') {
+          var id = u.pathname.slice(1);
+          if (id) return '/watch?v=' + id + (u.searchParams.get('t') ? '&t=' + u.searchParams.get('t') : '');
+        }
+      } catch {}
+      return null;
+    }
+
+    function linkifyDescription() {
+      var el = document.getElementById('player-desc-text');
+      if (!el || el.dataset.linkified) return;
+      var text = el.textContent;
+      if (!text.trim()) return;
+      el.dataset.linkified = '1';
+      var frag = document.createDocumentFragment();
+      var urlRe = /(https?:\/\/[^\s]+)/g;
+      var lastIdx = 0;
+      var match;
+      while ((match = urlRe.exec(text)) !== null) {
+        if (match.index > lastIdx) {
+          frag.appendChild(document.createTextNode(text.slice(lastIdx, match.index)));
+        }
+        var a = document.createElement('a');
+        var url = match[1];
+        var localPath = youtubeUrlToLocal(url);
+        if (localPath) {
+          a.href = localPath;
+        } else {
+          a.href = url;
+          a.target = '_blank';
+          a.rel = 'noopener';
+        }
+        a.textContent = url;
+        frag.appendChild(a);
+        lastIdx = urlRe.lastIndex;
+      }
+      if (lastIdx < text.length) {
+        frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+      }
+      el.textContent = '';
+      el.appendChild(frag);
+    }
+    linkifyDescription();

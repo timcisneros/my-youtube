@@ -1,0 +1,9 @@
+node_modules/
+data/
+dist/
+tmp/
+.env
+cookies.txt
+cookies.txt.tmp
+*.dump
+*.webm

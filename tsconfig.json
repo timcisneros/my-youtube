@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "outDir": "dist",
+    "rootDir": ".",
+    "strict": false,
+    "noImplicitAny": false,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "moduleDetection": "force",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": [
+    "*.ts",
+    "lib/**/*.ts",
+    "youtube/**/*.ts",
+    "routes/**/*.ts",
+    "scripts/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "public",
+    "views",
+    "tests",
+    "data"
+  ]
+}

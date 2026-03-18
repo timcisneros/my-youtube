@@ -1,0 +1,419 @@
+---
+# my-youtube single-server provisioning playbook
+#
+# Provisions a complete my-youtube instance on a single Ubuntu server:
+# Node.js 22, yt-dlp, ffmpeg, Redis, nginx, Let's Encrypt, systemd services.
+#
+# Usage:
+#   ansible-playbook -i inventory playbook.yml
+#
+# Variables (set in inventory or --extra-vars):
+#   domain:           Your domain name (e.g., yourtube.example.com)
+#   certbot_email:    Email for Let's Encrypt notifications
+#   repo_url:         Git repository URL for my-youtube
+#   repo_branch:      Git branch to deploy (default: main)
+#   session_secret:   Express session secret
+#   stream_secret:    Stream token HMAC secret
+#   use_redis:        Enable Redis (default: true)
+#   use_postgres:     Use PostgreSQL instead of SQLite (default: false)
+#   postgres_password: PostgreSQL password (required if use_postgres=true)
+
+- name: Provision my-youtube server
+  hosts: myyoutube
+  become: true
+  vars:
+    app_user: myyoutube
+    app_dir: /opt/myyoutube/app
+    config_dir: /etc/myyoutube
+    repo_branch: main
+    use_redis: true
+    use_postgres: false
+    node_major: 22
+    max_concurrent_ytdlp: 4
+    max_extraction_workers: 2
+
+  tasks:
+    # --- System Setup ---
+
+    - name: Update apt cache
+      apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      apt:
+        name:
+          - curl
+          - git
+          - ffmpeg
+          - ufw
+          - fail2ban
+          - unattended-upgrades
+          - python3
+        state: present
+
+    # --- Node.js 22 ---
+
+    - name: Add NodeSource GPG key
+      shell: |
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg
+      args:
+        creates: /usr/share/keyrings/nodesource.gpg
+
+    - name: Add NodeSource repository
+      copy:
+        content: "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_{{ node_major }}.x nodistro main\n"
+        dest: /etc/apt/sources.list.d/nodesource.list
+        mode: "0644"
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+        update_cache: true
+
+    # --- yt-dlp ---
+
+    - name: Install yt-dlp
+      get_url:
+        url: https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp
+        dest: /usr/local/bin/yt-dlp
+        mode: "0755"
+
+    - name: Set up yt-dlp auto-update cron
+      cron:
+        name: "Update yt-dlp"
+        minute: "0"
+        hour: "4"
+        job: "/usr/local/bin/yt-dlp -U && systemctl restart myyoutube-worker 2>/dev/null; true"
+        user: root
+
+    # --- Redis (optional) ---
+
+    - name: Install Redis
+      apt:
+        name: redis-server
+        state: present
+      when: use_redis
+
+    - name: Configure Redis maxmemory
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^# maxmemory "
+        line: "maxmemory 512mb"
+      when: use_redis
+      notify: restart redis
+
+    - name: Configure Redis maxmemory-policy
+      lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: "^# maxmemory-policy"
+        line: "maxmemory-policy allkeys-lru"
+      when: use_redis
+      notify: restart redis
+
+    - name: Enable Redis
+      systemd:
+        name: redis-server
+        enabled: true
+        state: started
+      when: use_redis
+
+    # --- PostgreSQL (optional) ---
+
+    - name: Install PostgreSQL
+      apt:
+        name:
+          - postgresql
+          - postgresql-contrib
+        state: present
+      when: use_postgres
+
+    - name: Create PostgreSQL user
+      become_user: postgres
+      shell: |
+        psql -tc "SELECT 1 FROM pg_roles WHERE rolname='myyoutube'" | grep -q 1 || \
+        psql -c "CREATE USER myyoutube WITH PASSWORD '{{ postgres_password }}';"
+      when: use_postgres
+
+    - name: Create PostgreSQL database
+      become_user: postgres
+      shell: |
+        psql -tc "SELECT 1 FROM pg_database WHERE datname='myyoutube'" | grep -q 1 || \
+        psql -c "CREATE DATABASE myyoutube OWNER myyoutube;"
+      when: use_postgres
+
+    # --- Application User and Directory ---
+
+    - name: Create myyoutube system user
+      user:
+        name: "{{ app_user }}"
+        system: true
+        create_home: true
+        shell: /bin/bash
+
+    - name: Create application directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0755"
+      loop:
+        - /opt/myyoutube
+        - "{{ config_dir }}"
+        - /opt/myyoutube/backups
+
+    # --- Clone and Install ---
+
+    - name: Clone my-youtube repository
+      become_user: "{{ app_user }}"
+      git:
+        repo: "{{ repo_url }}"
+        dest: "{{ app_dir }}"
+        version: "{{ repo_branch }}"
+        force: false
+      register: git_result
+
+    - name: Install npm dependencies
+      become_user: "{{ app_user }}"
+      shell: npm ci --production
+      args:
+        chdir: "{{ app_dir }}"
+      when: git_result.changed
+
+    # --- Generate Secrets ---
+
+    - name: Generate session secret if not provided
+      set_fact:
+        session_secret: "{{ lookup('pipe', 'openssl rand -hex 32') }}"
+      when: session_secret is not defined
+
+    - name: Generate stream secret if not provided
+      set_fact:
+        stream_secret: "{{ lookup('pipe', 'openssl rand -hex 32') }}"
+      when: stream_secret is not defined
+
+    # --- Environment Configuration ---
+
+    - name: Write environment file
+      template:
+        src: env.j2
+        dest: "{{ config_dir }}/env"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: "0600"
+      notify:
+        - restart myyoutube
+        - restart myyoutube-worker
+
+    # --- nginx ---
+
+    - name: Install nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Copy nginx site config
+      template:
+        src: nginx-site.j2
+        dest: /etc/nginx/sites-available/myyoutube
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Add nginx cache zones to main config
+      blockinfile:
+        path: /etc/nginx/nginx.conf
+        insertafter: "http {"
+        marker: "# {mark} MYYOUTUBE CACHE ZONES"
+        block: |
+          proxy_cache_path /var/cache/nginx/poster levels=1:2 keys_zone=poster_cache:10m max_size=1g inactive=24h;
+          proxy_cache_path /var/cache/nginx/storyboard levels=1:2 keys_zone=storyboard_cache:10m max_size=2g inactive=24h;
+      notify: reload nginx
+
+    - name: Create nginx cache directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: "0755"
+      loop:
+        - /var/cache/nginx/poster
+        - /var/cache/nginx/storyboard
+
+    - name: Enable nginx site
+      file:
+        src: /etc/nginx/sites-available/myyoutube
+        dest: /etc/nginx/sites-enabled/myyoutube
+        state: link
+      notify: reload nginx
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Enable nginx
+      systemd:
+        name: nginx
+        enabled: true
+        state: started
+
+    # --- Let's Encrypt ---
+
+    - name: Install certbot
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    - name: Obtain Let's Encrypt certificate
+      shell: >
+        certbot --nginx
+        --non-interactive
+        --agree-tos
+        --email {{ certbot_email }}
+        --domains {{ domain }}
+        --redirect
+      args:
+        creates: "/etc/letsencrypt/live/{{ domain }}/fullchain.pem"
+
+    # --- Systemd Services ---
+
+    - name: Install myyoutube web service
+      copy:
+        src: "{{ app_dir }}/deploy/systemd/myyoutube.service"
+        dest: /etc/systemd/system/myyoutube.service
+        remote_src: true
+        mode: "0644"
+      notify: restart myyoutube
+
+    - name: Install myyoutube worker service
+      copy:
+        src: "{{ app_dir }}/deploy/systemd/myyoutube-worker.service"
+        dest: /etc/systemd/system/myyoutube-worker.service
+        remote_src: true
+        mode: "0644"
+      notify: restart myyoutube-worker
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: true
+
+    - name: Enable and start myyoutube
+      systemd:
+        name: myyoutube
+        enabled: true
+        state: started
+
+    - name: Enable and start myyoutube-worker
+      systemd:
+        name: myyoutube-worker
+        enabled: true
+        state: started
+      when: use_redis
+
+    # --- Firewall ---
+
+    - name: Configure UFW defaults
+      ufw:
+        direction: incoming
+        default: deny
+
+    - name: Allow SSH
+      ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Allow HTTP
+      ufw:
+        rule: allow
+        port: "80"
+        proto: tcp
+
+    - name: Allow HTTPS
+      ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    # --- Fail2ban ---
+
+    - name: Configure fail2ban for SSH
+      copy:
+        content: |
+          [sshd]
+          enabled = true
+          port = ssh
+          filter = sshd
+          logpath = /var/log/auth.log
+          maxretry = 3
+          bantime = 3600
+          findtime = 600
+        dest: /etc/fail2ban/jail.local
+        mode: "0644"
+      notify: restart fail2ban
+
+    - name: Enable fail2ban
+      systemd:
+        name: fail2ban
+        enabled: true
+        state: started
+
+    # --- Backup Cron ---
+
+    - name: Set up daily database backup
+      cron:
+        name: "Backup my-youtube database"
+        minute: "0"
+        hour: "3"
+        job: >
+          {% if use_postgres %}
+          pg_dump -U myyoutube -h localhost myyoutube | gzip > /opt/myyoutube/backups/pg-$(date +\%Y\%m\%d).sql.gz
+          {% else %}
+          sqlite3 {{ app_dir }}/data/tags.db ".backup /opt/myyoutube/backups/tags-$(date +\%Y\%m\%d).db"
+          {% endif %}
+        user: "{{ app_user }}"
+
+    - name: Set up backup rotation (keep 30 days)
+      cron:
+        name: "Rotate my-youtube backups"
+        minute: "30"
+        hour: "3"
+        job: "find /opt/myyoutube/backups -type f -mtime +30 -delete"
+        user: "{{ app_user }}"
+
+  # --- Handlers ---
+
+  handlers:
+    - name: restart redis
+      systemd:
+        name: redis-server
+        state: restarted
+
+    - name: reload nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
+    - name: restart myyoutube
+      systemd:
+        name: myyoutube
+        state: restarted
+
+    - name: restart myyoutube-worker
+      systemd:
+        name: myyoutube-worker
+        state: restarted
+
+    - name: restart fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted

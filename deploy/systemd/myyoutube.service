@@ -1,0 +1,46 @@
+[Unit]
+Description=my-youtube web application
+Documentation=https://github.com/your-org/my-youtube
+After=network.target postgresql.service redis.service
+Wants=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=myyoutube
+Group=myyoutube
+WorkingDirectory=/opt/myyoutube/app
+ExecStart=/usr/bin/node cluster.js
+EnvironmentFile=/etc/myyoutube/env
+Restart=always
+RestartSec=5
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/myyoutube/app/data
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+MemoryMax=4G
+TasksMax=512
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=myyoutube
+
+# Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

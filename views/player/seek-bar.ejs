@@ -1,0 +1,368 @@
+      // --- Seek bar ---
+      function formatTime(s) {
+        s = Math.floor(s);
+        var h = Math.floor(s / 3600);
+        var m = Math.floor((s % 3600) / 60);
+        var sec = s % 60;
+        var str = m + ':' + (sec < 10 ? '0' : '') + sec;
+        if (h > 0) str = h + ':' + (m < 10 ? '0' : '') + str;
+        return str;
+      }
+
+      var seekHoverTime = -1;
+      function segmentFill(time, segStart, segEnd) {
+        if (time <= segStart) return 0;
+        if (time >= segEnd) return 100;
+        return ((time - segStart) / (segEnd - segStart)) * 100;
+      }
+      function updateSeekBars() {
+        if (isLive) {
+          // Live: single segment, use pure percentages
+          var lr = getLiveRange();
+          var liveEnd = lr.end;
+          var liveStart = lr.start;
+          var liveRange = liveEnd - liveStart || 1;
+          var playedPct = (isSeeking || isDragging) ? seekValue * 100 : ((video.currentTime - liveStart) / liveRange) * 100;
+          var hoverPct = seekHoverTime >= 0 ? ((seekHoverTime - liveStart) / liveRange) * 100 : -1;
+          for (var i = 0; i < seekSegments.length; i++) {
+            var s = seekSegments[i];
+            s.played.style.width = Math.max(0, Math.min(100, playedPct)) + '%';
+            s.buffered.style.width = '100%';
+            if (hoverPct >= 0) {
+              s.hover.style.width = Math.max(0, Math.min(100, hoverPct)) + '%';
+              s.hover.style.display = 'block';
+            } else {
+              s.hover.style.display = 'none';
+            }
+          }
+          return;
+        }
+        var duration = video.duration || 0;
+        var currentTime = (isSeeking || isDragging) ? seekValue * duration : video.currentTime;
+        var bufferedEnd = 0;
+        if (video.buffered.length > 0) {
+          bufferedEnd = video.buffered.end(video.buffered.length - 1);
+          // Snap to full duration if within 1 second (DASH segment boundary rounding)
+          if (duration > 0 && duration - bufferedEnd < 1) bufferedEnd = duration;
+        }
+        for (var i = 0; i < seekSegments.length; i++) {
+          var s = seekSegments[i];
+          s.played.style.width = segmentFill(currentTime, s.start, s.end) + '%';
+          s.buffered.style.width = segmentFill(bufferedEnd, s.start, s.end) + '%';
+          if (seekHoverTime >= 0) {
+            s.hover.style.width = segmentFill(seekHoverTime, s.start, s.end) + '%';
+            s.hover.style.display = 'block';
+          } else {
+            s.hover.style.display = 'none';
+          }
+        }
+      }
+      // Cache seek bar rects — invalidate on resize/fullscreen instead of reading on every mousemove
+      var _seekRectsStale = true;
+      var _cachedRowRect = null;
+      var _cachedSegRects = [];
+      function _invalidateSeekRects() { _seekRectsStale = true; }
+      window.addEventListener('resize', _invalidateSeekRects);
+      document.addEventListener('fullscreenchange', _invalidateSeekRects);
+      function _refreshSeekRects() {
+        if (!_seekRectsStale) return;
+        _cachedRowRect = seekTrackRow.getBoundingClientRect();
+        _cachedSegRects = seekSegments.map(function (s) { return s.el.getBoundingClientRect(); });
+        _seekRectsStale = false;
+      }
+      function seekPctFromMouseRaw(e) {
+        _refreshSeekRects();
+        return Math.max(0, Math.min(1, (e.clientX - _cachedRowRect.left) / _cachedRowRect.width));
+      }
+      function seekTimeFromMouse(e) {
+        if (isLive) {
+          var lr = getLiveRange();
+          var end = lr.end;
+          var start = lr.start;
+          return start + seekPctFromMouseRaw(e) * (end - start);
+        }
+        var duration = video.duration || 0;
+        if (!duration) return 0;
+        _refreshSeekRects();
+        // Check each segment for precise time mapping
+        for (var i = 0; i < seekSegments.length; i++) {
+          var s = seekSegments[i];
+          var rect = _cachedSegRects[i] || s.el.getBoundingClientRect();
+          if (e.clientX >= rect.left && e.clientX <= rect.right) {
+            var localPct = (e.clientX - rect.left) / rect.width;
+            return s.start + localPct * (s.end - s.start);
+          }
+        }
+        // Fallback: if in a gap or outside, use nearest segment
+        return seekPctFromMouseRaw(e) * duration;
+      }
+      function seekPctFromMouse(e) {
+        if (isLive) return seekPctFromMouseRaw(e);
+        return seekTimeFromMouse(e) / (video.duration || 1);
+      }
+      function updateThumbPosition() {
+        if (isSeeking || isDragging) {
+          seekThumb.style.setProperty('--seek', seekValue);
+          return;
+        }
+        if (isLive) {
+          var lr = getLiveRange();
+          var range = lr.end - lr.start || 1;
+          seekThumb.style.setProperty('--seek', (video.currentTime - lr.start) / range);
+        } else {
+          var dur = video.duration || 0;
+          seekThumb.style.setProperty('--seek', dur ? video.currentTime / dur : 0);
+        }
+      }
+      var hoveredSegment = null;
+      seekBarContainer.addEventListener('mousemove', function (e) {
+        seekHoverTime = seekTimeFromMouse(e);
+        // Find which segment the mouse is over
+        var newHovered = null;
+        if (isLive) {
+          // Live: always single segment
+          if (seekSegments.length) newHovered = seekSegments[0];
+        } else {
+          for (var i = 0; i < seekSegments.length; i++) {
+            if (seekHoverTime >= seekSegments[i].start && seekHoverTime < seekSegments[i].end) {
+              newHovered = seekSegments[i];
+              break;
+            }
+          }
+          // Last segment edge case
+          if (!newHovered && seekSegments.length) newHovered = seekSegments[seekSegments.length - 1];
+        }
+        if (newHovered !== hoveredSegment) {
+          if (hoveredSegment) hoveredSegment.el.classList.remove('seek-segment-hover');
+          if (newHovered) newHovered.el.classList.add('seek-segment-hover');
+          hoveredSegment = newHovered;
+        }
+        seekBarContainer.classList.add('expanded');
+        updateSeekBars();
+      });
+      seekBarContainer.addEventListener('mouseleave', function () {
+        seekHoverTime = -1;
+        seekBarContainer.classList.remove('expanded');
+        if (hoveredSegment) {
+          hoveredSegment.el.classList.remove('seek-segment-hover');
+          hoveredSegment = null;
+        }
+        updateSeekBars();
+      });
+
+      var seekDebounce = 0;
+      var isSeeking = false;
+      var isDragging = false;
+
+      function seekTo(pct) {
+        seekValue = pct;
+        isSeeking = true;
+        updateSeekBars();
+        updateThumbPosition();
+        if (isLive) {
+          var lr = getLiveRange();
+          var end = lr.end;
+          var start = lr.start;
+          var target = start + pct * (end - start);
+          clearTimeout(seekDebounce);
+          seekDebounce = setTimeout(function () {
+            if (engine.recovering) { engine.seekDuringRecovery(target); isSeeking = false; return; }
+            video.currentTime = target;
+            isSeeking = false;
+          }, 125);
+        } else {
+          var duration = video.duration || 0;
+          timeDisplay.textContent = formatTime(pct * duration) + ' / ' + formatTime(duration);
+          clearTimeout(seekDebounce);
+          seekDebounce = setTimeout(function () {
+            if (engine.recovering) { engine.seekDuringRecovery(pct * duration); isSeeking = false; return; }
+            video.currentTime = pct * duration;
+            isSeeking = false;
+          }, 125);
+        }
+      }
+
+      seekBarContainer.addEventListener('mousedown', function (e) {
+        if (e.button !== 0) return;
+        isDragging = true;
+        seekTo(seekPctFromMouse(e));
+        e.preventDefault();
+      });
+      document.addEventListener('mousemove', function (e) {
+        if (!isDragging) return;
+        seekTo(seekPctFromMouse(e));
+      });
+      document.addEventListener('mouseup', function () {
+        if (!isDragging) return;
+        isDragging = false;
+        clearTimeout(seekDebounce);
+        if (engine.recovering) {
+          if (isLive) {
+            var lr = getLiveRange();
+            engine.seekDuringRecovery(lr.start + seekValue * (lr.end - lr.start));
+          } else {
+            engine.seekDuringRecovery(seekValue * (video.duration || 0));
+          }
+          isSeeking = false;
+          return;
+        }
+        if (isLive) {
+          var lr = getLiveRange();
+          var end = lr.end;
+          var start = lr.start;
+          video.currentTime = start + seekValue * (end - start);
+        } else {
+          video.currentTime = seekValue * (video.duration || 0);
+        }
+        if (video.ended) video.play().catch(function () {});
+        isSeeking = false;
+      });
+
+      function checkLive() {
+        var wasLive = isLive;
+        safePlayerCall(function () { isLive = player.isLive(); });
+        if (!isLive) isLive = !isFinite(video.duration) && video.duration > 0;
+        engine.setLive(isLive);
+        if (isLive && !wasLive) {
+          buildSegments(null);
+          safePlayerCall(function () { player.configure('manifest.availabilityWindowOverride', Infinity); });
+          timeDisplay.innerHTML = '<span class="live-dot"></span>Live';
+          timeDisplay.classList.add('player-live');
+          timeDisplay.style.cursor = 'pointer';
+          timeDisplay.addEventListener('click', function () {
+            if (!isLive) return;
+            var range = getLiveRange();
+            video.currentTime = range.end;
+          });
+        } else if (!isLive && wasLive) {
+          timeDisplay.classList.remove('player-live');
+        }
+      }
+      video.addEventListener('timeupdate', function () {
+        if (isSeeking || isDragging || engine.recoveryTransition) return;
+        if (isLive) {
+          var lr = getLiveRange();
+          var end = lr.end;
+          var start = lr.start;
+          var range = end - start || 1;
+          seekValue = (video.currentTime - start) / range;
+          var behindLive = end - video.currentTime > 10;
+          var dot = timeDisplay.querySelector('.live-dot');
+          if (dot) dot.style.background = behindLive ? '#888' : '#f00';
+          updateSeekBars();
+          updateThumbPosition();
+          return;
+        }
+        var duration = video.duration || 0;
+        if (duration) seekValue = video.currentTime / duration;
+        timeDisplay.textContent = formatTime(video.currentTime) + ' / ' + formatTime(duration);
+        updateSeekBars();
+        updateThumbPosition();
+      });
+      video.addEventListener('progress', updateSeekBars);
+      video.addEventListener('loadedmetadata', function () {
+        checkLive();
+        if (!isLive && !engine.recoveryTransition) {
+          buildSegments(null);
+          timeDisplay.textContent = '0:00 / ' + formatTime(video.duration || 0);
+          updateSeekBars();
+          updateThumbPosition();
+        }
+      });
+      video.addEventListener('durationchange', function () {
+        checkLive();
+        if (!isLive && seekSegments.length > 0) {
+          var chapters = window._chapterList && window._chapterList.length > 1 ? window._chapterList : null;
+          buildSegments(chapters);
+          updateSeekBars();
+        }
+      });
+      player.addEventListener('loaded', checkLive);
+
+      // --- Controls auto-hide ---
+      var hideTimer = 0;
+      function showControls() {
+        controlsContainer.setAttribute('shown', '');
+        container.classList.add('controls-visible');
+        videoContainer.classList.remove('no-cursor');
+        clearTimeout(hideTimer);
+        if (!video.paused && !isAnyMenuOpen()) {
+          hideTimer = setTimeout(hideControls, 3000);
+        }
+      }
+      function hideControls() {
+        if (video.paused || isAnyMenuOpen()) return;
+        controlsContainer.removeAttribute('shown');
+        container.classList.remove('controls-visible');
+        videoContainer.classList.add('no-cursor');
+      }
+
+      container.addEventListener('mousemove', showControls);
+      container.addEventListener('mouseenter', showControls);
+      container.addEventListener('touchstart', showControls);
+      container.addEventListener('mouseleave', function () {
+        if (!video.paused) {
+          clearTimeout(hideTimer);
+          hideControls();
+        }
+      });
+      video.addEventListener('play', function () {
+        showControls();
+      });
+      video.addEventListener('pause', function () {
+        showControls();
+      });
+
+      // Toggle paused class so CSS can prevent cursor hiding when paused
+      function updatePausedClass() {
+        videoContainer.classList.toggle('video-paused', video.paused);
+      }
+      video.addEventListener('play', updatePausedClass);
+      video.addEventListener('pause', updatePausedClass);
+      updatePausedClass();
+
+      // --- Flash feedback ---
+      var playSvg = '<svg viewBox="0 0 36 36" width="36" height="36">' + ytIcons.PLAY + '</svg>';
+      var pauseSvg = '<svg viewBox="0 0 36 36" width="36" height="36">' + ytIcons.PAUSE + '</svg>';
+      function showFlash(svg) {
+        flash.innerHTML = svg;
+        flash.classList.remove('flash-anim');
+        void flash.offsetWidth;
+        flash.classList.add('flash-anim');
+      }
+      videoContainer.addEventListener('click', function (e) {
+        if (!container.classList.contains('player-ready')) return;
+        if (e.target.closest('button') || e.target.closest('.player-controls-bar') || e.target.closest('.player-seek-bar-container') || e.target.closest('.player-overflow-menu') || e.target.closest('.player-quality-menu') || e.target.closest('.player-rate-menu') || e.target.closest('.custom-caption-menu')) return;
+        if (video.paused) {
+          video.play();
+          showFlash(playSvg);
+        } else {
+          video.pause();
+          showFlash(pauseSvg);
+        }
+      });
+
+
+      // --- Fast seeking ---
+      var seekRestoreTimer = 0;
+      var seekingActive = false;
+      video.addEventListener('seeking', function () {
+        if (seekRestoreTimer) { clearTimeout(seekRestoreTimer); seekRestoreTimer = 0; }
+        if (!seekingActive) {
+          seekingActive = true;
+          safePlayerCall(function () {
+            player.configure('streaming.rebufferingGoal', 0.01);
+            player.configure('streaming.bufferingGoal', 1);
+          });
+        }
+      });
+      video.addEventListener('seeked', function () {
+        if (seekRestoreTimer) clearTimeout(seekRestoreTimer);
+        seekRestoreTimer = setTimeout(function () {
+          seekingActive = false;
+          safePlayerCall(function () {
+            player.configure('streaming.rebufferingGoal', 0.3);
+            player.configure('streaming.bufferingGoal', 120);
+          });
+        }, 300);
+      });

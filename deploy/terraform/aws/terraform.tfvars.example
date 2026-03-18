@@ -1,0 +1,37 @@
+# AWS Configuration for my-youtube
+# Copy this file to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+
+# AWS credentials are best set via environment variables:
+#   export AWS_ACCESS_KEY_ID="your-access-key"
+#   export AWS_SECRET_ACCESS_KEY="your-secret-key"
+
+# Region and AZ
+region            = "us-east-1"
+availability_zone = "us-east-1a"
+
+# SSH access
+ssh_public_key  = "ssh-ed25519 AAAA... you@example.com"
+ssh_allowed_ips = ["1.2.3.4/32"]  # Your IP address
+
+# Domain
+domain = "yourtube.example.com"
+
+# Instance types (adjust for your workload)
+web_instance_type     = "t3.medium"   # 2 vCPU, 4GB — ~$30/mo
+worker_instance_type  = "t3.large"    # 2 vCPU, 8GB — ~$60/mo
+db_instance_type      = "t3.medium"   # 2 vCPU, 4GB — ~$30/mo
+storage_instance_type = "t3.medium"   # 2 vCPU, 4GB — ~$30/mo
+
+# Volume sizes
+db_volume_size      = 50   # GB for PostgreSQL data
+storage_volume_size = 200  # GB for MinIO media storage
+
+# Credentials — use strong random values!
+# Generate with: openssl rand -hex 32
+postgres_password = "CHANGE_ME_postgres_password"
+redis_password    = "CHANGE_ME_redis_password"
+s3_access_key     = "myyoutube-admin"
+s3_secret_key     = "CHANGE_ME_minio_secret"
+session_secret    = "CHANGE_ME_session_hex_secret"
+stream_secret     = "CHANGE_ME_stream_hex_secret"

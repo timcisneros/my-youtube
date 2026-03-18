@@ -1,0 +1,117 @@
+version: '3.8'
+
+services:
+  # --- Infrastructure ---
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: myyoutube
+      POSTGRES_USER: myyoutube
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U myyoutube"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9001:9001"  # MinIO console (optional, remove in production)
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Create the S3 bucket on first start
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb --ignore-existing local/myyoutube;
+      exit 0;
+      "
+
+  # --- Application ---
+
+  web:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgres://myyoutube:${POSTGRES_PASSWORD:-changeme}@postgres:5432/myyoutube
+      REDIS_URL: redis://redis:6379
+      STORAGE_URL: s3://myyoutube
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
+      S3_REGION: us-east-1
+      SESSION_SECRET: ${SESSION_SECRET:-change-this-in-production}
+      STREAM_SECRET: ${STREAM_SECRET:-}
+      MAX_CONCURRENT_YTDLP: ${MAX_CONCURRENT_YTDLP:-4}
+    volumes:
+      - app_data:/app/data
+      - ./cookies.txt:/app/cookies.txt:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/favicon.ico"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  extraction-worker:
+    build: .
+    restart: unless-stopped
+    command: ["node", "extraction-worker.js"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_URL: redis://redis:6379
+      MAX_EXTRACTION_WORKERS: ${MAX_EXTRACTION_WORKERS:-2}
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro
+    # Scale workers: docker compose up --scale extraction-worker=3
+    deploy:
+      replicas: ${EXTRACTION_REPLICAS:-1}
+
+volumes:
+  pg_data:
+  redis_data:
+  minio_data:
+  app_data:

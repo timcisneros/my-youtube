@@ -1,0 +1,52 @@
+    <h1>Explore</h1>
+    <div class="topic-filters-section">
+      <% if (topicFilters && topicFilters.length > 0) { %>
+        <div class="topic-filter-pills">
+          <% for (const tf of topicFilters) { %>
+            <span class="topic-pill <%= tf.filter === 'boost' ? 'topic-boost' : 'topic-suppress' %>">
+              <%= tf.topic %>
+              <button class="topic-pill-remove" data-topic="<%= tf.topic %>">&times;</button>
+            </span>
+          <% } %>
+        </div>
+      <% } %>
+      <button class="topic-filter-add-btn" id="topic-filter-toggle">+ Topic filter</button>
+      <button class="topic-filter-add-btn" id="reset-recommendations-btn" style="margin-left:8px;color:#c44;">Reset recommendations</button>
+      <div class="topic-filter-form" id="topic-filter-form" style="display:none;">
+        <input type="text" id="topic-filter-input" placeholder="Topic keyword" minlength="2" maxlength="30">
+        <select id="topic-filter-type">
+          <option value="boost">Boost</option>
+          <option value="suppress">Suppress</option>
+        </select>
+        <button id="topic-filter-save" class="topic-filter-save-btn">Add</button>
+        <button id="topic-filter-cancel" class="topic-filter-cancel-btn">Cancel</button>
+      </div>
+    </div>
+    <% if (videos.length === 0) { %>
+      <p class="empty">Watch some videos first to get personalized recommendations.</p>
+    <% } else { %>
+      <div class="video-grid" data-session-id="<%= typeof sessionId !== 'undefined' ? sessionId : '' %>">
+        <% for (let _ei = 0; _ei < videos.length; _ei++) { const v = videos[_ei]; %>
+          <a href="/watch?v=<%= v.videoId %>" class="video-card" data-channel-id="<%= v.channelId %>" data-explore-pos="<%= _ei %>">
+            <div class="video-thumb-wrap">
+              <img data-src="/api/stream/<%= v.videoId %>/thumb" alt="" class="video-thumb lazy-thumb" width="320" height="180">
+              <% if (liveStatuses[v.videoId] === 'is_live') { %><span class="video-badge live" data-video-id="<%= v.videoId %>">LIVE</span><% } else if (liveStatuses[v.videoId] === 'is_upcoming') { %><span class="video-badge upcoming" data-video-id="<%= v.videoId %>">UPCOMING</span><% } else if (durations[v.videoId]) { %><span class="video-duration" data-video-id="<%= v.videoId %>"><%= durations[v.videoId] %></span><% } else { %><span class="video-duration" data-video-id="<%= v.videoId %>"></span><% } %>
+              <div class="watch-progress" data-progress-id="<%= v.videoId %>"></div>
+              <button class="dismiss-btn" data-dismiss-id="<%= v.videoId %>" title="Not interested">&times;</button>
+              <button class="boost-btn<%= boostedSet && boostedSet.has(v.channelId) ? ' boosted' : '' %>" data-boost-channel="<%= v.channelId %>" title="Boost this channel">&#x2B06;</button>
+              <button class="queue-btn<%= queuedSet && queuedSet.has(v.videoId) ? ' queued' : '' %>" data-queue-id="<%= v.videoId %>" data-queue-title="<%= v.title %>" data-queue-channel="<%= v.channelTitle %>" data-queue-channel-id="<%= v.channelId %>" title="Add to queue">&#x1F551;</button>
+              <button class="rate-up-btn<%= ratedMap && ratedMap.get(v.videoId) === 1 ? ' rated-up' : '' %>" data-rate-id="<%= v.videoId %>" data-rate-value="1" title="Thumbs up">&#x1F44D;</button>
+              <button class="rate-down-btn<%= ratedMap && ratedMap.get(v.videoId) === -1 ? ' rated-down' : '' %>" data-rate-id="<%= v.videoId %>" data-rate-value="-1" title="Thumbs down">&#x1F44E;</button>
+            </div>
+            <div class="video-info">
+              <% if (newSet && newSet.has(v.videoId)) { %><span class="new-badge">NEW</span><% } %><% if (v.reason) { %><span class="reason-badge reason-<%= v.reason.replace(/\s+/g, '-') %>"><%= v.reason %></span><% } %>
+              <div class="video-title"><%= v.title %></div>
+              <div class="video-channel"><%= v.channelTitle %> <button class="mute-btn<%= mutedSet && mutedSet.has(v.channelId) ? ' muted' : '' %>" data-mute-channel="<%= v.channelId %>" title="Mute this channel">&#x1F507;</button></div>
+              <div class="video-time" data-published="<%= v.publishedAt %>"></div>
+            </div>
+          </a>
+        <% } %>
+      </div>
+    <% } %>
+    <script>document.querySelectorAll('[data-published]').forEach(function(el) { if (el.dataset.published) el.textContent = timeAgo(el.dataset.published); });</script>
+  </main>

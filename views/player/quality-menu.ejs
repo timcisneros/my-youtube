@@ -1,0 +1,189 @@
+      // --- Quality menu ---
+      (function () {
+        var savedQuality = localStorage.getItem('player-quality');
+        var abrEnabled = !savedQuality || savedQuality === 'auto';
+        var qualityBackBtn = document.createElement('button');
+        qualityBackBtn.className = 'player-back-btn';
+        var qbSvg = document.createElementNS(SVG_NS, 'svg');
+        qbSvg.classList.add('material-svg-icon');
+        qbSvg.setAttribute('viewBox', '0 -960 960 960');
+        var qbPath = document.createElementNS(SVG_NS, 'path');
+        qbPath.setAttribute('d', 'M560-240 320-480l240-240 56 56-184 184 184 184-56 56Z');
+        qbSvg.appendChild(qbPath);
+        qualityBackBtn.appendChild(qbSvg);
+        var qbSpan = document.createElement('span');
+        qbSpan.textContent = 'Quality';
+        qualityBackBtn.appendChild(qbSpan);
+        qualityBackBtn.addEventListener('click', function () {
+          qualityMenu.classList.add('player-menu-hidden');
+          overflowMenu.classList.remove('player-menu-hidden');
+        });
+        qualityMenu.appendChild(qualityBackBtn);
+
+        function makeCheckmark() {
+          var svg = document.createElementNS(SVG_NS, 'svg');
+          svg.setAttribute('viewBox', '0 -960 960 960');
+          svg.setAttribute('fill', 'currentColor');
+          svg.classList.add('material-svg-icon', 'player-chosen-item');
+          svg.setAttribute('aria-hidden', 'true');
+          var p = document.createElementNS(SVG_NS, 'path');
+          p.setAttribute('d', 'm382-354 339-339q12-12 28-12t28 12q12 12 12 28.5T777-636L410-268q-12 12-28 12t-28-12L182-440q-12-12-11.5-28.5T183-497q12-12 28.5-12t28.5 12l142 143Z');
+          svg.appendChild(p);
+          return svg;
+        }
+
+        window._rebuildQualityMenu = rebuildQualityMenu;
+        function rebuildQualityMenu() {
+          if (engine.recovering || engine.networkTrouble) return;
+          // Remove all children except back button
+          var children = qualityMenu.querySelectorAll('button:not(.player-back-btn)');
+          for (var i = 0; i < children.length; i++) children[i].remove();
+
+          var tracks = [];
+          try { tracks = player.getVariantTracks(); } catch (e) {}
+          var isProgressive = !player.getAssetUri();
+
+          if (isProgressive) {
+            // Progressive mode — show current resolution only
+            var h = video.videoHeight || 0;
+            if (h) {
+              var btn = document.createElement('button');
+              var span = document.createElement('span');
+              span.textContent = h + 'p';
+              span.classList.add('player-chosen-item');
+              btn.appendChild(makeCheckmark());
+              btn.appendChild(span);
+              qualityMenu.appendChild(btn);
+            }
+            return;
+          }
+
+          // Dedupe by height
+          var seen = {};
+          var unique = [];
+          for (var i = 0; i < tracks.length; i++) {
+            var h = tracks[i].height;
+            if (h && !seen[h]) {
+              seen[h] = true;
+              unique.push(tracks[i]);
+            }
+          }
+          unique.sort(function (a, b) { return b.height - a.height; });
+
+          // Auto option
+          var autoBtn = document.createElement('button');
+          var autoSpan = document.createElement('span');
+          autoSpan.textContent = 'Auto';
+          if (abrEnabled) {
+            autoSpan.classList.add('player-chosen-item');
+            autoBtn.appendChild(makeCheckmark());
+          }
+          autoBtn.appendChild(autoSpan);
+          autoBtn.addEventListener('click', function () {
+            abrEnabled = true;
+            localStorage.setItem('player-quality', 'auto');
+            safePlayerCall(function () { player.configure({ abr: { enabled: true } }); });
+            rebuildQualityMenu();
+            updateQualityState();
+          });
+          qualityMenu.appendChild(autoBtn);
+
+          for (var j = 0; j < unique.length; j++) {
+            (function (track) {
+              var btn = document.createElement('button');
+              var span = document.createElement('span');
+              span.textContent = track.height + 'p';
+              if (!abrEnabled && track.active) {
+                span.classList.add('player-chosen-item');
+                btn.appendChild(makeCheckmark());
+              }
+              btn.appendChild(span);
+              btn.addEventListener('click', function () {
+                abrEnabled = false;
+                localStorage.setItem('player-quality', String(track.height));
+                safePlayerCall(function () {
+                  player.configure({ abr: { enabled: false } });
+                  player.selectVariantTrack(track, true);
+                });
+                rebuildQualityMenu();
+                updateQualityState();
+              });
+              qualityMenu.appendChild(btn);
+            })(unique[j]);
+          }
+        }
+
+        window._updateQualityState = updateQualityState;
+        function updateQualityState() {
+          if (engine.recovering || engine.networkTrouble) return;
+          var isProgressive = false;
+          safePlayerCall(function () { isProgressive = !player.getAssetUri(); });
+          if (isProgressive) {
+            var h = video.videoHeight || 0;
+            qualityRow.stateSpan.textContent = h ? h + 'p' : '';
+          } else if (abrEnabled) {
+            qualityRow.stateSpan.textContent = 'Auto';
+          } else {
+            var tracks = [];
+            try { tracks = player.getVariantTracks(); } catch (e) {}
+            for (var i = 0; i < tracks.length; i++) {
+              if (tracks[i].active) {
+                qualityRow.stateSpan.textContent = tracks[i].height + 'p';
+                break;
+              }
+            }
+          }
+          syncHdBadge();
+        }
+
+        function syncHdBadge() {
+          var isHd = false;
+          try {
+            var tracks = player.getVariantTracks();
+            for (var i = 0; i < tracks.length; i++) {
+              if (tracks[i].active && tracks[i].height >= 720) {
+                isHd = true;
+                break;
+              }
+            }
+          } catch (e) {}
+          settingsBtn.classList.toggle('yt-hd-active', isHd);
+        }
+
+        // Debounce quality menu rebuilds — multiple events fire per track change
+        // Restore saved quality preference once tracks are available
+        var _qualityRestored = false;
+        function restoreSavedQuality() {
+          if (_qualityRestored || !savedQuality || savedQuality === 'auto') return;
+          var tracks = [];
+          try { tracks = player.getVariantTracks(); } catch (e) {}
+          if (!tracks.length) return;
+          var targetHeight = parseInt(savedQuality, 10);
+          var match = tracks.find(function (t) { return t.height === targetHeight; });
+          if (match) {
+            abrEnabled = false;
+            safePlayerCall(function () {
+              player.configure({ abr: { enabled: false } });
+              player.selectVariantTrack(match, true);
+            });
+            _qualityRestored = true;
+          }
+        }
+
+        var _qualityRebuildPending = false;
+        function scheduleQualityRebuild() {
+          if (_qualityRebuildPending) return;
+          _qualityRebuildPending = true;
+          requestAnimationFrame(function () {
+            _qualityRebuildPending = false;
+            restoreSavedQuality();
+            rebuildQualityMenu();
+            updateQualityState();
+          });
+        }
+        player.addEventListener('variantchanged', scheduleQualityRebuild);
+        player.addEventListener('trackschanged', scheduleQualityRebuild);
+        player.addEventListener('adaptation', scheduleQualityRebuild);
+        player.addEventListener('loaded', scheduleQualityRebuild);
+        video.addEventListener('loadedmetadata', scheduleQualityRebuild);
+      })();

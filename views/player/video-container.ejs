@@ -1,0 +1,73 @@
+    <div class="player-embed" id="player-container">
+      <div class="player-loading"><div class="player-spinner"></div></div>
+      <video id="player" class="player-video"
+        poster="/api/stream/<%= video.videoId %>/poster" fetchpriority="high"
+      ></video>
+    </div>
+    <div class="player-primary">
+      <h1 class="player-title"><%= video.title %></h1>
+      <div class="player-channel-row">
+        <% if (video.channelId) { %>
+          <img src="/channel/<%= video.channelId %>/avatar" alt="" class="player-channel-avatar" loading="lazy" width="36" height="36">
+          <div class="player-channel-info">
+            <a href="/channel/<%= video.channelId %>" class="player-channel"><%= video.channelTitle %></a>
+            <span class="player-subs" id="player-subs"></span>
+          </div>
+        <% } else { %>
+          <div class="player-channel-info">
+            <span class="player-channel" id="player-channel-wrap"><%= video.channelTitle %></span>
+            <span class="player-subs" id="player-subs"></span>
+          </div>
+        <% } %>
+      </div>
+      <div class="player-toolbar">
+        <span class="player-stats" id="player-stats">
+          <% if (video.viewCount != null) { %><span class="stat-item"><svg class="stat-icon" viewBox="0 0 24 24" width="16" height="16"><path d="M8 5v14l11-7z" fill="currentColor"/></svg> <%= Number(video.viewCount).toLocaleString() %></span><% } %>
+          <% if (video.likeCount != null) { %><span class="stat-item"><svg class="stat-icon" viewBox="0 0 24 24" width="16" height="16"><path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg> <%= Number(video.likeCount).toLocaleString() %></span><% } %>
+          <span class="stat-item player-date" id="player-date" data-published="<%= video.publishedAt || '' %>"></span>
+        </span>
+        <script>
+          (function () {
+            var el = document.getElementById('player-date');
+            if (el && el.dataset.published) {
+              var ls = '<%= (video.liveStatus || "") %>';
+              var prefix = ls === 'is_live' ? 'Started ' : ls === 'was_live' ? 'Streamed ' : ls === 'post_live' ? 'Premiered ' : '';
+              el.textContent = prefix + timeAgo(el.dataset.published);
+            }
+          })();
+        </script>
+        <span class="player-rating" data-video-id="<%= video.videoId %>">
+          <button class="player-rate-btn<%= currentRating === 1 ? ' rated-up' : '' %>" data-rate-id="<%= video.videoId %>" data-rate-value="1" title="Thumbs up">
+            <svg class="stat-icon" viewBox="0 0 24 24" width="20" height="20"><path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+          </button>
+          <button class="player-rate-btn<%= currentRating === -1 ? ' rated-down' : '' %>" data-rate-id="<%= video.videoId %>" data-rate-value="-1" title="Thumbs down">
+            <svg class="stat-icon" viewBox="0 0 24 24" width="20" height="20" style="transform:rotate(180deg)"><path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+          </button>
+        </span>
+      </div>
+      <div class="tags-section" data-video-id="<%= video.videoId %>">
+        <div class="tags-list">
+          <% for (const tag of tags) { %>
+            <span class="tag-badge"><%= tag %><button class="tag-remove" data-tag="<%= tag %>">&times;</button></span>
+          <% } %>
+        </div>
+        <form class="tag-form">
+          <input type="text" name="tag" placeholder="Add tag..." maxlength="31" autocomplete="off">
+          <button type="submit">Add</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="player-supplemental">
+      <details class="player-description" id="player-description">
+        <summary>Description</summary>
+        <pre id="player-desc-text"><%= video.description %></pre>
+      </details>
+    </div>
+
+    <div class="comments-section" data-video-id="<%= video.videoId %>"<%= video.liveStatus === 'is_live' ? ' hidden' : '' %> data-lazy="1">
+      <h3>Comments</h3>
+      <div class="comments-list"></div>
+      <button class="load-more-btn" style="display:none;">Load More</button>
+      <p class="comments-status">Scroll down to load comments</p>
+    </div>

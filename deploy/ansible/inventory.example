@@ -1,0 +1,39 @@
+# my-youtube Ansible inventory
+#
+# Copy to 'inventory' and fill in your values:
+#   cp inventory.example inventory
+#   ansible-playbook -i inventory playbook.yml
+
+[myyoutube]
+# Single server deployment
+your-server-ip ansible_user=root
+
+[myyoutube:vars]
+# --- Required ---
+domain=yourtube.example.com
+certbot_email=admin@example.com
+repo_url=https://github.com/your-org/my-youtube.git
+
+# --- Optional (defaults shown) ---
+# repo_branch=main
+# use_redis=true
+# use_postgres=false
+# max_concurrent_ytdlp=4
+# max_extraction_workers=2
+
+# --- Secrets (override via --extra-vars or ansible-vault) ---
+# session_secret=auto-generated-if-omitted
+# stream_secret=auto-generated-if-omitted
+# postgres_password=required-if-use_postgres-is-true
+
+# --- Multi-server example ---
+# [myyoutube_web]
+# web-1.example.com ansible_user=root
+# web-2.example.com ansible_user=root
+#
+# [myyoutube_workers]
+# worker-1.example.com ansible_user=root
+# worker-2.example.com ansible_user=root
+#
+# [myyoutube_db]
+# db-1.example.com ansible_user=root

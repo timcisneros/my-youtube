@@ -1,0 +1,52 @@
+    <h1>Downloads</h1>
+    <% if (downloads.length === 0) { %>
+      <p class="empty">No downloaded videos yet.</p>
+    <% } else { %>
+      <div class="video-grid">
+        <% for (const dl of downloads) { %>
+          <div class="video-card download-card" data-video-id="<%= dl.video_id %>">
+            <a href="/watch?v=<%= dl.video_id %>">
+              <div class="video-thumb-wrap">
+                <img data-src="/api/stream/<%= dl.video_id %>/thumb" class="video-thumb lazy-thumb">
+                <% if (durations[dl.video_id]) { %><span class="video-duration"><%= durations[dl.video_id] %></span><% } else { %><span class="video-duration" data-video-id="<%= dl.video_id %>"></span><% } %>
+              </div>
+              <div class="video-info">
+                <div class="video-title"><%= dl.title %></div>
+                <div class="video-channel"><%= dl.channel_title %></div>
+                <div class="download-meta">
+                  <span class="download-size"><%= (dl.total_bytes / 1048576).toFixed(1) %> MB</span>
+                  <span class="download-badge <%= dl.status %>"><%= dl.status === 'complete' ? 'Downloaded' : dl.status === 'downloading' ? 'Downloading' : 'Error' %></span>
+                </div>
+              </div>
+            </a>
+            <button class="download-delete" title="Delete">&times;</button>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+    <script>
+    (function() {
+      document.querySelectorAll('.download-delete').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        e.preventDefault();
+        var card = btn.closest('.download-card');
+        var videoId = card.dataset.videoId;
+        fetch('/downloads/' + videoId, { method: 'DELETE' }).then(function(r) {
+          if (r.ok) card.remove();
+          // Show empty message if no cards left
+          if (!document.querySelector('.download-card')) {
+            var grid = document.querySelector('.video-grid');
+            if (grid) grid.remove();
+            var main = document.querySelector('main');
+            var p = document.createElement('p');
+            p.className = 'empty';
+            p.textContent = 'No downloaded videos yet.';
+            main.appendChild(p);
+          }
+        });
+        });
+      });
+    })();
+    </script>
+  </main>

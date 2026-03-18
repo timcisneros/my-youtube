@@ -1,0 +1,95 @@
+      // --- Keyboard shortcuts ---
+      function onKeydown(e) {
+        var active = document.activeElement;
+        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) return;
+        switch (e.key) {
+          case ' ':
+          case 'k':
+            e.preventDefault();
+            if (video.paused) { video.play(); showFlash(playSvg); }
+            else { video.pause(); showFlash(pauseSvg); }
+            break;
+          case 'ArrowLeft':
+          case 'j':
+            e.preventDefault();
+            if (engine.recovering) { engine.seekDuringRecovery(Math.max(0, engine.lastGoodTime - 5)); break; }
+            video.currentTime = Math.max(0, video.currentTime - 5);
+            if (video.ended) video.play().catch(function () {});
+            break;
+          case 'ArrowRight':
+          case 'l':
+            e.preventDefault();
+            if (engine.recovering) { engine.seekDuringRecovery(Math.min(video.duration || Infinity, engine.lastGoodTime + 5)); break; }
+            video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 5);
+            break;
+          case 'ArrowUp':
+            e.preventDefault();
+            video.volume = Math.min(1, video.volume + 0.05);
+            break;
+          case 'ArrowDown':
+            e.preventDefault();
+            video.volume = Math.max(0, video.volume - 0.05);
+            break;
+          case 'f':
+            if (document.fullscreenElement) document.exitFullscreen();
+            else container.requestFullscreen();
+            break;
+          case 'm':
+            video.muted = !video.muted;
+            break;
+          case 'c':
+            // Toggle captions
+            if (window._subtitleList && window._subtitleList.length > 0) {
+              ccBtn.click();
+            }
+            break;
+          case '>':
+            e.preventDefault();
+            video.playbackRate = Math.min(2, video.playbackRate + 0.25);
+            break;
+          case '<':
+            e.preventDefault();
+            video.playbackRate = Math.max(0.25, video.playbackRate - 0.25);
+            break;
+          case 'p':
+            // Picture-in-Picture toggle
+            if (document.pictureInPictureElement) {
+              document.exitPictureInPicture().catch(function () {});
+            } else if (video.requestPictureInPicture) {
+              video.requestPictureInPicture().catch(function () {});
+            }
+            break;
+          case '0': case '1': case '2': case '3': case '4':
+          case '5': case '6': case '7': case '8': case '9':
+            e.preventDefault();
+            var pct = parseInt(e.key) / 10;
+            var dur = video.duration || 0;
+            if (dur && !isLive) {
+              video.currentTime = dur * pct;
+            }
+            break;
+        }
+      }
+      // Clean up previous player's global listeners before adding new ones
+      if (window._shakaKeydown) {
+        document.removeEventListener('keydown', window._shakaKeydown);
+      }
+      if (window._stallTimer) {
+        clearInterval(window._stallTimer);
+        window._stallTimer = null;
+      }
+      document.addEventListener('keydown', onKeydown);
+      window._shakaKeydown = onKeydown;
+      // Cleanup function for SPA navigation / player reinit
+      window._cleanupPlayer = function () {
+        document.removeEventListener('keydown', onKeydown);
+        window.removeEventListener('resize', _invalidateSeekRects);
+        document.removeEventListener('fullscreenchange', _invalidateSeekRects);
+        if (window._stallTimer) { clearInterval(window._stallTimer); window._stallTimer = null; }
+        if (window._watchTimeSaveTimer) { clearInterval(window._watchTimeSaveTimer); window._watchTimeSaveTimer = null; }
+        if (dlPollTimer) { clearInterval(dlPollTimer); dlPollTimer = null; }
+        stopCaptionLoop();
+        stopStatusPoll();
+        if (window._playerEngine) { window._playerEngine.destroy(); window._playerEngine = null; }
+        window._shakaPlayer = null;
+      };

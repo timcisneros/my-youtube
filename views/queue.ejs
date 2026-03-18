@@ -1,0 +1,55 @@
+    <h1>Queue</h1>
+    <% if (videos.length === 0) { %>
+      <p class="empty">Your queue is empty. <a href="/explore">Explore</a> to find videos to save.</p>
+    <% } else { %>
+      <div class="video-grid">
+        <% for (const v of videos) { %>
+          <div class="video-card queue-card" data-video-id="<%= v.video_id %>">
+            <a href="/watch?v=<%= v.video_id %>">
+              <div class="video-thumb-wrap">
+                <img data-src="/api/stream/<%= v.video_id %>/thumb" class="video-thumb lazy-thumb" width="320" height="180">
+                <% if (durations[v.video_id]) { %><span class="video-duration"><%= durations[v.video_id] %></span><% } else { %><span class="video-duration" data-video-id="<%= v.video_id %>"></span><% } %>
+                <div class="watch-progress" data-progress-id="<%= v.video_id %>"></div>
+              </div>
+              <div class="video-info">
+                <div class="video-title"><%= v.title %></div>
+                <div class="video-channel"><%= v.channel_title %></div>
+              </div>
+            </a>
+            <button class="queue-remove" title="Remove from queue">&times;</button>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+    <script>
+    (function() {
+      document.querySelectorAll('.queue-remove').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          e.preventDefault();
+          var card = btn.closest('.queue-card');
+          var videoId = card.dataset.videoId;
+          fetch('/queue', {
+            method: 'DELETE',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videoId: videoId })
+          }).catch(function() {});
+          card.style.transition = 'opacity 0.3s ease';
+          card.style.opacity = '0';
+          setTimeout(function() {
+            card.remove();
+            if (!document.querySelector('.queue-card')) {
+              var grid = document.querySelector('.video-grid');
+              if (grid) grid.remove();
+              var main = document.querySelector('main');
+              var p = document.createElement('p');
+              p.className = 'empty';
+              p.innerHTML = 'Your queue is empty. <a href="/explore">Explore</a> to find videos to save.';
+              main.appendChild(p);
+            }
+          }, 300);
+        });
+      });
+    })();
+    </script>
+  </main>

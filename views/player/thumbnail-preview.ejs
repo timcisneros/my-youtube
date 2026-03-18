@@ -1,0 +1,153 @@
+      // --- Thumbnail preview on seek bar hover ---
+      (function () {
+        var tooltip = document.createElement('div');
+        tooltip.className = 'seek-thumbnail';
+        var thumbImg = document.createElement('div');
+        thumbImg.className = 'seek-thumbnail-img';
+        var tooltipInfo = document.createElement('div');
+        tooltipInfo.className = 'seek-thumbnail-info';
+        var chapterLabel = document.createElement('span');
+        chapterLabel.className = 'seek-thumbnail-chapter';
+        var timeLabel = document.createElement('span');
+        timeLabel.className = 'seek-thumbnail-time';
+        tooltipInfo.appendChild(chapterLabel);
+        tooltipInfo.appendChild(timeLabel);
+        tooltip.appendChild(thumbImg);
+        tooltip.appendChild(tooltipInfo);
+        container.appendChild(tooltip);
+
+        var sbData = null;
+        var sheetImages = {};
+        var dw, dh, bgSize, framesPerSheet, halfW = 40, lastFrameIdx = -1, lastSheetIdx = -1;
+        var visible = false;
+        var rafId = 0;
+        var pendingX = 0, pendingTime = 0;
+        var showTimer = 0;
+        // Resolved once during _loadStoryboard: maps sheet index → URL
+        var sheetUrl = function () { return ''; };
+
+        function preloadSheet(idx) {
+          if (sheetImages[idx]) return;
+          var url = sheetUrl(idx);
+          if (!url) return;
+          var img = new Image();
+          img.addEventListener('error', function () { delete sheetImages[idx]; }, { once: true });
+          img.src = url;
+          sheetImages[idx] = img;
+        }
+
+        function renderFrame() {
+          rafId = 0;
+          tooltip.style.transform = 'translateX(-50%) translateX(' + pendingX + 'px)';
+          if (isLive) {
+            var liveEnd = getLiveRange().end;
+            var behind = liveEnd - pendingTime;
+            timeLabel.textContent = behind < 1 ? 'Live' : '-' + formatTime(Math.round(behind));
+          } else {
+            timeLabel.textContent = formatTime(pendingTime);
+          }
+          // Show chapter name if available
+          if (window._chapterList && window._chapterList.length > 1) {
+            var chName = '';
+            for (var ci = window._chapterList.length - 1; ci >= 0; ci--) {
+              if (pendingTime >= window._chapterList[ci].start_time) {
+                chName = window._chapterList[ci].title;
+                break;
+              }
+            }
+            chapterLabel.textContent = chName;
+            chapterLabel.style.display = chName ? '' : 'none';
+          } else {
+            chapterLabel.style.display = 'none';
+          }
+          if (!sbData) {
+            thumbImg.style.display = 'none';
+            return;
+          }
+          thumbImg.style.display = '';
+          var timeBase = isLive ? getLiveRange().start : 0;
+          var frameIdx = Math.floor((pendingTime - timeBase) / sbData.interval);
+          frameIdx = Math.max(0, sbData.totalFrames ? Math.min(sbData.totalFrames - 1, frameIdx) : frameIdx);
+          var sheetIdx = Math.floor(frameIdx / framesPerSheet);
+          if (frameIdx === lastFrameIdx) return;
+          lastFrameIdx = frameIdx;
+          var posInSheet = frameIdx % framesPerSheet;
+          var col = posInSheet % sbData.cols;
+          var row = Math.floor(posInSheet / sbData.cols);
+          thumbImg.style.backgroundPosition = '-' + (col * dw) + 'px -' + (row * dh) + 'px';
+          if (sheetIdx !== lastSheetIdx) {
+            lastSheetIdx = sheetIdx;
+            var img = sheetImages[sheetIdx];
+            if (!img) { preloadSheet(sheetIdx); img = sheetImages[sheetIdx]; }
+            var url = sheetUrl(sheetIdx);
+            function applySheet(image) {
+              if (lastSheetIdx !== sheetIdx) return;
+              thumbImg.style.backgroundImage = 'url(' + url + ')';
+              var scaleX = dw / sbData.thumbW;
+              var scaleY = dh / sbData.thumbH;
+              thumbImg.style.backgroundSize = Math.round(image.naturalWidth * scaleX) + 'px ' + Math.round(image.naturalHeight * scaleY) + 'px';
+            }
+            if (img.complete && img.naturalWidth) {
+              applySheet(img);
+            } else {
+              img.addEventListener('load', function () { applySheet(img); }, { once: true });
+            }
+            preloadSheet(sheetIdx);
+            preloadSheet(sheetIdx + 1);
+          }
+        }
+
+        seekBarContainer.addEventListener('mousemove', function (e) {
+          if (!video.duration && !isLive) return;
+          pendingTime = seekTimeFromMouse(e);
+          var containerRect = container.getBoundingClientRect();
+          pendingX = e.clientX - containerRect.left;
+          pendingX = Math.max(halfW, Math.min(containerRect.width - halfW, pendingX));
+          if (!visible) {
+            if (!showTimer) {
+              showTimer = setTimeout(function () {
+                tooltip.style.visibility = 'visible';
+                visible = true;
+                showTimer = 0;
+                if (!rafId) rafId = requestAnimationFrame(renderFrame);
+              }, 120);
+            }
+            return;
+          }
+          if (!rafId) rafId = requestAnimationFrame(renderFrame);
+        });
+
+        seekBarContainer.addEventListener('mouseleave', function () {
+          if (showTimer) { clearTimeout(showTimer); showTimer = 0; }
+          tooltip.style.visibility = 'hidden';
+          visible = false;
+          lastFrameIdx = -1;
+          lastSheetIdx = -1;
+          if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+        });
+
+        window._loadStoryboard = function () {
+          fetch('/api/stream/<%= video.videoId %>/storyboard?token=' + streamToken)
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+              if (!data) return;
+              sbData = data;
+              sheetUrl = data.live
+                ? function (idx) { return data.urlTemplate + idx + '?token=' + streamToken; }
+                : function (idx) { return idx < data.sheets.length ? data.sheets[idx] + '?token=' + streamToken : ''; };
+              // Target ~192px wide regardless of source thumbnail size
+              var scale = Math.min(192 / sbData.thumbW, 108 / sbData.thumbH);
+              dw = Math.round(sbData.thumbW * scale);
+              dh = Math.round(sbData.thumbH * scale);
+              bgSize = (sbData.cols * dw) + 'px ' + (sbData.rows * dh) + 'px';
+              framesPerSheet = sbData.cols * sbData.rows;
+              halfW = dw / 2;
+              thumbImg.style.width = dw + 'px';
+              thumbImg.style.height = dh + 'px';
+              thumbImg.style.backgroundSize = bgSize;
+              tooltip.style.width = dw + 'px';
+              preloadSheet(0);
+            })
+            .catch(function () {});
+        };
+      })();

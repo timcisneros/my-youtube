@@ -1,0 +1,34 @@
+    <h1>Today's Videos</h1>
+    <% if (typeof error !== 'undefined' && error) { %>
+      <p class="error"><%= error %></p>
+    <% } %>
+    <% if (videos.length === 0) { %>
+      <p class="empty" id="empty-msg">No new videos from your subscriptions today.</p>
+      <script>
+        (function() {
+          var d = new Date();
+          var formatted = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+          document.getElementById('empty-msg').textContent =
+            'No new videos from your subscriptions since midnight (' + formatted + ').';
+        })();
+      </script>
+    <% } else { %>
+      <div class="video-grid">
+        <% for (const v of videos) { %>
+          <a href="/watch?v=<%= v.videoId %>" class="video-card">
+            <div class="video-thumb-wrap">
+              <img data-src="/api/stream/<%= v.videoId %>/thumb" alt="" class="video-thumb lazy-thumb" width="320" height="180">
+              <% if (liveStatuses[v.videoId] === 'is_live') { %><span class="video-badge live" data-video-id="<%= v.videoId %>">LIVE</span><% } else if (liveStatuses[v.videoId] === 'is_upcoming') { %><span class="video-badge upcoming" data-video-id="<%= v.videoId %>">UPCOMING</span><% } else if (durations[v.videoId]) { %><span class="video-duration" data-video-id="<%= v.videoId %>"><%= durations[v.videoId] %></span><% } else { %><span class="video-duration" data-video-id="<%= v.videoId %>"></span><% } %>
+              <div class="watch-progress" data-progress-id="<%= v.videoId %>"></div>
+            </div>
+            <div class="video-info">
+              <div class="video-title"><%= v.title %></div>
+              <div class="video-channel"><%= v.channelTitle %></div>
+              <div class="video-time" data-published="<%= v.publishedAt %>"></div>
+            </div>
+          </a>
+        <% } %>
+      </div>
+    <% } %>
+    <script>document.querySelectorAll('[data-published]').forEach(function(el) { if (el.dataset.published) el.textContent = timeAgo(el.dataset.published); });</script>
+  </main>

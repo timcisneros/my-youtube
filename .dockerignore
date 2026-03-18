@@ -1,0 +1,8 @@
+node_modules
+data
+*.dump
+*.mp4
+*.webm
+.env
+.git
+.claude
