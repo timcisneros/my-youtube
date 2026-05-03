@@ -1,3 +1,316 @@
+// Offline detection — badge only, no navigation blocking
+var _isOffline = !navigator.onLine;
+
+function showOfflineBadge() {
+  _isOffline = true;
+  var status = document.querySelector('.nav-status');
+  if (status && !document.getElementById('offline-badge')) {
+    var badge = document.createElement('span');
+    badge.id = 'offline-badge';
+    badge.className = 'offline-badge';
+    badge.textContent = 'Offline';
+    status.insertBefore(badge, status.firstChild);
+  }
+}
+
+function hideOfflineBadge() {
+  _isOffline = false;
+  var badge = document.getElementById('offline-badge');
+  if (badge) badge.remove();
+}
+
+window.addEventListener('online', hideOfflineBadge);
+window.addEventListener('offline', showOfflineBadge);
+
+// Request durable storage so IDB data isn't evicted under storage pressure
+if (navigator.storage && navigator.storage.persist) {
+  navigator.storage.persist().catch(function () {});
+}
+
+// Handle SW fallback responses (server unreachable).
+// The SW sets X-SW-Fallback header when serving /offline as a substitute.
+// For downloads, render from localStorage. For other pages, render the fallback HTML.
+function handleFallback(html) {
+  var main = document.querySelector('main');
+  if (!main) return;
+  // Downloads: render from localStorage
+  if (window.location.pathname === '/downloads') {
+    try {
+      var data = localStorage.getItem('offline_downloads');
+      if (data) {
+        var downloads = JSON.parse(data);
+        if (downloads && downloads.length) {
+          var grid = '<h1>Downloads</h1><div class="video-grid">';
+          for (var i = 0; i < downloads.length; i++) {
+            var dl = downloads[i];
+            grid += '<div class="video-card download-card" data-video-id="' + dl.video_id + '">'
+              + '<a href="/watch?v=' + dl.video_id + '">'
+              + '<div class="video-thumb-wrap">'
+              + '<img data-src="/api/stream/' + dl.video_id + '/thumb" class="video-thumb lazy-thumb">'
+              + '</div>'
+              + '<div class="video-info">'
+              + '<div class="video-title">' + escapeHtml(dl.title) + '</div>'
+              + '<div class="video-channel">' + escapeHtml(dl.channel_title) + '</div>'
+              + '</div></a></div>';
+          }
+          grid += '</div>';
+          main.innerHTML = grid;
+          loadThumbnails();
+          return;
+        }
+      }
+    } catch (e) {}
+  }
+  // Watch page: render minimal player — MPD + segments may be cached by SW
+  var videoMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  if (window.location.pathname === '/watch' && videoMatch) {
+    var videoId = videoMatch[1];
+    var title = '';
+    try {
+      var dlData = localStorage.getItem('offline_downloads');
+      if (dlData) {
+        var dls = JSON.parse(dlData);
+        for (var j = 0; j < dls.length; j++) {
+          if (dls[j].video_id === videoId) { title = dls[j].title; break; }
+        }
+      }
+    } catch (e) {}
+    main.innerHTML = '<div class="player-embed" id="player-container">'
+      + '<div class="player-loading"><div class="player-spinner"></div></div>'
+      + '<video id="player" class="player-video" poster="/api/stream/' + videoId + '/poster"></video>'
+      + '</div>'
+      + '<div class="player-primary"><h1 class="player-title">' + escapeHtml(title || videoId) + '</h1></div>';
+    if (window.shaka && window.PlayerEngine) {
+      shaka.polyfill.installAll();
+      if (shaka.Player.isBrowserSupported()) {
+        var video = document.getElementById('player');
+        var engine = new PlayerEngine(video, { videoId: videoId, streamToken: '' });
+        window._player = engine.getPlayer();
+        window._shakaPlayer = engine.getPlayer();
+        window._playerEngine = engine;
+        engine.init();
+      }
+    }
+    return;
+  }
+  // Default: render the /offline fallback page from SW
+  if (html) {
+    var doc = new DOMParser().parseFromString(html, 'text/html');
+    var newMain = doc.querySelector('main');
+    if (newMain) main.innerHTML = newMain.innerHTML;
+  } else {
+    main.innerHTML = '<div class="offline-message"><h2>You are offline</h2>'
+      + '<p>Connect to the internet to browse videos.</p>'
+      + '<p><a href="/downloads">View your downloads</a></p></div>';
+  }
+}
+
+// Download a format file to IDB with streaming and resume support
+function downloadFormatToIDB(videoId, formatId, token) {
+  var key = videoId + ':' + formatId;
+  var CHUNK_SIZE = IDBHelpers.CHUNK_SIZE; // 2MB
+
+  IDBHelpers.getMeta(key).then(function (meta) {
+    if (meta && meta.done && meta.chunkSize) return; // already downloaded with chunk format
+
+    var downloadedChunks = (meta && meta.downloadedChunks) || 0;
+    var resumeOffset = downloadedChunks * CHUNK_SIZE;
+    var headers = {};
+    if (resumeOffset > 0) {
+      headers['Range'] = 'bytes=' + resumeOffset + '-';
+    }
+
+    fetch('/api/stream/' + videoId + '/fmt/' + formatId + '?token=' + token, { headers: headers })
+      .then(function (resp) {
+        if (!resp.ok && resp.status !== 206) return;
+        var contentType = resp.headers.get('Content-Type') || 'application/octet-stream';
+        var contentLength = resp.headers.get('Content-Length');
+        var totalSize = resumeOffset + (contentLength ? parseInt(contentLength, 10) : 0);
+        var totalChunks = Math.ceil(totalSize / CHUNK_SIZE) || 1;
+
+        var reader = resp.body.getReader();
+        var buffer = []; // array of Uint8Arrays
+        var bufferBytes = 0;
+        var chunkIndex = downloadedChunks;
+        var chunksSinceMetaUpdate = 0;
+        var META_INTERVAL = 3; // update meta every 3 chunks
+
+        function flushChunk(size) {
+          // Assemble exactly `size` bytes from buffer into a Blob
+          var parts = [];
+          var needed = size;
+          while (needed > 0 && buffer.length > 0) {
+            var piece = buffer[0];
+            if (piece.byteLength <= needed) {
+              parts.push(piece);
+              needed -= piece.byteLength;
+              buffer.shift();
+            } else {
+              parts.push(piece.slice(0, needed));
+              buffer[0] = piece.slice(needed);
+              needed = 0;
+            }
+          }
+          bufferBytes -= size;
+          var blob = new Blob(parts, { type: contentType });
+          var idx = chunkIndex;
+          chunkIndex++;
+          chunksSinceMetaUpdate++;
+
+          var p = IDBHelpers.putChunk(key, idx, blob);
+
+          // Update meta periodically
+          if (chunksSinceMetaUpdate >= META_INTERVAL) {
+            chunksSinceMetaUpdate = 0;
+            p = p.then(function () {
+              return IDBHelpers.putMeta(key, {
+                videoId: videoId,
+                formatId: formatId,
+                chunkSize: CHUNK_SIZE,
+                totalSize: totalSize,
+                contentType: contentType,
+                downloadedChunks: chunkIndex,
+                totalChunks: totalChunks,
+                done: false
+              });
+            });
+          }
+          return p;
+        }
+
+        function pump() {
+          return reader.read().then(function (result) {
+            if (result.done) {
+              // Write remaining buffer as final chunk
+              var finalPromise = Promise.resolve();
+              if (bufferBytes > 0) {
+                finalPromise = flushChunk(bufferBytes);
+              }
+              return finalPromise.then(function () {
+                return IDBHelpers.putMeta(key, {
+                  videoId: videoId,
+                  formatId: formatId,
+                  chunkSize: CHUNK_SIZE,
+                  totalSize: totalSize,
+                  contentType: contentType,
+                  downloadedChunks: chunkIndex,
+                  totalChunks: chunkIndex, // actual final count
+                  done: true
+                });
+              });
+            }
+
+            buffer.push(result.value);
+            bufferBytes += result.value.byteLength;
+
+            // Flush full chunks
+            var flushPromise = Promise.resolve();
+            while (bufferBytes >= CHUNK_SIZE) {
+              flushPromise = flushPromise.then(function () {
+                return flushChunk(CHUNK_SIZE);
+              });
+            }
+
+            return flushPromise.then(pump);
+          });
+        }
+
+        // Write initial meta if starting fresh
+        var initPromise = downloadedChunks === 0
+          ? IDBHelpers.putMeta(key, {
+              videoId: videoId,
+              formatId: formatId,
+              chunkSize: CHUNK_SIZE,
+              totalSize: totalSize,
+              contentType: contentType,
+              downloadedChunks: 0,
+              totalChunks: totalChunks,
+              done: false
+            })
+          : Promise.resolve();
+
+        return initPromise.then(pump);
+      })
+      .catch(function () {});
+  }).catch(function () {});
+}
+
+// Prepare a downloaded video for offline playback via the offline-bundle endpoint.
+// Sends bundle to SW for caching (watch page HTML + MPD), downloads format files to IDB.
+function prepareForOffline(videoId) {
+  fetch('/api/stream/' + videoId + '/offline-bundle')
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (bundle) {
+      if (!bundle || !bundle.mpd) return;
+      // Send bundle to SW for caching (watch page HTML + MPD + poster)
+      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage({
+          type: 'cache-offline-bundle',
+          bundle: bundle
+        });
+      }
+
+      // Check storage quota before downloading format files
+      var totalFormatSize = 0;
+      if (bundle.formatSizes) {
+        for (var f = 0; f < bundle.formats.length; f++) {
+          totalFormatSize += (bundle.formatSizes[bundle.formats[f]] || 0);
+        }
+      }
+
+      var startDownloads = function () {
+        if (typeof IDBHelpers === 'undefined') return;
+        for (var i = 0; i < bundle.formats.length; i++) {
+          downloadFormatToIDB(videoId, bundle.formats[i], bundle.streamToken);
+        }
+      };
+
+      // Warn if insufficient space (1.5x safety margin)
+      if (totalFormatSize > 0 && navigator.storage && navigator.storage.estimate) {
+        navigator.storage.estimate().then(function (est) {
+          var available = (est.quota || 0) - (est.usage || 0);
+          if (available < totalFormatSize * 1.5) {
+            console.warn('[offline] Low storage: need ~' + Math.round(totalFormatSize * 1.5 / 1048576) + 'MB, available ~' + Math.round(available / 1048576) + 'MB');
+          }
+          startDownloads();
+        }).catch(function () { startDownloads(); });
+      } else {
+        startDownloads();
+      }
+    })
+    .catch(function () {});
+}
+
+function cacheDownloadMetadata() {
+  if (window.location.pathname !== '/downloads') return;
+  var cards = document.querySelectorAll('.download-card');
+  if (!cards.length) return;
+  var downloads = [];
+  var prefetched = {};
+  try { prefetched = JSON.parse(localStorage.getItem('offline_prefetched') || '{}'); } catch (e) {}
+  var newPrefetches = false;
+  cards.forEach(function (card) {
+    var videoId = card.dataset.videoId;
+    var titleEl = card.querySelector('.video-title');
+    var channelEl = card.querySelector('.video-channel');
+    downloads.push({
+      video_id: videoId,
+      title: titleEl ? titleEl.textContent : '',
+      channel_title: channelEl ? channelEl.textContent : ''
+    });
+    // Prefetch completed downloads for offline playback
+    if (!prefetched[videoId] && card.querySelector('.download-badge.complete')) {
+      prepareForOffline(videoId);
+      prefetched[videoId] = 1;
+      newPrefetches = true;
+    }
+  });
+  try {
+    localStorage.setItem('offline_downloads', JSON.stringify(downloads));
+    if (newPrefetches) localStorage.setItem('offline_prefetched', JSON.stringify(prefetched));
+  } catch (e) {}
+}
+
 // Relative time formatting ("8 hours ago", "3 days ago", etc.)
 function timeAgo(date) {
   var s = Math.floor((Date.now() - new Date(date).getTime()) / 1000);
@@ -14,6 +327,17 @@ function timeAgo(date) {
   if (mo < 12) return mo + (mo === 1 ? ' month ago' : ' months ago');
   var y = Math.floor(mo / 12);
   return y + (y === 1 ? ' year ago' : ' years ago');
+}
+
+// Keep relative timestamps fresh — re-run timeAgo every 60s
+var _timestampTimer = null;
+function startTimestampRefresh() {
+  if (_timestampTimer) clearInterval(_timestampTimer);
+  _timestampTimer = setInterval(function () {
+    document.querySelectorAll('[data-published]').forEach(function (el) {
+      if (el.dataset.published) el.textContent = timeAgo(el.dataset.published);
+    });
+  }, 60000);
 }
 
 // Format seconds as H:MM:SS or M:SS
@@ -283,11 +607,18 @@ function loadWatchProgress() {
       clearInterval(window._stallTimer);
       window._stallTimer = null;
     }
+    if (window._detailsTimer) {
+      clearInterval(window._detailsTimer);
+      window._detailsTimer = null;
+    }
+    if (window._watchTimeSaveTimer) {
+      clearInterval(window._watchTimeSaveTimer);
+      window._watchTimeSaveTimer = null;
+    }
     window._chapterList = null;
     window._subtitleList = null;
     window._captionCues = null;
     window._linkifyDescriptionTimestamps = null;
-    if (window._cleanupReconnect) { window._cleanupReconnect(); window._cleanupReconnect = null; }
     if (window._stopStatusPoll) { window._stopStatusPoll(); window._stopStatusPoll = null; }
     if (_durationSource) { _durationSource.close(); _durationSource = null; }
   }
@@ -353,6 +684,7 @@ function loadWatchProgress() {
       loadThumbnails();
       loadDurations();
       loadWatchProgress();
+      startTimestampRefresh();
       var scripts = document.querySelectorAll('main script');
       scripts.forEach(function (s) {
         var ns = document.createElement('script');
@@ -362,47 +694,45 @@ function loadWatchProgress() {
     });
   }
 
-  // Save current page state before navigating away, for instant back/forward
-  function savePageState() {
-    var main = document.querySelector('main');
-    if (!main) return;
-    history.replaceState({
-      mainHTML: main.innerHTML,
-      title: document.title,
-      scroll: window.scrollY
-    }, '');
-  }
-
   async function navigate(href) {
     startBar();
-    // If navigating to a video page, fire stream prefetch immediately
-    // so yt-dlp + probes run in parallel with the page fetch
     var watchMatch = href.match(/[?&]v=([A-Za-z0-9_-]+)/);
-    if (watchMatch) {
+    if (watchMatch && !_isOffline) {
       if (window._startLoadTimer) window._startLoadTimer();
-      fetch('/api/stream/' + watchMatch[1] + '/prefetch');
+      fetch('/api/stream/' + watchMatch[1] + '/prefetch').catch(function () {});
     }
     try {
-      var res = await fetch(href);
+      var res = await fetch(href, { headers: { 'Accept': 'text/html' } });
       if (!res.ok) { window.location.href = href; return; }
+      var isFallback = res.headers.get('X-SW-Fallback') === '1';
       var html = await res.text();
-      savePageState();
       history.pushState({}, '', href);
-      swapContent(html);
-      // For video pages, keep loading bar until player is ready
-      if (watchMatch) {
-        window._finishLoadingBar = finishBar;
+      finishBar();
+      if (isFallback) {
+        destroyPlayer();
+        updateActiveNav();
+        handleFallback(html);
       } else {
-        finishBar();
-        // Hide timer and stream-via when navigating away from a video page
-        var tel = document.getElementById('load-timer');
-        if (tel) tel.className = 'load-timer';
-        var svel = document.getElementById('stream-via');
-        if (svel) svel.textContent = '';
+        if (_isOffline) hideOfflineBadge();
+        swapContent(html);
+        cacheDownloadMetadata();
+        if (watchMatch) {
+          window._finishLoadingBar = function () {};
+        } else {
+          var tel = document.getElementById('load-timer');
+          if (tel) tel.className = 'load-timer';
+          var svel = document.getElementById('stream-via');
+          if (svel) svel.textContent = '';
+        }
       }
       window.scrollTo(0, 0);
     } catch (e) {
-      window.location.href = href;
+      finishBar();
+      history.pushState({}, '', href);
+      destroyPlayer();
+      updateActiveNav();
+      handleFallback('');
+      window.scrollTo(0, 0);
     }
   }
 
@@ -421,60 +751,36 @@ function loadWatchProgress() {
     navigate(href);
   });
 
-  window.addEventListener('popstate', async function (e) {
+  window.addEventListener('popstate', function () {
     destroyPlayer();
-    // Pages with dynamic state — fetch fresh instead of restoring stale cache
-    if (/[?&]v=/.test(window.location.search) || window.location.pathname === '/downloads') {
-      startBar();
-      var vMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]+)/);
-      if (vMatch) {
-        if (window._startLoadTimer) window._startLoadTimer();
-        fetch('/api/stream/' + vMatch[1] + '/prefetch');
-      }
-      fetch(window.location.href)
-        .then(function (r) { return r.ok ? r.text() : null; })
-        .then(function (html) {
-          if (!html) { window.location.reload(); return; }
-          swapContent(html);
-        })
-        .catch(function () { window.location.reload(); });
-      return;
-    }
-    // Restore from cached state if available (instant, no flicker)
-    if (e.state && e.state.mainHTML) {
-      var main = document.querySelector('main');
-      if (main) main.innerHTML = e.state.mainHTML;
-      if (e.state.title) document.title = e.state.title;
-      updateActiveNav();
-      document.querySelectorAll('[data-published]').forEach(function (el) {
-        if (!el.dataset.published) return;
-        var d = new Date(el.dataset.published);
-        el.textContent = isNaN(d.getTime()) ? el.dataset.published : timeAgo(el.dataset.published);
-      });
-      initComments();
-      initTags();
-      loadThumbnails();
-      loadDurations(true);
-      loadWatchProgress();
-      var scripts = document.querySelectorAll('main script');
-      scripts.forEach(function (s) {
-        var ns = document.createElement('script');
-        ns.textContent = s.textContent;
-        s.parentNode.replaceChild(ns, s);
-      });
-      if (typeof e.state.scroll === 'number') window.scrollTo(0, e.state.scroll);
-      return;
-    }
-    // No cached state — fetch fresh
     startBar();
-    try {
-      var res = await fetch(window.location.href);
-      var html = await res.text();
-      swapContent(html);
-      finishBar();
-    } catch (err) {
-      window.location.reload();
+    var vMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]+)/);
+    if (vMatch && !_isOffline) {
+      if (window._startLoadTimer) window._startLoadTimer();
+      fetch('/api/stream/' + vMatch[1] + '/prefetch').catch(function () {});
     }
+    fetch(window.location.href, { headers: { 'Accept': 'text/html' } })
+      .then(function (r) {
+        var fallback = r.headers.get('X-SW-Fallback') === '1';
+        return r.ok ? r.text().then(function (t) { return { html: t, fallback: fallback }; }) : null;
+      })
+      .then(function (result) {
+        if (!result) { window.location.reload(); return; }
+        finishBar();
+        if (result.fallback) {
+          updateActiveNav();
+          handleFallback(result.html);
+        } else {
+          if (_isOffline) hideOfflineBadge();
+          swapContent(result.html);
+          cacheDownloadMetadata();
+        }
+      })
+      .catch(function () {
+        finishBar();
+        updateActiveNav();
+        handleFallback('');
+      });
   });
 })();
 
@@ -1147,9 +1453,23 @@ function escapeHtml(str) {
   }
 })();
 
+// On full page load, if URL is a watch page but the SW served /offline
+// (no player element), build a minimal player from IDB chunks.
+function tryOfflineWatchRecovery() {
+  if (window.location.pathname !== '/watch') return;
+  var vMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  if (!vMatch) return;
+  // If a player already exists, the page loaded correctly
+  if (document.getElementById('player')) return;
+  var videoId = vMatch[1];
+  handleFallback('');
+}
+
 // Initial page load — wait for DOM
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', function () {
+    if (_isOffline) showOfflineBadge();
+    tryOfflineWatchRecovery();
     initComments();
     initTags();
     initDismiss();
@@ -1163,8 +1483,12 @@ if (document.readyState === 'loading') {
     loadThumbnails();
     loadDurations();
     loadWatchProgress();
+    startTimestampRefresh();
+    cacheDownloadMetadata();
   });
 } else {
+  if (_isOffline) showOfflineBadge();
+  tryOfflineWatchRecovery();
   initComments();
   initTags();
   initBoost();
@@ -1177,4 +1501,6 @@ if (document.readyState === 'loading') {
   loadThumbnails();
   loadDurations();
   loadWatchProgress();
+  startTimestampRefresh();
+  cacheDownloadMetadata();
 }

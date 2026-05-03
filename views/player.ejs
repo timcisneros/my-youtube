@@ -1,5 +1,8 @@
 <%- include('player/video-container') %>
 
+<% if (typeof inlineMPD !== 'undefined' && inlineMPD) { %>
+    <script>window.__inlineMPD = <%- JSON.stringify(inlineMPD) %>;</script>
+<% } %>
     <script>
 <%- include('player/linkify') %>
 
@@ -32,87 +35,65 @@
       }
 
       // Engine events -> UI updates
+      var _playerReady = false;
       engine.on('via', function (via) {
         stopStatusPoll();
         finalVia = via;
-        setStreamVia('buffering...');
+        // During initial load show "buffering..." until video starts.
+        // After initial load, show the value directly (reconnection path).
+        setStreamVia(_playerReady ? via : 'buffering...');
       });
 
-      engine.on('recovery-start', function (data) {
-        console.warn('[player] recovering (' + data.reason + '), lastGoodTime=' + data.lastGoodTime.toFixed(1));
+      // --- Server down/up events (simple model) ---
+      engine.on('server-down', function (reason) {
         setStreamVia('reconnecting...');
       });
 
-      engine.on('recovery-elapsed', function (elapsed) {
+      engine.on('server-down-elapsed', function (elapsed) {
         setStreamVia('reconnecting... (' + elapsed + 's)');
       });
 
-
-
-      engine.on('retry-start', function () {
+      engine.on('server-up', function () {
         setStreamVia('buffering...');
-        console.log('[player] trying retryStreaming...');
       });
 
-      engine.on('retry-failed', function (code) {
-        console.log('[player] retryStreaming failed (code=' + code + '), falling back to unload->load');
-      });
-
-      engine.on('reload-start', function (time) {
-        setStreamVia('reconnecting...');
-        console.log('[player] unload->load recovery at ' + time.toFixed(1) + 's');
-      });
-
-      engine.on('recovery-end', function (data) {
-        finalVia = data.via || finalVia;
+      engine.on('recovery-end', function () {
         if (finalVia) setStreamVia(finalVia);
-        else setStreamVia('');
-        qualityMenu.classList.remove('player-menu-hidden');
-        var cleanUrl = new URL(window.location);
-        if (data.time > 1 && !engine.isLive) cleanUrl.searchParams.set('t', Math.floor(data.time));
-        else cleanUrl.searchParams.delete('t');
-        cleanUrl.searchParams.delete('retry');
-        history.replaceState({}, '', cleanUrl.toString());
-        console.log('[player] recovery succeeded via ' + data.method + ' at ' + data.time.toFixed(1) + 's');
-      });
-
-      engine.on('network-trouble', function () {
-        qualityMenu.classList.add('player-menu-hidden');
-      });
-
-      engine.on('network-trouble-cleared', function () {
-        qualityMenu.classList.remove('player-menu-hidden');
-        if (window._rebuildQualityMenu) window._rebuildQualityMenu();
         if (window._updateQualityState) window._updateQualityState();
       });
 
-      // Freeze canvas -- view-layer DOM for freeze-frame during unload->load
-      var _freezeCanvas = null;
-      engine.on('freeze-frame', function () {
-        video.removeAttribute('poster');
-        if (!_freezeCanvas) {
-          _freezeCanvas = document.createElement('canvas');
-          _freezeCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain;z-index:1;pointer-events:none';
-          video.parentElement.style.position = 'relative';
-          video.parentElement.appendChild(_freezeCanvas);
+
+      // Downloaded video available — pin ABR to that resolution so playback
+      // is instant from disk instead of streaming lower qualities from YouTube
+      var _downloadedHeight = <%= typeof downloadedHeight !== 'undefined' ? downloadedHeight : 0 %>;
+      engine.on('downloaded-height', function (height) {
+        _downloadedHeight = height;
+        if (height > 0) {
+          player.configure('abr.restrictions.minHeight', height);
+          player.configure('abr.restrictions.maxHeight', height);
         }
-        _freezeCanvas.width = video.videoWidth || video.clientWidth;
-        _freezeCanvas.height = video.videoHeight || video.clientHeight;
-        try {
-          _freezeCanvas.getContext('2d').drawImage(video, 0, 0, _freezeCanvas.width, _freezeCanvas.height);
-        } catch (e) {}
       });
-      engine.on('unfreeze-frame', function () {
-        if (_freezeCanvas && _freezeCanvas.parentElement) {
-          _freezeCanvas.parentElement.removeChild(_freezeCanvas);
-        }
-        _freezeCanvas = null;
+      // Server-side detection (works for inline MPD path too)
+      if (_downloadedHeight > 0) {
+        player.configure('abr.restrictions.minHeight', _downloadedHeight);
+        player.configure('abr.restrictions.maxHeight', _downloadedHeight);
+      }
+
+      // Token refreshed — update local token references.
+      // The probe will confirm the server is up on the next iteration.
+      engine.on('token-refreshed', function (newToken) {
+        streamToken = newToken;
+        manifestBaseUrl = '/api/stream/<%= video.videoId %>/dash.mpd?token=' + newToken;
+        manifestUrl = manifestBaseUrl;
+        console.log('[player] stream token refreshed');
       });
 
-      engine.on('fatal', function (data) {
-        if (!window._shakaPlayer) return;
+      // Token refresh failed (session also expired) — last resort page reload,
+      // preserving playback position so the user can resume
+      engine.on('auth-expired', function () {
         var url = new URL(window.location);
-        if (data.time > 1 && !engine.isLive) url.searchParams.set('t', Math.floor(data.time));
+        var pos = engine.lastGoodTime || video.currentTime || 0;
+        if (pos > 5 && !engine.isLive) url.searchParams.set('t', Math.floor(pos));
         url.searchParams.delete('retry');
         window.location.href = url.toString();
       });
@@ -235,7 +216,10 @@
             .then(function (r) { return r.json(); })
             .then(function (d) {
               updateDlButton(d.status, d.percent);
-              if (d.status === 'complete' || d.status === 'error') {
+              if (d.status === 'complete') {
+                clearInterval(dlPollTimer); dlPollTimer = null;
+                if (typeof prepareForOffline === 'function') prepareForOffline(dlVideoId);
+              } else if (d.status === 'error') {
                 clearInterval(dlPollTimer); dlPollTimer = null;
               }
             })
@@ -302,7 +286,7 @@
       // Show spinner during rebuffering (debounced to avoid flash on quick seeks)
       var bufferTimer = 0;
       video.addEventListener('waiting', function () {
-        if (engine.recovering) {
+        if (engine.isRecovering()) {
           var buf = video.buffered;
           var ct = video.currentTime;
           var hasBuffer = false;
@@ -316,18 +300,15 @@
       });
       video.addEventListener('playing', function () {
         clearTimeout(bufferTimer); bufferTimer = 0;
-        if (!engine.recovering) container.classList.remove('player-buffering');
-        if (engine.networkTrouble && !engine.recovering) {
-          engine.clearNetworkTrouble();
-        }
+        if (!engine.isRecovering()) container.classList.remove('player-buffering');
       });
       video.addEventListener('canplay', function () {
         clearTimeout(bufferTimer); bufferTimer = 0;
-        if (!engine.recovering) container.classList.remove('player-buffering');
+        if (!engine.isRecovering()) container.classList.remove('player-buffering');
       });
       video.addEventListener('seeked', function () {
         clearTimeout(bufferTimer); bufferTimer = 0;
-        if (!engine.recovering && !video.paused) container.classList.remove('player-buffering');
+        if (!engine.isRecovering() && !video.paused) container.classList.remove('player-buffering');
       });
 
       // --- Chapter markers ---
@@ -501,18 +482,28 @@
       // Extraction status -- WebSocket preferred, SSE fallback
       var statusSource = null;
       var statusWs = null;
-      var stepProgress = { 'yt-dlp': 15, 'yt-dlp-alt': 35, 'innertube': 55, 'invidious': 75, 'building': 90 };
+      var stepProgress = { 'queue': 5, 'yt-dlp': 15, 'yt-dlp-alt': 35, 'innertube': 55, 'invidious': 75, 'building': 90 };
       var stepLabels = {
+        'queue': 'queued...',
         'yt-dlp': 'trying yt-dlp...',
         'yt-dlp-alt': 'trying alt client...',
         'innertube': 'trying innertube...',
         'invidious': 'trying invidious...',
         'building': 'building stream...'
       };
+      var _extractionDone = false;
+      var _extractionDoneListeners = [];
+      function _onExtractionDone(fn) { _extractionDoneListeners.push(fn); }
+      function _fireExtractionDone() {
+        _extractionDone = true;
+        var cbs = _extractionDoneListeners.splice(0);
+        for (var i = 0; i < cbs.length; i++) cbs[i]();
+      }
       function handleStatusMsg(d) {
         if (d.done) {
           if (window._setLoadBarProgress) window._setLoadBarProgress(90);
           stopStatusPoll();
+          _fireExtractionDone();
           return;
         }
         if (d.step) {
@@ -565,9 +556,21 @@
 
       function loadVideo(retries) {
         retries = retries || 0;
-        startStatusPoll();
         // Only use ?refresh=1 on the very first attempt -- retries reuse cached extraction
         var loadUrl = (retries === 0) ? manifestUrl : manifestBaseUrl;
+        // If an inline MPD was embedded in the HTML, use it as a data URI to
+        // skip the manifest fetch (BaseURLs are already fully qualified server-side)
+        if (retries === 0 && window.__inlineMPD) {
+          var inlineMpd = window.__inlineMPD;
+          window.__inlineMPD = null;
+          loadUrl = 'data:application/dash+xml;base64,' + btoa(inlineMpd);
+          // Inline MPD means extraction already completed — set via directly
+          stopStatusPoll();
+          <% if (typeof inlineVia !== 'undefined' && inlineVia) { %>finalVia = '<%= inlineVia %>';<% } %>
+          setStreamVia('buffering...');
+        } else {
+          startStatusPoll();
+        }
         return player.load(loadUrl).catch(function (dashErr) {
           // Check if server returned HLS/progressive JSON (don't use ?refresh=1 here --
           // caches were just populated by the player.load above)
@@ -593,6 +596,7 @@
                 err.serverError = true;
                 // Only mark as permanent for truly unavailable content (premieres, etc.)
                 err.permanent = /live event|Premieres in|not currently live/i.test(data.error);
+                if (data.scheduledStart) err.scheduledStart = data.scheduledStart;
                 throw err;
               });
             }
@@ -602,6 +606,13 @@
           if (err.permanent) throw err;
           // Only retry Shaka load failures (not server extraction errors)
           if (retries < 2 && !err.serverError) {
+            // If extraction is still in progress, wait for it to finish before retrying
+            if (!_extractionDone) {
+              return new Promise(function (resolve) {
+                var timer = setTimeout(function () { resolve(); }, 30000);
+                _onExtractionDone(function () { clearTimeout(timer); resolve(); });
+              }).then(function () { return loadVideo(retries + 1); });
+            }
             return new Promise(function (resolve) { setTimeout(resolve, 1000 * (retries + 1)); })
               .then(function () { return loadVideo(retries + 1); });
           }
@@ -610,13 +621,12 @@
       }
 
 
-      // Recovery cleanup for SPA navigation -- engine.destroy() is called by destroyPlayer
-      window._cleanupReconnect = function () { engine._cleanupAll(); };
+      // Recovery cleanup for SPA navigation -- engine.destroy() handles full teardown
 
       // videoUnavailable is tracked by engine.videoUnavailable
 
       video.addEventListener('waiting', function () {
-        if (engine.recovering) return;
+        if (engine.isRecovering()) return;
         var buf = video.buffered;
         var ranges = [];
         for (var i = 0; i < buf.length; i++) ranges.push(buf.start(i).toFixed(1) + '-' + buf.end(i).toFixed(1));
@@ -625,12 +635,12 @@
 
       var expectedDuration = <%= (typeof video !== 'undefined' && video.duration) || 0 %>;
       video.addEventListener('ended', function () {
-        if (engine.recovering || engine.recoveryTransition || engine.retryActive) return;
+        if (engine.isRecovering()) return;
         var realDur = expectedDuration || video.duration;
         console.log('[player] ended at ' + video.currentTime.toFixed(1) + 's, video.duration=' + video.duration + ', expected=' + expectedDuration);
         if (!realDur || !isFinite(realDur)) return;
         if (video.currentTime < realDur - 5) {
-          engine.recover('premature end at ' + Math.floor(video.currentTime) + '/' + Math.floor(realDur));
+          engine.reportStall();
         }
       });
 
@@ -641,7 +651,7 @@
       function startStallWatch() {
         if (stallTimer) return;
         stallTimer = setInterval(function () {
-          if (video.paused || video.ended || engine.recovering) {
+          if (video.paused || video.ended || engine.isRecovering()) {
             stallLastTime = -1;
             return;
           }
@@ -653,7 +663,6 @@
             for (var i = 0; i < buf.length; i++) ranges.push(buf.start(i).toFixed(1) + '-' + buf.end(i).toFixed(1));
             console.warn('[player] stall detected at ' + ct.toFixed(1) + 's, buffered: [' + ranges.join(', ') + '], readyState=' + video.readyState);
             stallLastTime = -1;
-            // During retryStreaming window, a stall means retry failed -- go to fallback
             engine.reportStall();
             return;
           } else if (Math.abs(ct - stallLastTime) >= 0.1) {
@@ -670,12 +679,13 @@
       video.addEventListener('pause', function () { stallLastTime = -1; });
 
       video.addEventListener('error', function () {
-        if (engine.recovering) return;
+        if (engine.isRecovering()) return;
         var e = video.error;
         if (e) console.error('[video element] code=' + e.code + ' message=' + e.message);
       });
 
       attachPromise.then(function () { return loadVideo(); }).then(function () {
+        stopStatusPoll();
         // Clean retry param from URL after successful load
         if (retryCount > 0) {
           manifestUrl = manifestBaseUrl;
@@ -687,6 +697,7 @@
         function reveal() {
           if (revealed) return;
           revealed = true;
+          _playerReady = true;
           container.classList.add('player-ready');
           if (finalVia) setStreamVia(finalVia);
           if (window._stopLoadTimer) window._stopLoadTimer();
@@ -705,7 +716,7 @@
           // Save watch position periodically
           if (window._watchTimeSaveTimer) clearInterval(window._watchTimeSaveTimer);
           var _watchTimeSaveTimer = window._watchTimeSaveTimer = setInterval(function () {
-            if (video.paused || engine.recovering || engine.isLive) return;
+            if (video.paused || engine.isRecovering() || engine.isLive) return;
             var pos = video.currentTime;
             var dur = video.duration;
             if (pos > 5 && dur > 0) {
@@ -749,7 +760,80 @@
           window._finishLoadingBar = null;
         }
         container.classList.add('player-fallback');
-        if (err.permanent) {
+        // Upcoming live event / premiere — show poster with countdown
+        if (err.permanent && err.scheduledStart) {
+          var countdownEnd = new Date(err.scheduledStart).getTime();
+          container.innerHTML = '';
+          var posterImg = document.createElement('img');
+          posterImg.src = '/api/stream/<%= video.videoId %>/poster';
+          posterImg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain';
+          container.appendChild(posterImg);
+          var overlay = document.createElement('div');
+          overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,0.6)';
+          var countdownLabel = document.createElement('div');
+          countdownLabel.style.cssText = 'color:#fff;font-size:0.85rem;margin-bottom:8px;opacity:0.8';
+          countdownLabel.textContent = 'Live in';
+          overlay.appendChild(countdownLabel);
+          var countdownEl = document.createElement('div');
+          countdownEl.style.cssText = 'color:#fff;font-size:2rem;font-variant-numeric:tabular-nums;letter-spacing:0.02em';
+          overlay.appendChild(countdownEl);
+          container.appendChild(overlay);
+          container.style.position = 'relative';
+          function fmtCountdown(sec) {
+            var h = Math.floor(sec / 3600);
+            var m = Math.floor((sec % 3600) / 60);
+            var s = sec % 60;
+            if (h > 0) return h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+            return m + ':' + (s < 10 ? '0' : '') + s;
+          }
+          var connectAttempts = 0;
+          function tryConnect() {
+            connectAttempts++;
+            countdownLabel.textContent = 'Connecting...';
+            countdownEl.textContent = '';
+            // Force fresh extraction by using ?refresh=1
+            manifestUrl = manifestBaseUrl + '&refresh=1';
+            container.classList.remove('player-fallback');
+            engine.videoUnavailable = false;
+            loadVideo().then(function () {
+              // Success — remove the countdown overlay
+              if (overlay.parentElement) overlay.parentElement.removeChild(overlay);
+              if (posterImg.parentElement) posterImg.parentElement.removeChild(posterImg);
+            }).catch(function (retryErr) {
+              container.classList.add('player-fallback');
+              if (connectAttempts < 5) {
+                // Stream not ready yet — wait and retry
+                countdownLabel.textContent = 'Waiting for stream...';
+                var retryDelay = Math.min(10, connectAttempts * 3);
+                countdownEl.textContent = '';
+                setTimeout(tryConnect, retryDelay * 1000);
+              } else {
+                // Give up — show error with manual retry
+                countdownLabel.textContent = 'Stream not available yet';
+                countdownEl.textContent = '';
+                var manualBtn = document.createElement('button');
+                manualBtn.textContent = 'Retry';
+                manualBtn.style.cssText = 'margin-top:16px;padding:8px 24px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:0.9rem';
+                manualBtn.addEventListener('click', function () {
+                  manualBtn.remove();
+                  connectAttempts = 0;
+                  tryConnect();
+                });
+                overlay.appendChild(manualBtn);
+              }
+            });
+          }
+          function tickCountdown() {
+            var remaining = Math.max(0, Math.round((countdownEnd - Date.now()) / 1000));
+            countdownEl.textContent = fmtCountdown(remaining);
+            if (remaining <= 0) {
+              tryConnect();
+              return;
+            }
+            setTimeout(tickCountdown, 1000);
+          }
+          tickCountdown();
+        } else if (err.permanent) {
           container.innerHTML = '<div class="player-error">Failed to load video: ' + (err.message || err) + '</div>';
         } else if (retryCount === 0) {
           var retryDiv = document.createElement('div');
@@ -791,15 +875,13 @@
 
 <%- include('player/keyboard-shortcuts') %>
     }
-    if (window.shaka && window.PlayerEngine) { initPlayer(); }
-    else {
-      // Wait for both shaka and player-engine to load
-      var _initCheck = setInterval(function () {
-        if (window.shaka && window.PlayerEngine) {
-          clearInterval(_initCheck);
-          initPlayer();
-        }
-      }, 50);
+    function tryInitPlayer() {
+      if (window.shaka && window.PlayerEngine) initPlayer();
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', tryInitPlayer);
+    } else {
+      tryInitPlayer();
     }
 
     // Lazy-load full video details
@@ -811,7 +893,7 @@
           var dateEl = document.getElementById('player-date');
           var descEl = document.getElementById('player-desc-text');
 
-          // Stats (always update)
+          // Stats — rebuild views + likes, preserve date from initial render if details lacks it
           if (statsEl && (d.viewCount != null || d.likeCount != null)) {
             var parts = [];
             var isLive = d.liveStatus === 'is_live';
@@ -826,20 +908,27 @@
               var likes = isNaN(Number(d.likeCount)) ? d.likeCount : Number(d.likeCount).toLocaleString();
               parts.push('<span class="stat-item"><svg class="stat-icon" viewBox="0 0 24 24" width="16" height="16"><path d="M1 21h4V9H1v12zm22-11c0-1.1-.9-2-2-2h-6.31l.95-4.57.03-.32c0-.41-.17-.79-.44-1.06L14.17 1 7.59 7.59C7.22 7.95 7 8.45 7 9v10c0 1.1.9 2 2 2h9c.83 0 1.54-.5 1.84-1.22l3.02-7.05c.09-.23.14-.47.14-.73v-2z" fill="none" stroke="currentColor" stroke-width="1.5"/></svg> ' + likes + '</span>');
             }
-            if (d.publishedAt) {
-              var dateText = isLive ? 'Started ' + timeAgo(d.publishedAt)
-                : d.liveStatus === 'was_live' ? 'Streamed ' + timeAgo(d.publishedAt)
-                : d.liveStatus === 'post_live' ? 'Premiered ' + timeAgo(d.publishedAt)
-                : timeAgo(d.publishedAt);
-              parts.push('<span class="stat-item player-date">' + dateText + '</span>');
+            // Use details publishedAt if available, otherwise preserve server-rendered date
+            var pubDate = d.publishedAt || (dateEl && dateEl.dataset.published ? dateEl.dataset.published : '');
+            if (pubDate) {
+              var dateText = isLive ? 'Started ' + timeAgo(pubDate)
+                : d.liveStatus === 'was_live' ? 'Streamed ' + timeAgo(pubDate)
+                : d.liveStatus === 'post_live' ? 'Premiered ' + timeAgo(pubDate)
+                : timeAgo(pubDate);
+              parts.push('<span class="stat-item player-date" id="player-date" data-published="' + pubDate + '">' + dateText + '</span>');
             }
             statsEl.innerHTML = parts.join('');
           }
 
-          // Live comments
+          // Live: hide comments, start polling for updated viewer count
           if (d.liveStatus === 'is_live') {
             var cs = document.querySelector('.comments-section');
             if (cs) cs.hidden = true;
+            startDetailsRefresh();
+          } else if (window._detailsTimer) {
+            // Stream ended — stop polling
+            clearInterval(window._detailsTimer);
+            window._detailsTimer = null;
           }
 
           // Description
@@ -918,7 +1007,16 @@
             console.warn('[details] fetch failed:', err.message || err);
           });
     };
-    // Load details immediately -- doesn't depend on video playback
+    // Load details immediately -- doesn't depend on video playback.
+    // For live streams, re-poll every 30s to keep viewer count fresh.
     window._loadDetails();
+    window._detailsTimer = null;
+    function startDetailsRefresh() {
+      if (window._detailsTimer) clearInterval(window._detailsTimer);
+      window._detailsTimer = setInterval(function () {
+        if (document.hidden) return;
+        window._loadDetails();
+      }, 30000);
+    }
     </script>
   </main>

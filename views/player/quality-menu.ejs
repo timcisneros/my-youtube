@@ -32,9 +32,7 @@
           return svg;
         }
 
-        window._rebuildQualityMenu = rebuildQualityMenu;
         function rebuildQualityMenu() {
-          if (engine.recovering || engine.networkTrouble) return;
           // Remove all children except back button
           var children = qualityMenu.querySelectorAll('button:not(.player-back-btn)');
           for (var i = 0; i < children.length; i++) children[i].remove();

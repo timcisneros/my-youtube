@@ -29,10 +29,15 @@ function getDurationsForVideos(videoIds: string[]) {
   return result;
 }
 
-// Returns a map of videoId -> live_status string from DB.
-function getLiveStatusesForVideos(videoIds: string[]) {
+// Single query returning both formatted durations and live statuses.
+function getDurationsAndLiveStatuses(videoIds: string[]) {
   const unique = [...new Set(videoIds)];
-  return db.getLiveStatuses(unique);
+  const raw = db.getDurationsAndLiveStatuses(unique) as { durations: Record<string, number>; liveStatuses: Record<string, string> };
+  const durations: Record<string, string> = {};
+  for (const id of unique) {
+    if (raw.durations[id]) durations[id] = formatDuration(raw.durations[id]);
+  }
+  return { durations, liveStatuses: raw.liveStatuses };
 }
 
-export { getCachedDuration, getDurationsForVideos, getLiveStatusesForVideos };
+export { getCachedDuration, getDurationsForVideos, getDurationsAndLiveStatuses };

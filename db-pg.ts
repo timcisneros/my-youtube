@@ -468,6 +468,21 @@ const api: DatabaseAPI = {
     return result;
   },
 
+  async getDurationsAndLiveStatuses(videoIds) {
+    if (!videoIds.length) return { durations: {}, liveStatuses: {} };
+    const { rows } = await q(
+      'SELECT video_id, duration, live_status FROM video_durations WHERE video_id = ANY($1::text[])',
+      [videoIds]
+    );
+    const durations = {};
+    const liveStatuses = {};
+    for (const r of rows) {
+      durations[r.video_id] = r.duration;
+      liveStatuses[r.video_id] = r.live_status || 'not_live';
+    }
+    return { durations, liveStatuses };
+  },
+
   async setWatchTime(userId, videoId, position, duration) {
     await q(
       `INSERT INTO watch_time (user_id, video_id, last_position, duration, updated_at)
@@ -648,6 +663,10 @@ const api: DatabaseAPI = {
   async getVideoRatings(userId) {
     const { rows } = await q('SELECT video_id, rating FROM video_ratings WHERE user_id = $1', [userId]);
     return rows;
+  },
+  async getVideoRating(userId, videoId) {
+    const { rows } = await q('SELECT rating FROM video_ratings WHERE user_id = $1 AND video_id = $2', [userId, videoId]);
+    return rows.length ? rows[0].rating : 0;
   },
   async getCommunityRatings(videoIds, excludeUserId) {
     if (!videoIds.length) return {};

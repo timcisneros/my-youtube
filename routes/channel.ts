@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
 import { ensureAuth } from '../auth.js';
-import { getChannelInfo, getChannelVideos, getDurationsForVideos, getLiveStatusesForVideos } from '../youtube/index.js';
+import { getChannelInfo, getChannelVideos, getDurationsAndLiveStatuses } from '../youtube/index.js';
 import { getClientVersion, isYouTubeCdnUrl } from '../extractors.js';
 
 const router = Router();
@@ -66,8 +66,7 @@ router.get('/:channelId', ensureAuth, async (req, res) => {
     const [channelInfo, result] = await Promise.all([infoP, getChannelVideos(channelId, pageToken, activeTab)]);
     const displayId = result.handle || originalId;
     const ids = result.items.map(v => v.videoId);
-    const durations = getDurationsForVideos(ids);
-    const liveStatuses = getLiveStatusesForVideos(ids);
+    const { durations, liveStatuses } = getDurationsAndLiveStatuses(ids);
     await res.streamContent('channel', {
       channelInfo: { ...channelInfo, displayId }, tab: activeTab,
       items: result.items,

@@ -16,17 +16,7 @@
     <% } else { %>
       <div class="video-grid">
         <% for (const v of items) { %>
-          <a href="/watch?v=<%= v.videoId %>" class="video-card">
-            <div class="video-thumb-wrap">
-              <img data-src="/api/stream/<%= v.videoId %>/thumb" alt="" class="video-thumb lazy-thumb" width="320" height="180">
-              <% if (liveStatuses[v.videoId] === 'is_live') { %><span class="video-badge live" data-video-id="<%= v.videoId %>">LIVE</span><% } else if (liveStatuses[v.videoId] === 'is_upcoming') { %><span class="video-badge upcoming" data-video-id="<%= v.videoId %>">UPCOMING</span><% } else if (durations[v.videoId]) { %><span class="video-duration" data-video-id="<%= v.videoId %>"><%= durations[v.videoId] %></span><% } else { %><span class="video-duration" data-video-id="<%= v.videoId %>"></span><% } %>
-              <div class="watch-progress" data-progress-id="<%= v.videoId %>"></div>
-            </div>
-            <div class="video-info">
-              <div class="video-title"><%= v.title %></div>
-              <div class="video-time" data-published="<%= v.publishedAt %>"></div>
-            </div>
-          </a>
+          <%- include('partials/video-card', { vid: v.videoId, title: v.title, published: v.publishedAt }) %>
         <% } %>
       </div>
     <% } %>

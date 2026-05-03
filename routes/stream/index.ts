@@ -17,7 +17,7 @@ router.param('videoId', (_req, res, next, value) => {
 // prefetch, status, poster, and thumb (lightweight/public endpoints)
 router.use('/:videoId', (req, res, next) => {
   const suffix = req.path.split('/').pop();
-  if (suffix === 'prefetch' || suffix === 'status' || suffix === 'poster' || suffix === 'thumb') return next();
+  if (suffix === 'prefetch' || suffix === 'status' || suffix === 'poster' || suffix === 'thumb' || suffix === 'offline-bundle') return next();
   const token = req.query.token;
   if (!token || !validateStreamToken(req.params.videoId, token)) {
     return res.status(401).end();

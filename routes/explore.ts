@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { ensureAuth } from '../auth.js';
 import db from '../db.js';
 import { cache } from '../youtube/shared.js';
-import { getExploreVideos, getDurationsForVideos, getLiveStatusesForVideos } from '../youtube/index.js';
+import { getExploreVideos, getDurationsAndLiveStatuses } from '../youtube/index.js';
 
 const router = Router();
 
@@ -17,8 +17,7 @@ router.get('/', ensureAuth, async (req, res) => {
     const sessionId = sidParam || Date.now().toString(36);
     void Promise.resolve(db.startExploreSession(req.session.userId, sessionId));
     const allIds = videos.map(v => v.videoId);
-    const durations = getDurationsForVideos(allIds);
-    const liveStatuses = getLiveStatusesForVideos(allIds);
+    const { durations, liveStatuses } = getDurationsAndLiveStatuses(allIds);
     const boostedIds = await Promise.resolve(db.getBoostedChannelIds(req.session.userId));
     const boostedSet = new Set(boostedIds);
     const queuedIds = await Promise.resolve(db.getQueuedVideoIds(req.session.userId));

@@ -1,3 +1,4 @@
+import fs from 'fs';
 import { Readable, Transform } from 'stream';
 import { pipeline } from 'stream/promises';
 import {
@@ -6,8 +7,14 @@ import {
   formatCache,
   mpdCache,
   urlLookup,
+  sanitizeHeaders,
+  extractionInflight,
+  CACHE_TTL,
+  dedup,
 } from './shared.js';
 import { buildMPD } from './mpd.js';
+import { extractFormats } from './extraction.js';
+import { bgDownloads } from './downloads.js';
 import * as segmentCache from '../../lib/segment-cache.js';
 
 function mountDashRoutes(router) {
@@ -33,7 +40,7 @@ function mountDashRoutes(router) {
 
       // Unavailable video (upcoming livestream, premiere, etc.)
       if (typeof result === 'object' && result.unavailable) {
-        return res.status(404).json({ error: result.unavailable });
+        return res.status(404).json({ error: result.unavailable, scheduledStart: result.scheduledStart });
       }
 
       // Include stream chain metadata in a response header for the player UI
@@ -46,8 +53,30 @@ function mountDashRoutes(router) {
       if (typeof result === 'object' && (result.hls || result.progressive)) {
         return res.json(result);
       }
+
+      // Tell the player the downloaded video height so it can pin ABR
+      const itagHeight: Record<string, number> = {
+        '160': 144, '133': 240, '134': 360, '135': 480, '136': 720,
+        '137': 1080, '298': 720, '299': 1080, '264': 1440, '271': 1440,
+        '313': 2160, '304': 720, '303': 1080, '308': 1440, '315': 2160,
+        '330': 144, '331': 240, '332': 360, '333': 480, '334': 720,
+        '335': 1080, '336': 1440, '337': 2160,
+        '394': 144, '395': 240, '396': 360, '397': 480, '398': 720,
+        '399': 1080, '400': 1440, '401': 2160, '571': 4320,
+      };
+      let dlHeight = 0;
+      for (const [key, entry] of bgDownloads) {
+        if (key.startsWith(videoId + ':') && entry.done) {
+          const h = itagHeight[key.split(':')[1]] || 0;
+          if (h > dlHeight) dlHeight = h;
+        }
+      }
+      if (dlHeight > 0) {
+        res.set('X-Downloaded-Height', String(dlHeight));
+      }
+
       res.set('Content-Type', 'application/dash+xml');
-      res.set('Cache-Control', 'no-cache');
+      res.set('Cache-Control', 'private, max-age=300');
       res.send(result);
     } catch (err) {
       console.error('MPD generation failed:', err.message);
@@ -71,6 +100,36 @@ function mountDashRoutes(router) {
         return res.end(cached.data);
       }
 
+      // Serve from local download if available (instant, no YouTube round-trip)
+      const bg = bgDownloads.get(`${videoId}:${formatId}`);
+      if (bg && bg.done && bg.bytesDownloaded > 0) {
+        const audioItags = ['140', '141', '249', '250', '251'];
+        const contentType = audioItags.includes(formatId) ? 'audio/mp4' : 'video/mp4';
+        const rangeMatch = req.headers.range && (req.headers.range as string).match(/^bytes=(\d+)-(\d*)$/);
+        if (rangeMatch) {
+          const start = parseInt(rangeMatch[1], 10);
+          const end = rangeMatch[2] ? parseInt(rangeMatch[2], 10) : bg.bytesDownloaded - 1;
+          if (end < bg.bytesDownloaded) {
+            res.status(206);
+            res.set('Content-Type', contentType);
+            res.set('Content-Length', String(end - start + 1));
+            res.set('Content-Range', `bytes ${start}-${end}/${bg.totalSize || bg.bytesDownloaded}`);
+            res.set('Accept-Ranges', 'bytes');
+            res.set('X-Segment-Cache', 'local');
+            const stream = fs.createReadStream(bg.filePath, { start, end });
+            return pipeline(stream, res).catch(() => {});
+          }
+        } else {
+          res.status(200);
+          res.set('Content-Type', contentType);
+          res.set('Content-Length', String(bg.bytesDownloaded));
+          res.set('Accept-Ranges', 'bytes');
+          res.set('X-Segment-Cache', 'local');
+          const stream = fs.createReadStream(bg.filePath);
+          return pipeline(stream, res).catch(() => {});
+        }
+      }
+
       let entry = urlLookup.get(`${videoId}:${formatId}`);
       if (!entry || Date.now() > entry.expires) {
         // URL missing or expired — rebuild MPD to repopulate urlLookup
@@ -84,7 +143,25 @@ function mountDashRoutes(router) {
       const headers = { ...(entry.headers || {}) };
       if (req.headers.range) headers.Range = req.headers.range;
 
-      const upstream = await fetchWithConnTimeout(entry.url, { headers });
+      let upstream = await fetchWithConnTimeout(entry.url, { headers });
+
+      // YouTube CDN URL expired — evict caches, re-extract, retry once
+      if (upstream.status === 403 || upstream.status === 410) {
+        await upstream.body?.cancel().catch(() => {});
+        formatCache.delete(videoId);
+        mpdCache.delete(videoId);
+        for (const [key] of urlLookup) {
+          if (key.startsWith(videoId + ':')) urlLookup.delete(key);
+        }
+        const info = await dedup(extractionInflight, `refresh:${videoId}`, () => extractFormats(videoId));
+        const fmt = (info.formats || []).find((f: { format_id }) => String(f.format_id) === String(formatId));
+        if (!fmt?.url) return res.status(404).json({ error: 'Format not found after refresh' });
+        urlLookup.set(`${videoId}:${formatId}`, { url: fmt.url, headers: sanitizeHeaders(fmt.http_headers), expires: Date.now() + CACHE_TTL });
+        const retryHeaders: Record<string, string> = { ...sanitizeHeaders(fmt.http_headers) };
+        if (req.headers.range) retryHeaders.Range = req.headers.range as string;
+        upstream = await fetchWithConnTimeout(fmt.url, { headers: retryHeaders });
+      }
+
       if (!upstream.ok && upstream.status !== 206) {
         await upstream.body?.cancel().catch(() => {});
         if (upstream.status >= 500) res.set('Retry-After', '2');

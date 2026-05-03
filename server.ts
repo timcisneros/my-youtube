@@ -216,6 +216,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// Offline fallback page — no auth needed (SW caches this for offline use)
+app.get('/offline', (_req, res) => {
+  void res.flushShell({ activeTab: null }).then(() => {
+    res.end('<div class="offline-message"><h2>You are offline</h2><p>Connect to the internet to browse videos.</p><p><a href="/downloads">View your downloads</a></p></div></main><script src="/app.js"></script>\n</body>\n</html>');
+  });
+});
+
 import db from './db.js';
 
 // Mount route modules
@@ -354,21 +361,22 @@ app.get('/health/ready', async (_req, res) => {
 
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => logger.info('my-youtube running', { port: PORT }));
-import { attach } from './lib/ws-status.js';
+import { attach, closeAll as closeAllWebSockets } from './lib/ws-status.js';
 await attach(server);
 
 // Graceful shutdown — finish in-flight requests before exiting
 function gracefulShutdown(signal) {
   logger.info('Shutting down gracefully', { signal });
+  // Close WebSocket connections so they don't hold the server open
+  closeAllWebSockets();
   server.close(() => {
     logger.info('All connections closed, exiting');
     process.exit(0);
   });
-  // Force exit after 30s safety timeout
+  // Force exit after 5s safety timeout
   setTimeout(() => {
-    logger.error('Forced exit after 30s timeout');
     process.exit(1);
-  }, 30000).unref();
+  }, 5000).unref();
 }
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));

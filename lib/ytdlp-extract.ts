@@ -9,6 +9,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { ytdlpArgs, ytdlpBrowserArgs, refreshCookiesFile } from '../ytdlp.js';
+import { fetchScheduledStart } from '../extractors.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,7 +41,9 @@ async function extractViaYtdlp(videoId: string, withSlot: <T>(fn: () => Promise<
       const msg = e.stderr || e.message || '';
       // Truly unavailable videos
       if (/live event will begin|Premieres in|is not currently live/i.test(msg)) {
-        return { formats: [], duration: 0, _unavailable: msg, _permanent: true };
+        // Fetch the actual scheduled start time from Innertube (absolute, not relative)
+        const scheduledStart = await fetchScheduledStart(videoId).catch(() => undefined);
+        return { formats: [], duration: 0, _unavailable: msg, _permanent: true, _scheduledStart: scheduledStart };
       }
       // Bot detection -> try fresh browser cookies (Level 2)
       if (/Sign in to confirm you're not a bot|page needs to be reloaded/i.test(msg)) {

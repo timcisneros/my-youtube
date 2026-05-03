@@ -33,7 +33,14 @@
         var card = btn.closest('.download-card');
         var videoId = card.dataset.videoId;
         fetch('/downloads/' + videoId, { method: 'DELETE' }).then(function(r) {
-          if (r.ok) card.remove();
+          if (r.ok) {
+            card.remove();
+            // Clean up IDB format files
+            if (typeof IDBHelpers !== 'undefined') IDBHelpers.deleteAllForVideo(videoId);
+            if (navigator.serviceWorker && navigator.serviceWorker.controller) {
+              navigator.serviceWorker.controller.postMessage({ type: 'delete-offline-video', videoId: videoId });
+            }
+          }
           // Show empty message if no cards left
           if (!document.querySelector('.download-card')) {
             var grid = document.querySelector('.video-grid');

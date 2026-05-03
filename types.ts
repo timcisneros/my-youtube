@@ -52,6 +52,7 @@ export interface DatabaseAPI {
   getLiveStatus(videoId: string): MaybePromise<string | null>;
   getDurations(videoIds: string[]): MaybePromise<Record<string, number>>;
   getLiveStatuses(videoIds: string[]): MaybePromise<Record<string, string>>;
+  getDurationsAndLiveStatuses(videoIds: string[]): MaybePromise<{ durations: Record<string, number>; liveStatuses: Record<string, string> }>;
   setVideoTags(videoId: string, tags: string[]): MaybePromise<void>;
   getVideoTags(videoIds: string[]): MaybePromise<Record<string, string[]>>;
   setVideoDescription(videoId: string, description: string): MaybePromise<void>;
@@ -88,6 +89,7 @@ export interface DatabaseAPI {
   rateVideo(userId: string, videoId: string, rating: number): MaybePromise<void>;
   unrateVideo(userId: string, videoId: string): MaybePromise<void>;
   getVideoRatings(userId: string): MaybePromise<Array<{ video_id: string; rating: number }>>;
+  getVideoRating(userId: string, videoId: string): MaybePromise<number>;
   getCommunityRatings(videoIds: string[], excludeUserId: string): MaybePromise<Record<string, { up: number; down: number }>>;
   setTopicFilter(userId: string, topic: string, filter: string): MaybePromise<void>;
   removeTopicFilter(userId: string, topic: string): MaybePromise<void>;

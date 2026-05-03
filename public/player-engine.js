@@ -1,9 +1,16 @@
 /**
- * PlayerEngine — wraps Shaka Player with application-level overrides
- * for single-proxy architecture (all segments from one host).
+ * PlayerEngine — wraps Shaka Player with a custom HTTP plugin that
+ * owns the entire network layer for the single-proxy architecture.
  *
- * Handles: recovery state machine, request policy, error classification,
- * server probing, retryStreaming cascade.
+ * Recovery model: our HTTP scheme plugin replaces Shaka's built-in
+ * fetch plugin. Every request goes through our code. When the server
+ * is unreachable (network error, 401, 5xx), the plugin holds the
+ * request internally and waits for the probe to confirm recovery.
+ * Then it re-stamps the token and retries the fetch — returning only
+ * successful responses to Shaka. Shaka never sees a network error,
+ * never exhausts retries, never re-fetches the manifest, never clears
+ * the buffer. The video plays from buffer during the outage and
+ * resumes seamlessly when the server returns.
  *
  * Emits events so the UI layer can react without managing Shaka internals.
  */
@@ -18,24 +25,20 @@
     this.isLive = false;
 
     // State
-    this.recovering = false;
-    this.networkTrouble = false;
-    this.recoveryTransition = false;
+    this._serverDown = false;
+    this._recovering = false;  // decode-error reload in progress
     this.lastGoodTime = 0;
-    this.retryActive = false;
     this.videoUnavailable = false;
     this.destroyed = false;
 
+    // Held requests — resolve functions for plugin fetches waiting
+    // for the server to come back. Released by _exitServerDown.
+    this._heldRequests = [];
+
     // Internal
-    this._retryResolved = false;
-    this._retryGen = 0;
-    this._probeTimer = null;
-    this._elapsedTimer = null;
     this._listeners = {};
     this._player = new shaka.Player();
     this._finalVia = '';
-    this._rebufferCount = 0;
-    this._retryStartTime = 0;
   }
 
   // --- Event emitter ---
@@ -70,47 +73,175 @@
 
     var attachPromise = player.attach(this.video);
 
-    // 1. Request policy: block during recovery + append stream token
-    player.getNetworkingEngine().registerRequestFilter(function (type, request) {
-      if (self.recovering) {
-        return Promise.reject(new shaka.util.Error(
-          shaka.util.Error.Severity.RECOVERABLE,
-          shaka.util.Error.Category.NETWORK,
-          shaka.util.Error.Code.OPERATION_ABORTED
-        ));
-      }
-      // Timeout during retry — if segments are blocked for >10s, force reload
-      if (self.retryActive && self._retryStartTime && Date.now() - self._retryStartTime > 10000) {
-        self._onRetryFailed(0);
-        return Promise.reject(new shaka.util.Error(
-          shaka.util.Error.Severity.RECOVERABLE,
-          shaka.util.Error.Category.NETWORK,
-          shaka.util.Error.Code.OPERATION_ABORTED
-        ));
-      }
-      // Append stream token to all segment/manifest requests to our server
-      if (self.streamToken && request.uris && request.uris.length) {
-        for (var i = 0; i < request.uris.length; i++) {
-          var uri = request.uris[i];
-          if (uri.indexOf('/api/stream/') !== -1 && uri.indexOf('token=') === -1) {
-            request.uris[i] = uri + (uri.indexOf('?') === -1 ? '?' : '&') + 'token=' + self.streamToken;
+    // --- Custom HTTP plugin ---
+    // Replaces Shaka's built-in http_fetch_plugin. Every HTTP request
+    // goes through our code, giving us full control over hold, retry,
+    // token stamping, and error handling. Shaka only ever receives
+    // successful responses.
+
+    function stampUri(uri) {
+      if (!self.streamToken || uri.indexOf('/api/stream/') === -1) return uri;
+      var base = uri.replace(/[?&]token=[^&]*/, '');
+      return base + (base.indexOf('?') === -1 ? '?' : '&') + 'token=' + self.streamToken;
+    }
+
+    function waitForServer() {
+      if (!self._serverDown) return Promise.resolve();
+      return new Promise(function (resolve) {
+        self._heldRequests.push(resolve);
+      });
+    }
+
+    function httpPlugin(uri, request, requestType, progressUpdated, headersReceived) {
+      var startTime = Date.now();
+      var abortController = new AbortController();
+      var aborted = false;
+
+      function doFetch() {
+        if (aborted) {
+          return Promise.reject(new shaka.util.Error(
+            shaka.util.Error.Severity.RECOVERABLE,
+            shaka.util.Error.Category.NETWORK,
+            shaka.util.Error.Code.OPERATION_ABORTED
+          ));
+        }
+
+        var fetchUri = stampUri(uri);
+        var init = {
+          method: request.method || 'GET',
+          headers: {},
+          signal: abortController.signal
+        };
+
+        var reqHeaders = request.headers || {};
+        for (var key in reqHeaders) {
+          if (reqHeaders.hasOwnProperty(key)) {
+            init.headers[key] = reqHeaders[key];
           }
         }
-      }
-    });
+        if (request.body) init.body = request.body;
 
-    // 2. Response filter: capture stream-via metadata
-    player.getNetworkingEngine().registerResponseFilter(function (type, response) {
-      if (type === shaka.net.NetworkingEngine.RequestType.MANIFEST) {
-        var via = response.headers['x-stream-via'];
-        if (via) {
-          self._finalVia = via;
-          self.emit('via', via);
-        }
-      }
-    });
+        return fetch(fetchUri, init).then(function (response) {
+          // 401, 403, or 5xx — server problem, hold and retry.
+          // 403 included because it can mean an expired CDN URL that the
+          // server-side circuit breaker failed to refresh.
+          if (response.status === 401 || response.status === 403 || response.status >= 500) {
+            if (!self._serverDown) {
+              self._enterServerDown(response.status === 401 ? 'token-expired' : 'server-error');
+            }
+            return waitForServer().then(doFetch);
+          }
 
-    // 3. Configuration
+          // Capture metadata from manifest responses
+          if (requestType === shaka.net.NetworkingEngine.RequestType.MANIFEST) {
+            var via = response.headers.get('x-stream-via');
+            if (via) {
+              self._finalVia = via;
+              self.emit('via', via);
+            }
+            // If a local download exists, tell the UI the downloaded height
+            // so it can pin ABR to that resolution (instant playback from disk)
+            var dlHeight = response.headers.get('x-downloaded-height');
+            if (dlHeight) {
+              self.emit('downloaded-height', parseInt(dlHeight, 10));
+            }
+          }
+
+          // Build Shaka response with progress reporting
+          var responseHeaders = {};
+          response.headers.forEach(function (value, key) {
+            responseHeaders[key] = value;
+          });
+          if (headersReceived) headersReceived(responseHeaders);
+
+          var contentLength = parseInt(response.headers.get('Content-Length') || '0', 10);
+
+          // Stream body chunks for accurate ABR bandwidth estimation
+          if (response.body && typeof response.body.getReader === 'function') {
+            var reader = response.body.getReader();
+            var chunks = [];
+            var loaded = 0;
+
+            function pump() {
+              return reader.read().then(function (result) {
+                if (result.done) {
+                  var total = 0;
+                  for (var i = 0; i < chunks.length; i++) total += chunks[i].length;
+                  var combined = new Uint8Array(total);
+                  var offset = 0;
+                  for (var j = 0; j < chunks.length; j++) {
+                    combined.set(chunks[j], offset);
+                    offset += chunks[j].length;
+                  }
+                  return {
+                    uri: response.url || fetchUri,
+                    originalUri: uri,
+                    data: combined.buffer,
+                    status: response.status,
+                    headers: responseHeaders,
+                    timeMs: Date.now() - startTime
+                  };
+                }
+                chunks.push(result.value);
+                loaded += result.value.length;
+                if (progressUpdated) {
+                  progressUpdated(Date.now() - startTime, loaded, contentLength);
+                }
+                return pump();
+              });
+            }
+            return pump();
+          }
+
+          // Fallback for responses without ReadableStream
+          return response.arrayBuffer().then(function (data) {
+            if (progressUpdated) {
+              progressUpdated(Date.now() - startTime, data.byteLength, data.byteLength);
+            }
+            return {
+              uri: response.url || fetchUri,
+              originalUri: uri,
+              data: data,
+              status: response.status,
+              headers: responseHeaders,
+              timeMs: Date.now() - startTime
+            };
+          });
+        }).catch(function (err) {
+          // Abort — propagate without retry
+          if (aborted || err.name === 'AbortError') {
+            throw new shaka.util.Error(
+              shaka.util.Error.Severity.RECOVERABLE,
+              shaka.util.Error.Category.NETWORK,
+              shaka.util.Error.Code.OPERATION_ABORTED
+            );
+          }
+          // Network error — hold and retry
+          if (!self._serverDown) {
+            self._enterServerDown('network-error');
+          }
+          return waitForServer().then(doFetch);
+        });
+      }
+
+      // If already in serverDown, wait before first attempt
+      var promise = (self._serverDown ? waitForServer() : Promise.resolve()).then(doFetch);
+
+      return new shaka.util.AbortableOperation(promise, function () {
+        aborted = true;
+        abortController.abort();
+        return Promise.resolve();
+      });
+    }
+
+    // Register our plugin at APPLICATION priority — overrides Shaka's
+    // built-in http_fetch_plugin for all http/https requests.
+    var APP = shaka.net.NetworkingEngine.PluginPriority.APPLICATION;
+    shaka.net.NetworkingEngine.registerScheme('http', httpPlugin, APP);
+    shaka.net.NetworkingEngine.registerScheme('https', httpPlugin, APP);
+
+    // Configuration — no request/response filters needed. The plugin
+    // handles token stamping, error detection, and via capture.
     player.configure({
       abr: {
         enabled: true,
@@ -124,36 +255,12 @@
         bufferingGoal: 30,
         rebufferingGoal: 0.3,
         bufferBehind: 60,
-        segmentPrefetchLimit: 5,
+        segmentPrefetchLimit: 2,
         retryParameters: {
           maxAttempts: 3,
-          baseDelay: 200,
+          baseDelay: 300,
           backoffFactor: 2,
-          timeout: 10000
-        },
-        failureCallback: function (error) {
-          if (error.category === 1) {
-            // Always upgrade network errors to FATAL — in every state:
-            // - Normal: triggers recovery via error handler
-            // - Recovering: request filter blocks, this handles stragglers
-            // - Retry active: prevents variant cycling during retryStreaming
-            error.severity = 2;
-            if (!self.recovering && !self.retryActive) {
-              // Set recovering immediately so the request filter blocks
-              // on the very next tick — before recover() does full setup
-              self.recovering = true;
-              // Defer full recovery setup to next microtask so we return
-              // from this callback synchronously (Shaka expects that)
-              Promise.resolve().then(function () {
-                self.recovering = false;
-                self.recover('network failure code=' + error.code);
-              });
-            }
-            if (!self.networkTrouble) {
-              self.networkTrouble = true;
-              self.emit('network-trouble', true);
-            }
-          }
+          timeout: 30000
         }
       },
       manifest: {
@@ -166,36 +273,35 @@
       }
     });
 
-    // 4. Error handler
+    // Shaka error handler — suppressed. All network errors are handled
+    // by our plugin. Only non-network errors (parsing, buffer) log here.
     player.addEventListener('error', function (event) {
       var error = event.detail;
-      if (!error) return;
-      if (self.destroyed || self.recovering) return;
-      // Emergency quality drop after repeated rebuffers
-      if (error.category === 1) {
-        self._rebufferCount++;
-        if (self._rebufferCount >= 3) {
-          try {
-            player.configure({ abr: { restrictions: { maxHeight: 360 } } });
-            self.emit('emergency-quality-drop');
-          } catch (e) {}
-        }
-      }
-      if (error.severity === 2 || error.category === 3) {
-        if (self.retryActive) {
-          self._onRetryFailed(error.code);
-        } else {
-          self.recover('error cat=' + error.category + ' code=' + error.code);
-        }
+      if (error && !self._serverDown && !self._recovering) {
+        console.debug('[player-engine] shaka error cat=' + error.category + ' code=' + error.code);
       }
     });
 
-    // 5. Bound handlers — created once, reused across recovery cycles
-    this._boundTrackTime = function () {
-      if (self.video.currentTime > 0) self.lastGoodTime = self.video.currentTime;
-    };
-    this._boundProbe = function () { self._probeServer(); };
-    this._boundOnVisible = function () { if (!document.hidden) self._probeServer(); };
+    // Video element error recovery — handles decode errors, media
+    // errors, etc. independent of Shaka and our network layer.
+    this.video.addEventListener('error', function () {
+      var e = self.video.error;
+      if (!e || self.destroyed || self._serverDown || self._recovering) return;
+      self._recovering = true;
+      var pos = self.video.currentTime || self.lastGoodTime || 0;
+      console.log('[player-engine] video error code=' + e.code + ', reloading at ' + pos.toFixed(1) + 's');
+      self._player.unload().then(function () {
+        return self._player.load(self.manifestUrl, pos > 1 ? pos : undefined);
+      }).then(function () {
+        self.video.play().catch(function () {});
+        self._recovering = false;
+      }).catch(function () {
+        self._recovering = false;
+        if (!self._serverDown) {
+          self._enterServerDown('reload-failed');
+        }
+      });
+    });
 
     return attachPromise;
   };
@@ -215,176 +321,104 @@
 
   PlayerEngine.prototype.setLive = function (live) { this.isLive = live; };
 
-  PlayerEngine.prototype.clearNetworkTrouble = function () {
-    if (!this.networkTrouble) return;
-    this.networkTrouble = false;
-    this.emit('network-trouble-cleared');
+  // True when the engine is in any recovery state (server down or decode reload)
+  PlayerEngine.prototype.isRecovering = function () {
+    return this._serverDown || this._recovering;
   };
 
-  // --- Recovery state machine ---
+  // --- Server down / recovery ---
+  // The plugin holds requests internally when serverDown is true.
+  // enterServerDown starts the probe; exitServerDown releases held
+  // requests so the plugin retries its fetches with a fresh token.
 
-  PlayerEngine.prototype.recover = function (reason, keepTime) {
-    if (this.recovering || this.destroyed || this.videoUnavailable) return;
+  PlayerEngine.prototype._enterServerDown = function (reason) {
+    if (this._serverDown || this.destroyed) return;
+    this._serverDown = true;
+    this.lastGoodTime = this.video.currentTime || this.lastGoodTime || 0;
+    console.log('[player-engine] server down (' + reason + '), lastGoodTime=' + this.lastGoodTime.toFixed(1));
+    this.emit('server-down', reason);
+    this._startServerProbe();
+  };
 
-    this._cleanupAll();
-
-    this.recovering = true;
-    if (!keepTime) this.lastGoodTime = this.video.currentTime || 0;
-
-    this.video.addEventListener('timeupdate', this._boundTrackTime);
-
-    this.emit('recovery-start', {
-      reason: reason,
-      lastGoodTime: this.lastGoodTime
-    });
-
-    // Probe immediately, then on interval + events
-    this._probeServer();
-    this._probeTimer = setInterval(this._boundProbe, 5000);
-    window.addEventListener('online', this._boundProbe);
-    document.addEventListener('visibilitychange', this._boundOnVisible);
-
-    // Elapsed counter
-    var engine = this;
+  PlayerEngine.prototype._startServerProbe = function () {
+    if (this._serverProbeTimer) return;
+    var self = this;
     var startTime = Date.now();
-    this._elapsedTimer = setInterval(function () {
-      if (!engine.recovering) { clearInterval(engine._elapsedTimer); return; }
-      var elapsed = Math.floor((Date.now() - startTime) / 1000);
-      engine.emit('recovery-elapsed', elapsed);
+    this._serverElapsedTimer = setInterval(function () {
+      if (!self._serverDown) { clearInterval(self._serverElapsedTimer); return; }
+      self.emit('server-down-elapsed', Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
-  };
 
-  PlayerEngine.prototype._probeServer = function () {
-    if (!this.recovering) return;
-    if (!navigator.onLine) return;
-    var self = this;
-    fetch('/api/stream/' + this.videoId + '/prefetch')
-      .then(function (r) {
-        if (!self.recovering) return;
-        if (r.ok || r.status === 204) {
-          // Server is back — resume immediately. retryStreaming() refills
-          // the buffer alongside what's already playing. If the server goes
-          // down again, failureCallback catches it from the failed segment
-          // fetch. No need to wait for buffer drain or keep probing.
-          self._cleanupProbes();
-          self._doResume();
-        }
-      })
-      .catch(function () {});
-  };
-
-  PlayerEngine.prototype._doResume = function () {
-    // Keep _boundTrackTime — lastGoodTime stays fresh for fallback
-
-    this.recovering = false;
-    this.retryActive = true;
-    this._retryResolved = false;
-    this._retryStartTime = Date.now();
-    var gen = ++this._retryGen;
-
-    this.emit('retry-start');
-
-    var accepted;
-    try {
-      accepted = this._player.retryStreaming();
-    } catch (e) {
-      this.retryActive = false;
-      this._doFullReload();
-      return;
+    function probe() {
+      if (!self._serverDown || self.destroyed) return;
+      fetch(self.manifestUrl, { method: 'HEAD' })
+        .then(function (r) {
+          if (!self._serverDown) return;
+          if (r.status === 401) {
+            self._refreshToken();
+          } else if (r.ok && !r.headers.get('X-SW-Cache')) {
+            self._exitServerDown();
+          }
+        })
+        .catch(function () {})
+        .then(function () {
+          if (!self._serverDown || self.destroyed) return;
+          self._serverProbeTimer = setTimeout(probe, 3000 + Math.random() * 2000);
+        });
     }
-
-    if (!accepted) {
-      this.retryActive = false;
-      this._doFullReload();
-      return;
-    }
-
-    var self = this;
-    this._onRetryPlaying = function () { self._onRetrySuccess(); };
-    this._onRetryCanplay = function () {
-      if (self.video.readyState >= 3) self._onRetrySuccess();
-    };
-    this.video.addEventListener('playing', this._onRetryPlaying);
-    this.video.addEventListener('canplay', this._onRetryCanplay);
-
-    // Buffer growth check — detect silent retryStreaming failure
-    // Take two snapshots 2s apart to measure growth rate, not just absolute position
-    var bufSnapshot = this._getBufferEnd();
-    setTimeout(function () {
-      if (gen !== self._retryGen || !self.retryActive || self._retryResolved) return;
-      var midSnapshot = self._getBufferEnd();
-      setTimeout(function () {
-        if (gen !== self._retryGen || !self.retryActive || self._retryResolved) return;
-        var growth = self._getBufferEnd() - midSnapshot;
-        if (growth < 0.3) {
-          self._onRetryFailed(0);
-        }
-      }, 2000);
-    }, 2000);
+    probe();
   };
 
-  PlayerEngine.prototype._onRetrySuccess = function () {
-    if (this._retryResolved) return;
-    this._retryResolved = true;
-    this._cleanupRetry();
-    this.video.removeEventListener('timeupdate', this._boundTrackTime);
-    this.networkTrouble = false;
+  PlayerEngine.prototype._stopServerProbe = function () {
+    if (this._serverProbeTimer) { clearTimeout(this._serverProbeTimer); this._serverProbeTimer = null; }
+    if (this._serverElapsedTimer) { clearInterval(this._serverElapsedTimer); this._serverElapsedTimer = null; }
+  };
 
+  PlayerEngine.prototype._exitServerDown = function () {
+    if (!this._serverDown) return;
+    this._serverDown = false;
+    this._stopServerProbe();
+    this.lastGoodTime = Math.max(this.lastGoodTime, this.video.currentTime || 0);
+    console.log('[player-engine] server back, releasing ' + this._heldRequests.length + ' held requests');
+
+    // Release all held plugin fetches — each one loops back into
+    // doFetch() which re-stamps the token and retries the request.
+    var held = this._heldRequests;
+    this._heldRequests = [];
+    for (var i = 0; i < held.length; i++) held[i]();
+
+    this.emit('server-up');
     this.emit('recovery-end', {
-      method: 'retry',
+      method: 'seamless',
       time: this.video.currentTime,
       via: this._finalVia
     });
   };
 
-  PlayerEngine.prototype._onRetryFailed = function (code) {
-    if (!this.retryActive || this._retryResolved) return;
-    this._cleanupRetry();
-    this.video.removeEventListener('timeupdate', this._boundTrackTime);
-    this.emit('retry-failed', code);
-    this._doFullReload();
-  };
-
-  PlayerEngine.prototype._doFullReload = function () {
-    if (this.recoveryTransition || this.destroyed) return;
-    var resumeTime = this.lastGoodTime;
-    this.recoveryTransition = true;
-
-    this.emit('reload-start', resumeTime);
-    this.emit('freeze-frame');
-
+  // --- Token refresh ---
+  PlayerEngine.prototype._refreshToken = function () {
+    if (this._refreshingToken) return;
+    this._refreshingToken = true;
     var self = this;
-    this._player.unload().then(function () {
-      return self._player.load(self.manifestUrl);
-    }).then(function () {
-      if (resumeTime > 1 && !self.isLive) self.video.currentTime = resumeTime;
-
-      function finish() {
-        if (!self.recoveryTransition) return;
-        self.recoveryTransition = false;
-        self.networkTrouble = false;
-        self.video.play().catch(function () {});
-        self.emit('unfreeze-frame');
-        self.emit('recovery-end', {
-          method: 'reload',
-          time: resumeTime,
-          via: self._finalVia
-        });
-      }
-
-      self.video.addEventListener('seeked', finish, { once: true });
-      setTimeout(function () { if (self.recoveryTransition) finish(); }, 5000);
-    }).catch(function (err) {
-      if (self.destroyed) return;
-      self.recoveryTransition = false;
-      self.emit('unfreeze-frame');
-      self.emit('fatal', {
-        time: resumeTime,
-        error: err
+    fetch('/watch/token?v=' + encodeURIComponent(this.videoId))
+      .then(function (r) {
+        if (!r.ok) throw new Error('Token refresh failed: ' + r.status);
+        return r.json();
+      })
+      .then(function (data) {
+        if (!data.token) throw new Error('No token in response');
+        self._refreshingToken = false;
+        self.streamToken = data.token;
+        self.manifestUrl = '/api/stream/' + self.videoId + '/dash.mpd?token=' + data.token;
+        self.emit('token-refreshed', data.token);
+      })
+      .catch(function () {
+        self._refreshingToken = false;
+        self._stopServerProbe();
+        self._serverDown = false;
+        self.emit('auth-expired');
       });
-    });
   };
-
 
   // --- Buffer helpers ---
 
@@ -394,40 +428,25 @@
     return buf.end(buf.length - 1);
   };
 
+  PlayerEngine.prototype._getBufferAhead = function () {
+    var buf = this.video.buffered;
+    var ct = this.video.currentTime;
+    for (var i = 0; i < buf.length; i++) {
+      if (ct >= buf.start(i) - 0.5 && ct <= buf.end(i)) {
+        return buf.end(i) - ct;
+      }
+    }
+    return 0;
+  };
+
   // --- Cleanup ---
-
-  PlayerEngine.prototype._cleanupProbes = function () {
-    if (this._probeTimer) { clearInterval(this._probeTimer); this._probeTimer = null; }
-    if (this._elapsedTimer) { clearInterval(this._elapsedTimer); this._elapsedTimer = null; }
-    window.removeEventListener('online', this._boundProbe);
-    document.removeEventListener('visibilitychange', this._boundOnVisible);
-  };
-
-  PlayerEngine.prototype._cleanupRetry = function () {
-    this.retryActive = false;
-    this._retryResolved = false;
-    if (this._onRetryPlaying) { this.video.removeEventListener('playing', this._onRetryPlaying); this._onRetryPlaying = null; }
-    if (this._onRetryCanplay) { this.video.removeEventListener('canplay', this._onRetryCanplay); this._onRetryCanplay = null; }
-  };
-
-  PlayerEngine.prototype._cleanupAll = function () {
-    this._cleanupProbes();
-    this._cleanupRetry();
-    this.video.removeEventListener('timeupdate', this._boundTrackTime);
-    this.emit('unfreeze-frame');
-  };
 
   PlayerEngine.prototype.destroy = function () {
     this.destroyed = true;
-    this.recovering = false;
-    this.retryActive = false;
-    this.recoveryTransition = false;
-    this._cleanupAll();
-    // Remove global listeners that may have been added during recovery
-    if (this._boundProbe) {
-      window.removeEventListener('online', this._boundProbe);
-      document.removeEventListener('visibilitychange', this._boundOnVisible);
-    }
+    this._serverDown = false;
+    this._recovering = false;
+    this._heldRequests = [];
+    this._stopServerProbe();
     if (this._player) {
       try { this._player.destroy(); } catch (e) {}
       this._player = null;
@@ -435,20 +454,11 @@
     this._listeners = {};
   };
 
-  // --- Seek during recovery ---
-
-  PlayerEngine.prototype.seekDuringRecovery = function (time) {
-    this.lastGoodTime = time;
-  };
-
   // --- Stall watchdog integration ---
 
   PlayerEngine.prototype.reportStall = function () {
-    if (this.retryActive) {
-      this._onRetryFailed(0);
-    } else if (!this.recovering) {
-      this.recover('stall');
-    }
+    if (this._serverDown) return;
+    this._enterServerDown('stall');
   };
 
   // Export

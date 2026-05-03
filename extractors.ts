@@ -405,6 +405,31 @@ async function fetchLiveStoryboardSpec(videoId) {
   return null;
 }
 
+// Fetch the scheduled start time for an upcoming livestream/premiere via Innertube
+async function fetchScheduledStart(videoId: string): Promise<string | undefined> {
+  try {
+    if (!visitorData) await refreshClientVersion();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    const resp = await fetch(`https://www.youtube.com/youtubei/v1/player?key=${INNERTUBE_KEY}`, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT, 'X-Goog-Visitor-Id': visitorData },
+      body: JSON.stringify({
+        videoId,
+        context: { client: { clientName: 'WEB', clientVersion: clientVersion, hl: 'en' } },
+      }),
+    });
+    if (!resp.ok) { clearTimeout(timer); return undefined; }
+    const data = await resp.json();
+    clearTimeout(timer);
+    const ts = data?.playabilityStatus?.liveStreamability?.liveStreamabilityRenderer?.offlineSlate
+      ?.liveStreamOfflineSlateRenderer?.scheduledStartTime;
+    if (ts) return new Date(parseInt(ts, 10) * 1000).toISOString();
+  } catch {}
+  return undefined;
+}
+
 export {
   createCircuitBreaker,
   refreshClientVersion,
@@ -413,5 +438,6 @@ export {
   extractViaInnertube,
   extractViaInvidious,
   fetchLiveStoryboardSpec,
+  fetchScheduledStart,
   USER_AGENT,
 };

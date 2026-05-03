@@ -52,7 +52,7 @@ async function fetchChannelRSS(channelId) {
       return {
         videoId: (entry['yt:videoId'] || '').toString(),
         title: entry.title || '',
-        publishedAt: upd > pub ? upd : pub,
+        publishedAt: pub || upd,
         channelId
       };
     }),

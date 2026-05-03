@@ -1520,3 +1520,21 @@ h1 { margin-bottom: 0.5rem; font-size: 1.25rem; }
   cursor: pointer;
   font-size: 0.85rem;
 }
+
+/* Offline badge + message */
+.offline-badge {
+  background: #ff5722;
+  color: #fff;
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-weight: 600;
+  margin-right: 0.5rem;
+}
+.offline-message {
+  text-align: center;
+  padding: 4rem 1rem;
+  color: #aaa;
+}
+.offline-message h2 { color: #fff; margin-bottom: 1rem; }
+.offline-message a { color: #3ea6ff; }

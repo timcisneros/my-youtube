@@ -1,0 +1,18 @@
+<a href="/watch?v=<%= vid %>" class="video-card"<%= typeof cardAttrs !== 'undefined' ? ' ' + cardAttrs : '' %>>
+  <div class="video-thumb-wrap">
+    <img data-src="/api/stream/<%= vid %>/thumb" alt="" class="video-thumb lazy-thumb" width="320" height="180">
+    <% if (typeof liveStatuses !== 'undefined' && liveStatuses[vid] === 'is_live') { %><span class="video-badge live" data-video-id="<%= vid %>">LIVE</span><% } else if (typeof liveStatuses !== 'undefined' && liveStatuses[vid] === 'is_upcoming') { %><span class="video-badge upcoming" data-video-id="<%= vid %>">UPCOMING</span><% } else if (typeof durations !== 'undefined' && durations[vid]) { %><span class="video-duration" data-video-id="<%= vid %>"><%= durations[vid] %></span><% } else { %><span class="video-duration" data-video-id="<%= vid %>"></span><% } %>
+    <div class="watch-progress" data-progress-id="<%= vid %>"></div>
+<%- typeof thumbExtra !== 'undefined' ? thumbExtra : '' %>
+  </div>
+  <div class="video-info">
+<%- typeof infoPre !== 'undefined' ? infoPre : '' %>
+    <div class="video-title"><%= title %></div>
+<% if (typeof channel !== 'undefined' && channel) { %>
+    <div class="video-channel"><%= channel %><%= typeof channelExtra !== 'undefined' ? channelExtra : '' %></div>
+<% } %>
+<% if (typeof published !== 'undefined' && published) { %>
+    <div class="video-time" data-published="<%= published %>"></div>
+<% } %>
+  </div>
+</a>

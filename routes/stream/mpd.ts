@@ -1,3 +1,5 @@
+import fs from 'fs';
+import db from '../../db.js';
 import { hasRedis } from '../../lib/cache.js';
 import {
   fetchWithConnTimeout,
@@ -10,6 +12,7 @@ import {
   CACHE_TTL,
   selectBestHlsFormat,
 } from './shared.js';
+import { bgDownloads } from './downloads.js';
 import { extractFormats } from './extraction.js';
 import { notifyExtractionStep, notifyExtractionDone } from './status.js';
 
@@ -25,7 +28,7 @@ async function probeMP4Ranges(url, headers) {
   }
 
   // First fetch — most YouTube MP4s have ftyp+moov+sidx within the first few KB
-  let buf = await fetchChunk(0, 4096);
+  let buf = await fetchChunk(0, 8192);
   if (!buf) return null;
 
   while (true) {
@@ -62,6 +65,35 @@ async function probeMP4Ranges(url, headers) {
   }
 
   return (initEnd > 0 && sidxStart >= 0) ? { initRange: '0-' + initEnd, indexRange: sidxStart + '-' + sidxEnd } : null;
+}
+
+// Probe MP4 byte ranges from a local file (no network)
+function probeLocalMP4Ranges(filePath) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const headerBuf = Buffer.alloc(8192);
+    const bytesRead = fs.readSync(fd, headerBuf, 0, 8192, 0);
+    if (bytesRead < 8) return null;
+    const buf = headerBuf.subarray(0, bytesRead);
+    let offset = 0, initEnd = 0, sidxStart = -1, sidxEnd = -1;
+    while (offset + 8 <= buf.length) {
+      let size = buf.readUInt32BE(offset);
+      const type = buf.toString('ascii', offset + 4, offset + 8);
+      if (size === 1 && offset + 16 <= buf.length) {
+        const bigSize = buf.readBigUInt64BE(offset + 8);
+        if (bigSize > BigInt(Number.MAX_SAFE_INTEGER)) break;
+        size = Number(bigSize);
+      }
+      if (size === 0 || size < 8) break;
+      if (type === 'moov') initEnd = offset + size - 1;
+      else if (type === 'sidx') { sidxStart = offset; sidxEnd = offset + size - 1; }
+      if (sidxStart >= 0 && initEnd > 0) break;
+      offset += size;
+    }
+    return (initEnd > 0 && sidxStart >= 0) ? { initRange: '0-' + initEnd, indexRange: sidxStart + '-' + sidxEnd } : null;
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 function formatDuration(sec) {
@@ -128,8 +160,77 @@ async function buildMPD(videoId) {
   }
 
   return dedup(mpdInflight, videoId, async () => {
+    // Fast path: if local downloads exist, build MPD from disk (no extraction needed)
+    const localFormats = [];
+    for (const [key, entry] of bgDownloads) {
+      if (key.startsWith(videoId + ':') && entry.done && entry.bytesDownloaded > 0) {
+        localFormats.push({ itag: key.split(':')[1], filePath: entry.filePath, size: entry.bytesDownloaded });
+      }
+    }
+    if (localFormats.length >= 2) { // need at least video + audio
+      const rangeMap = {};
+      const fakeFormats = [];
+      // Known itag metadata for MPD generation
+      const itagMeta: Record<string, { height?: number; width?: number; vcodec?: string; acodec?: string; tbr?: number; asr?: number; ext?: string }> = {
+        '160': { height: 144, width: 256, vcodec: 'avc1.4d400c', ext: 'mp4' },
+        '133': { height: 240, width: 426, vcodec: 'avc1.4d4015', ext: 'mp4' },
+        '134': { height: 360, width: 640, vcodec: 'avc1.4d401e', ext: 'mp4' },
+        '135': { height: 480, width: 854, vcodec: 'avc1.4d401f', ext: 'mp4' },
+        '136': { height: 720, width: 1280, vcodec: 'avc1.4d401f', ext: 'mp4' },
+        '137': { height: 1080, width: 1920, vcodec: 'avc1.640028', ext: 'mp4' },
+        '298': { height: 720, width: 1280, vcodec: 'avc1.4d4020', ext: 'mp4' },
+        '299': { height: 1080, width: 1920, vcodec: 'avc1.64002a', ext: 'mp4' },
+        '264': { height: 1440, width: 2560, vcodec: 'avc1.640032', ext: 'mp4' },
+        '304': { height: 720, width: 1280, vcodec: 'avc1.4d4020', ext: 'mp4' },
+        '303': { height: 1080, width: 1920, vcodec: 'avc1.640028', ext: 'mp4' },
+        '308': { height: 1440, width: 2560, vcodec: 'avc1.640032', ext: 'mp4' },
+        '315': { height: 2160, width: 3840, vcodec: 'avc1.640033', ext: 'mp4' },
+        '394': { height: 144, width: 256, vcodec: 'av01.0.00M.08', ext: 'mp4' },
+        '395': { height: 240, width: 426, vcodec: 'av01.0.00M.08', ext: 'mp4' },
+        '396': { height: 360, width: 640, vcodec: 'av01.0.01M.08', ext: 'mp4' },
+        '397': { height: 480, width: 854, vcodec: 'av01.0.04M.08', ext: 'mp4' },
+        '398': { height: 720, width: 1280, vcodec: 'av01.0.05M.08', ext: 'mp4' },
+        '399': { height: 1080, width: 1920, vcodec: 'av01.0.08M.08', ext: 'mp4' },
+        '400': { height: 1440, width: 2560, vcodec: 'av01.0.12M.08', ext: 'mp4' },
+        '401': { height: 2160, width: 3840, vcodec: 'av01.0.12M.08', ext: 'mp4' },
+        '140': { acodec: 'mp4a.40.2', tbr: 128, asr: 44100, ext: 'm4a' },
+        '141': { acodec: 'mp4a.40.2', tbr: 256, asr: 44100, ext: 'm4a' },
+        '249': { acodec: 'opus', tbr: 50, asr: 48000, ext: 'm4a' },
+        '250': { acodec: 'opus', tbr: 70, asr: 48000, ext: 'm4a' },
+        '251': { acodec: 'opus', tbr: 160, asr: 48000, ext: 'm4a' },
+      };
+      let allProbed = true;
+      for (const lf of localFormats) {
+        const meta = itagMeta[lf.itag];
+        if (!meta) { allProbed = false; break; }
+        try {
+          const ranges = probeLocalMP4Ranges(lf.filePath);
+          if (!ranges) { allProbed = false; break; }
+          rangeMap[lf.itag] = ranges;
+          fakeFormats.push({
+            format_id: lf.itag,
+            height: meta.height || 0,
+            width: meta.width || 0,
+            vcodec: meta.vcodec || 'none',
+            acodec: meta.acodec || 'none',
+            tbr: meta.tbr || (lf.size * 8 / 1000 / 300), // estimate ~5min
+            asr: meta.asr || 0,
+            ext: meta.ext || 'mp4',
+          });
+        } catch { allProbed = false; break; }
+      }
+      if (allProbed && Object.keys(rangeMap).length >= 2) {
+        const duration = db.getDuration(videoId) || 0;
+        const mpd = generateMPD(videoId, duration, fakeFormats, rangeMap);
+        console.log(`[stream ${videoId}] using local downloads (${localFormats.length} files)`);
+        mpdCache.set(videoId, { data: mpd, meta: { playback: 'dash', via: 'local' }, expires: Date.now() + CACHE_TTL });
+        notifyExtractionDone(videoId);
+        return mpd;
+      }
+    }
+
     const info = await extractFormats(videoId);
-    if (info._unavailable) { notifyExtractionDone(videoId); return { unavailable: info._unavailable }; }
+    if (info._unavailable) { notifyExtractionDone(videoId); return { unavailable: info._unavailable, scheduledStart: info._scheduledStart }; }
     notifyExtractionStep(videoId, 'building');
 
     try {

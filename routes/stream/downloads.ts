@@ -19,6 +19,8 @@ import {
   CACHE_TTL,
 } from './shared.js';
 import { getCached } from './extraction.js';
+import { createStreamToken } from '../../auth.js';
+import { buildMPD } from './mpd.js';
 
 // Background download manager: "videoId:itag" -> { filePath, bytesDownloaded, totalSize, done, startedAt, abort }
 const bgDownloads = new Map();
@@ -77,6 +79,7 @@ function startBgDownload(videoId, itag, url, headers, meta) {
       // Check if all formats for this video are done
       if (allFormatsDone(videoId)) {
         db.completeDownload(videoId);
+        buildMPD(videoId).catch(() => {});
       }
     } catch (err) {
       if (err.name !== 'AbortError') {
@@ -187,7 +190,42 @@ setInterval(() => {
   }
 })();
 
-function mountDownloadRoutes(router) {
+function mountDownloadRoutes(router: import('express').Router) {
+  // GET /api/stream/:videoId/offline-bundle — returns everything the SW needs for offline playback
+  router.get('/:videoId/offline-bundle', async (req, res) => {
+    const { videoId } = req.params;
+    const dl = db.getDownload(videoId);
+    if (!dl || dl.status !== 'complete') return res.status(404).json({ error: 'Not downloaded' });
+
+    const streamToken = createStreamToken(videoId);
+    let mpd = '';
+    try {
+      const result = await buildMPD(videoId);
+      if (typeof result === 'string') mpd = result;
+    } catch { /* ignore */ }
+
+    const formats: string[] = [];
+    const formatSizes: Record<string, number> = {};
+    for (const [key, entry] of bgDownloads) {
+      if (key.startsWith(videoId + ':') && entry.done) {
+        const formatId = key.split(':')[1];
+        formats.push(formatId);
+        formatSizes[formatId] = entry.totalSize;
+      }
+    }
+
+    res.json({
+      videoId,
+      streamToken,
+      mpd,
+      title: dl.title,
+      channelTitle: dl.channel_title,
+      formats,
+      formatSizes
+    });
+  });
+
+
   // POST /api/stream/:videoId/cache — trigger background download of all formats
   router.post('/:videoId/cache', express.json(), async (req, res) => {
     try {

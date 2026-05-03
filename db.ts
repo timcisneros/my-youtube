@@ -493,6 +493,19 @@ api = {
     for (const r of rows) result[r.video_id] = r.live_status || 'not_live';
     return result;
   },
+  getDurationsAndLiveStatuses(videoIds) {
+    if (!videoIds.length) return { durations: {}, liveStatuses: {} };
+    const placeholders = videoIds.map(() => '?').join(',');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
+    const rows: any[] = db.prepare(`SELECT video_id, duration, live_status FROM video_durations WHERE video_id IN (${placeholders})`).all(...videoIds);
+    const durations = {};
+    const liveStatuses = {};
+    for (const r of rows) {
+      durations[r.video_id] = r.duration;
+      liveStatuses[r.video_id] = r.live_status || 'not_live';
+    }
+    return { durations, liveStatuses };
+  },
   setWatchTime(userId, videoId, position, duration) {
     stmts.upsertWatchTime.run(userId, videoId, position, duration);
   },
@@ -591,6 +604,11 @@ api = {
   getVideoRatings(userId) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
     return stmts.getVideoRatings.all(userId) as any[];
+  },
+  getVideoRating(userId, videoId) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
+    const row = db.prepare('SELECT rating FROM video_ratings WHERE user_id = ? AND video_id = ?').get(userId, videoId) as any;
+    return row ? row.rating : 0;
   },
   getCommunityRatings(videoIds, excludeUserId) {
     if (!videoIds.length) return {};

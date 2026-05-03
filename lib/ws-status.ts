@@ -61,4 +61,12 @@ function notify(videoId, data) {
 
 function isAvailable() { return wss !== null; }
 
-export { attach, notify, isAvailable };
+function closeAll() {
+  if (!wss) return;
+  for (const client of wss.clients) {
+    try { client.close(1001, 'Server shutting down'); } catch {}
+  }
+  wss.close();
+}
+
+export { attach, notify, isAvailable, closeAll };
