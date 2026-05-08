@@ -1,6 +1,6 @@
 importScripts('/idb-helpers.js');
 // Service Worker — cache-first for static assets, segment caching for video proxy
-var STATIC_CACHE = 'my-youtube-static-v9';
+var STATIC_CACHE = 'my-youtube-static-v11';
 var SEGMENT_CACHE = 'my-youtube-segments-v5';
 var IMAGE_CACHE = 'my-youtube-images-v1';
 var APP_SHELL_CACHE = 'my-youtube-shell-v1';
@@ -11,10 +11,9 @@ var STATIC_ASSETS = [
   '/idb-helpers.js',
   '/app.js',
   '/style.css',
-  '/player-engine.js',
+  '/native-player-engine.js',
   '/fonts/roboto.css',
   '/fonts/roboto-latin.woff2',
-  '/vendor/shaka/shaka-player.compiled.js',
   '/manifest.json',
   '/favicon.svg'
 ];
@@ -24,6 +23,42 @@ var STATIC_ASSETS = [
 // regardless of which token (or no token) the player uses.
 function stripToken(urlStr) {
   return urlStr.replace(/[?&]token=[^&]*/g, '').replace(/\?$/, '');
+}
+
+function cacheKeyWithRange(request) {
+  var range = request.headers.get('Range') || '';
+  var baseUrl = stripToken(request.url);
+  var cacheUrl = baseUrl + (range ? (baseUrl.indexOf('?') === -1 ? '?' : '&') + '_r=' + encodeURIComponent(range) : '');
+  return new Request(cacheUrl);
+}
+
+function withSourceHeaders(response, source, offline) {
+  var headers = new Headers(response.headers);
+  headers.set('X-SW-Cached', '1');
+  headers.set('X-SW-Cache', '1');
+  headers.set('X-SW-Source', source);
+  if (offline) headers.set('X-SW-Offline', '1');
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: headers
+  });
+}
+
+function putHlsProxyResponse(cache, cacheKey, response) {
+  if (response.status === 206) {
+    return response.clone().arrayBuffer().then(function (buf) {
+      var headers = new Headers(response.headers);
+      headers.delete('Content-Range');
+      headers.set('Content-Length', String(buf.byteLength));
+      return cache.put(cacheKey, new Response(buf, {
+        status: 200,
+        headers: headers
+      }));
+    });
+  }
+  if (response.ok) return cache.put(cacheKey, response.clone());
+  return Promise.resolve();
 }
 
 self.addEventListener('install', function (event) {
@@ -91,7 +126,13 @@ self.addEventListener('message', function (event) {
     if (bundle.mpd) {
       cache.put(new Request(mpdUrl), new Response(bundle.mpd, {
         status: 200,
-        headers: { 'Content-Type': 'application/dash+xml' }
+        headers: {
+          'Content-Type': 'application/dash+xml',
+          'X-SW-Cached': '1',
+          'X-SW-Cache': '1',
+          'X-SW-Source': 'offline-bundle',
+          'X-SW-Offline': '1'
+        }
       }));
     }
   });
@@ -143,21 +184,18 @@ function buildOfflineWatchPage(bundle) {
     + '    <div class="video-channel">' + channelTitle + '</div>\n'
     + '  </div>\n'
     + '</main>\n'
-    + '<script src="/vendor/shaka/shaka-player.compiled.js"><\/script>\n'
-    + '<script src="/player-engine.js"><\/script>\n'
+    + '<script src="/native-player-engine.js"><\/script>\n'
     + '<script src="/idb-helpers.js"><\/script>\n'
     + '<script src="/app.js"><\/script>\n'
     + '<script>\n'
     + '(function() {\n'
     + '  var container = document.getElementById("player-container");\n'
     + '  var video = document.getElementById("player");\n'
-    + '  if (!container || !video || !window.shaka || !window.PlayerEngine) return;\n'
-    + '  shaka.polyfill.installAll();\n'
-    + '  if (!shaka.Player.isBrowserSupported()) return;\n'
+    + '  if (!container || !video || !window.PlayerEngine) return;\n'
     + '  var engine = new PlayerEngine(video, { videoId: "' + bundle.videoId + '", streamToken: "' + bundle.streamToken + '" });\n'
     + '  window._playerEngine = engine;\n'
     + '  window._player = engine.getPlayer();\n'
-    + '  engine.init();\n'
+    + '  engine.init().then(function () { return engine.load(); }).catch(function (err) { console.error("[player-engine] offline load failed:", err); });\n'
     + '})();\n'
     + '<\/script>\n'
     + '</body>\n'
@@ -255,10 +293,35 @@ self.addEventListener('fetch', function (event) {
         return caches.open(APP_SHELL_CACHE).then(function (cache) {
           return cache.match(mpdCacheKey).then(function (cached) {
             if (!cached) return new Response('', { status: 503 });
-            // Mark as SW-cached so player-engine probe can distinguish from live server
-            var headers = new Headers(cached.headers);
-            headers.set('X-SW-Cache', '1');
-            return new Response(cached.body, { status: cached.status, headers: headers });
+            var online = self.navigator && 'onLine' in self.navigator ? self.navigator.onLine : false;
+            return withSourceHeaders(cached, 'app-shell', !online);
+          });
+        });
+      })
+    );
+    return;
+  }
+
+  // HLS playlists: network-first with cache fallback, matching DASH MPD behavior.
+  if (url.pathname.match(/^\/api\/stream\/[^/]+\/hls\.m3u8$/) || url.pathname.match(/^\/api\/stream\/[^/]+\/hls\/[^/]+\.m3u8$/)) {
+    var hlsPlaylistCacheKey = new Request(stripToken(event.request.url));
+    event.respondWith(
+      caches.open(APP_SHELL_CACHE).then(function (cache) {
+        return fetch(event.request).then(function (response) {
+          if (response.ok) cache.put(hlsPlaylistCacheKey, response.clone());
+          return response;
+        }).catch(function () {
+          return cache.match(hlsPlaylistCacheKey).then(function (cached) {
+            if (!cached) return new Response('', {
+              status: 503,
+              headers: {
+                'X-SW-Cached': '0',
+                'X-SW-Offline': '1',
+                'X-SW-Source': 'miss'
+              }
+            });
+            var online = self.navigator && 'onLine' in self.navigator ? self.navigator.onLine : false;
+            return withSourceHeaders(cached, 'app-shell', !online);
           });
         });
       })
@@ -292,18 +355,46 @@ self.addEventListener('fetch', function (event) {
     return;
   }
 
+  // HLS proxied sub-manifests and fMP4 segments. Cache by token-stripped URL plus Range,
+  // since HLS byte-range media requests share one object URL across many segments.
+  if (url.pathname.match(/^\/api\/stream\/[^/]+\/hls-proxy$/)) {
+    var hlsProxyCacheKey = cacheKeyWithRange(event.request);
+    event.respondWith(
+      caches.open(SEGMENT_CACHE).then(function (cache) {
+        return cache.match(hlsProxyCacheKey).then(function (cached) {
+          if (cached) return withSourceHeaders(cached, 'segment-cache', false);
+          return fetch(event.request).then(function (response) {
+            if (response.ok || response.status === 206) {
+              putHlsProxyResponse(cache, hlsProxyCacheKey, response).then(trimSegmentCache).catch(function () {});
+            }
+            return response;
+          }).catch(function () {
+            return cache.match(hlsProxyCacheKey).then(function (retry) {
+              return retry ? withSourceHeaders(retry, 'segment-cache', true) : new Response('', {
+                status: 503,
+                headers: {
+                  'X-SW-Cached': '0',
+                  'X-SW-Offline': '1',
+                  'X-SW-Source': 'miss'
+                }
+              });
+            });
+          });
+        });
+      })
+    );
+    return;
+  }
+
   // Video segment proxy: cache successful 200 responses for re-watches
   // Match /api/stream/{videoId}/proxy/{itag} with range requests
   // Cache keys strip the auth token so segments work offline with any/no token
   if (url.pathname.match(/^\/api\/stream\/[^/]+\/proxy\/\d+$/)) {
-    var range = event.request.headers.get('Range') || '';
-    var baseUrl = stripToken(event.request.url);
-    var cacheUrl = baseUrl + (range ? (baseUrl.indexOf('?') === -1 ? '?' : '&') + '_r=' + encodeURIComponent(range) : '');
-    var cacheKey = new Request(cacheUrl);
+    var cacheKey = cacheKeyWithRange(event.request);
     event.respondWith(
       caches.open(SEGMENT_CACHE).then(function (cache) {
         return cache.match(cacheKey).then(function (cached) {
-          if (cached) return cached;
+          if (cached) return withSourceHeaders(cached, 'segment-cache', false);
           return fetch(event.request).then(function (response) {
             if (response.status === 200) {
               cache.put(cacheKey, response.clone());
@@ -351,7 +442,11 @@ self.addEventListener('fetch', function (event) {
                     'Content-Type': ct,
                     'Content-Length': String(blob.size),
                     'Content-Range': 'bytes ' + start + '-' + end + '/' + totalSize,
-                    'Accept-Ranges': 'bytes'
+                    'Accept-Ranges': 'bytes',
+                    'X-SW-Cached': '1',
+                    'X-SW-Cache': '1',
+                    'X-SW-Source': 'idb',
+                    'X-SW-Offline': '1'
                   }
                 });
               });
@@ -362,7 +457,16 @@ self.addEventListener('fetch', function (event) {
           if (meta.done) {
             return IDBHelpers.getAllChunks(fmtIdbKey, meta).then(function (blob) {
               if (!blob) return null;
-              return new Response(blob, { status: 200, headers: { 'Content-Type': ct } });
+              return new Response(blob, {
+                status: 200,
+                headers: {
+                  'Content-Type': ct,
+                  'X-SW-Cached': '1',
+                  'X-SW-Cache': '1',
+                  'X-SW-Source': 'idb',
+                  'X-SW-Offline': '1'
+                }
+              });
             });
           }
 
@@ -388,13 +492,17 @@ self.addEventListener('fetch', function (event) {
                           'Content-Type': cached.headers.get('Content-Type') || 'application/octet-stream',
                           'Content-Length': String(sl.byteLength),
                           'Content-Range': 'bytes ' + s + '-' + e + '/' + buf.byteLength,
-                          'Accept-Ranges': 'bytes'
+                          'Accept-Ranges': 'bytes',
+                          'X-SW-Cached': '1',
+                          'X-SW-Cache': '1',
+                          'X-SW-Source': 'segment-cache',
+                          'X-SW-Offline': '1'
                         }
                       });
                     });
                   }
                 }
-                return cached;
+                return withSourceHeaders(cached, 'segment-cache', false);
               }
               // 3. Network
               return fetch(event.request).then(function (response) {
@@ -405,7 +513,14 @@ self.addEventListener('fetch', function (event) {
                 return response;
               }).catch(function () {
                 return cache.match(fmtCacheKey).then(function (retry) {
-                  return retry || new Response('', { status: 503 });
+                  return retry ? withSourceHeaders(retry, 'segment-cache', true) : new Response('', {
+                    status: 503,
+                    headers: {
+                      'X-SW-Cached': '0',
+                      'X-SW-Offline': '1',
+                      'X-SW-Source': 'miss'
+                    }
+                  });
                 });
               });
             });
@@ -414,7 +529,14 @@ self.addEventListener('fetch', function (event) {
         .catch(function () {
           // IDB error — fall through to network
           return fetch(event.request).catch(function () {
-            return new Response('', { status: 503 });
+            return new Response('', {
+              status: 503,
+              headers: {
+                'X-SW-Cached': '0',
+                'X-SW-Offline': '1',
+                'X-SW-Source': 'miss'
+              }
+            });
           });
         })
     );

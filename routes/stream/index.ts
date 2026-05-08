@@ -1,5 +1,6 @@
 import express from 'express';
 import { validateStreamToken } from '../../auth.js';
+import { isPlayerFixtureVideo } from './player-fixture.js';
 const router = express.Router();
 
 // Batch endpoints (no :videoId param) must be mounted BEFORE the /:videoId
@@ -16,6 +17,7 @@ router.param('videoId', (_req, res, next, value) => {
 // Stream token auth — validates HMAC-signed token for all routes except
 // prefetch, status, poster, and thumb (lightweight/public endpoints)
 router.use('/:videoId', (req, res, next) => {
+  if (isPlayerFixtureVideo(req.params.videoId)) return next();
   const suffix = req.path.split('/').pop();
   if (suffix === 'prefetch' || suffix === 'status' || suffix === 'poster' || suffix === 'thumb' || suffix === 'offline-bundle') return next();
   const token = req.query.token;

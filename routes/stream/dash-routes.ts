@@ -16,12 +16,19 @@ import { buildMPD } from './mpd.js';
 import { extractFormats } from './extraction.js';
 import { bgDownloads } from './downloads.js';
 import * as segmentCache from '../../lib/segment-cache.js';
+import { buildFixtureMPD, isPlayerFixtureVideo, serveFixtureFormat, serveFixtureProgressive, serveFixtureTemplatePart } from './player-fixture.js';
 
 function mountDashRoutes(router) {
   // GET /api/stream/:videoId/dash.mpd
   router.get('/:videoId/dash.mpd', async (req, res) => {
     try {
       const { videoId } = req.params;
+      if (isPlayerFixtureVideo(videoId)) {
+        res.set('X-Stream-Via', 'fixture/dash');
+        res.set('Content-Type', 'application/dash+xml');
+        res.set('Cache-Control', 'no-store');
+        return res.send(buildFixtureMPD(videoId, req.query));
+      }
       // Extraction rate limit — only when not already cached
       if (!formatCache.has(videoId) && req.app.extractionRateCheck && !req.app.extractionRateCheck(req.ip, videoId)) {
         res.set('Retry-After', '60');
@@ -84,10 +91,22 @@ function mountDashRoutes(router) {
     }
   });
 
+  router.get('/:videoId/progressive.mp4', (req, res) => {
+    if (serveFixtureProgressive(req.params.videoId, req, res)) return;
+    res.status(404).json({ error: 'Progressive fixture not found' });
+  });
+
+  router.get('/:videoId/tmpl/:formatId/:kind/:part?', (req, res) => {
+    const part = req.params.kind === 'init' ? 'init' : req.params.part;
+    if (part && serveFixtureTemplatePart(req.params.videoId, req.params.formatId, part, req, res)) return;
+    res.status(404).json({ error: 'Template fixture part not found' });
+  });
+
   // DASH format proxy — streams individual adaptive format by format_id
   router.get('/:videoId/fmt/:formatId', async (req, res) => {
     try {
       const { videoId, formatId } = req.params;
+      if (serveFixtureFormat(videoId, formatId, req, res)) return;
 
       // Check Redis segment cache for hot videos
       const cached = await segmentCache.getSegment(videoId, formatId, req.headers.range);
@@ -145,8 +164,8 @@ function mountDashRoutes(router) {
 
       let upstream = await fetchWithConnTimeout(entry.url, { headers });
 
-      // YouTube CDN URL expired — evict caches, re-extract, retry once
-      if (upstream.status === 403 || upstream.status === 410) {
+      // YouTube CDN URL/range expired — evict caches, re-extract, retry once
+      if (upstream.status === 403 || upstream.status === 404 || upstream.status === 410 || upstream.status === 416) {
         await upstream.body?.cancel().catch(() => {});
         formatCache.delete(videoId);
         mpdCache.delete(videoId);

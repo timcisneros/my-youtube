@@ -13,6 +13,7 @@ import {
   selectBestHlsFormat,
 } from './shared.js';
 import { extractFormats } from './extraction.js';
+import { buildFixtureHlsMaster, buildFixtureHlsMedia, isPlayerFixtureVideo } from './player-fixture.js';
 
 // Cache rewritten HLS manifests to avoid re-parsing on every request
 const hlsRewriteCache = new LRUMap(200);
@@ -108,6 +109,11 @@ function mountHlsRoutes(router) {
   router.get('/:videoId/hls.m3u8', async (req, res) => {
     try {
       const { videoId } = req.params;
+      if (isPlayerFixtureVideo(videoId) && req.query.fixtureHls) {
+        res.set('Content-Type', 'application/vnd.apple.mpegurl');
+        res.set('Cache-Control', 'no-store');
+        return res.send(buildFixtureHlsMaster(videoId, req.query));
+      }
       let entry = hlsCache.get(videoId);
       if (!entry || Date.now() > entry.expires) return res.status(404).json({ error: 'HLS not available' });
       let upstream = await fetchWithConnTimeout(entry.url, { headers: entry.headers });
@@ -138,6 +144,18 @@ function mountHlsRoutes(router) {
     } catch (err) {
       if (!res.headersSent) res.status(502).end();
     }
+  });
+
+  router.get('/:videoId/hls/:formatId.m3u8', (req, res) => {
+    const { videoId, formatId } = req.params;
+    if (!isPlayerFixtureVideo(videoId) || !req.query.fixtureHls) {
+      return res.status(404).json({ error: 'HLS fixture not found' });
+    }
+    const body = buildFixtureHlsMedia(videoId, formatId);
+    if (!body) return res.status(404).json({ error: 'HLS fixture format not found' });
+    res.set('Content-Type', 'application/vnd.apple.mpegurl');
+    res.set('Cache-Control', 'no-store');
+    res.send(body);
   });
 
   // HLS segment/sub-manifest proxy — use query param since encoded URLs are too long for path params
