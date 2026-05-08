@@ -32,15 +32,15 @@ router.get('/', ensureAuth, async (req, res) => {
 
   const videoP = getVideoDetails(videoId);
 
-  // Flush shell with Shaka + preload/prefetch in head — browser starts loading
-  // these resources immediately while getVideoDetails runs
+  // Flush shell with native player + preload/prefetch in head — browser starts
+  // loading these resources immediately while getVideoDetails runs. Shaka is
+  // lazy-loaded only when native playback falls back.
   await res.flushShell({
     activeTab: null,
     mainClass: 'player-page',
     extraHead: `<link rel="preload" href="/api/stream/${videoId}/poster" as="image" fetchpriority="high">\n` +
       (inlineMPD ? '' : `  <link rel="preload" href="/api/stream/${videoId}/dash.mpd?token=${streamToken}" as="fetch" crossorigin fetchpriority="high">\n`) +
-      `  <script src="/vendor/shaka/shaka-player.compiled.js" defer><\/script>\n` +
-      `  <script src="/player-engine.js" defer><\/script>\n` +
+      `  <script src="/native-player-engine.js" defer><\/script>\n` +
       `  <script>fetch('/api/stream/${videoId}/prefetch')<\/script>`
   });
 

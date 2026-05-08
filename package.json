@@ -12,6 +12,7 @@
     "test": "tsx --test tests/integration.test.mjs",
     "test:pg": "tsx --test tests/pg.test.mjs",
     "test:e2e": "tsx --test tests/e2e.test.mjs",
+    "test:player": "playwright test",
     "test:resilience": "tsx --test tests/resilience.test.mjs",
     "test:all": "tsx --test tests/integration.test.mjs tests/resilience.test.mjs tests/explore.test.mjs",
     "eval:explore": "tsx scripts/explore-eval.ts",
@@ -40,6 +41,7 @@
     "ws": "^8.18.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.59.1",
     "@types/better-sqlite3": "^7.6.13",
     "@types/compression": "^1.8.1",
     "@types/express": "^5.0.6",

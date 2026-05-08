@@ -245,11 +245,12 @@
     player.configure({
       abr: {
         enabled: true,
+        useNetworkInformation: true,
         defaultBandwidthEstimate: 3000000,
         switchInterval: 2,
-        bandwidthUpgradeTarget: 0.7,
-        bandwidthDowngradeTarget: 0.4,
-        restrictions: { minHeight: 360 }
+        bandwidthUpgradeTarget: 0.85,
+        bandwidthDowngradeTarget: 0.95,
+        restrictions: {}
       },
       streaming: {
         bufferingGoal: 30,
