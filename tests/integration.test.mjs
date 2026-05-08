@@ -751,6 +751,21 @@ describe('HTTP endpoint smoke tests', () => {
     assert.strictEqual(res.status, 401);
   });
 
+  it('POST /api/player-events should accept sanitized first-party telemetry without session', async () => {
+    const res = await httpRequest(TEST_PORT, 'POST', '/api/player-events', {
+      events: [{
+        type: 'first-frame',
+        videoId: 'dQw4w9WgXcQ',
+        provider: 'native-dash',
+        mode: 'dash',
+        activeHeight: 720,
+        bufferAhead: 12,
+      }],
+    });
+    assert.strictEqual(res.status, 200);
+    assert.deepStrictEqual(JSON.parse(res.body), { ok: true });
+  });
+
   it('should include security headers', async () => {
     const res = await httpGet(TEST_PORT, '/auth/login');
     assert.ok(res.headers['content-security-policy'], 'Should have CSP header');

@@ -189,19 +189,23 @@
         var paths = ccActive ? ytIcons.CLOSED_CAPTIONS_ON : ytIcons.CLOSED_CAPTIONS;
         ccSvg.setAttribute('viewBox', '0 0 36 36');
         _replaceSvgContent(ccSvg, paths);
-        ccSvg.style.opacity = (ccActive || (window._subtitleList && window._subtitleList.length > 0)) ? '1' : '0.3';
+        var textTracks = player && player.getTextTracks ? player.getTextTracks() : [];
+        ccSvg.style.opacity = (ccActive || textTracks.length > 0) ? '1' : '0.3';
         ccBtn.classList.toggle('yt-cc-active', ccActive);
       }
       updateCcVisual();
       window._ccUpdateVisual = function (on) { ccActive = on; updateCcVisual(); };
       ccBtn.addEventListener('click', function () {
         if (ccActive) {
-          window._selectCaption(-1);
+          player.setTextTrackVisibility(false);
           ccActive = false;
-        } else if (window._subtitleList.length > 0) {
-          var idx = window._activeCaptionIdx >= 0 ? window._activeCaptionIdx : 0;
-          window._selectCaption(idx);
-          ccActive = true;
+        } else if (player.getTextTracks().length > 0) {
+          var track = player.getActiveTextTrack() || player.getTextTracks()[0];
+          player.selectTextTrack(track).then(function () {
+            player.setTextTrackVisibility(true);
+            ccActive = true;
+            updateCcVisual();
+          });
         }
         updateCcVisual();
       });
@@ -289,7 +293,7 @@
       overflowMenu.appendChild(loopRow.button);
 
       // Autoplay toggle row
-      var isAutoplayOn = localStorage.getItem('autoplay') === '1';
+      var isAutoplayOn = localStorage.getItem('autoplay') !== '0';
       var autoplayRow = makeOverflowRow(menuIconPaths.autoplayOff, 'Autoplay', isAutoplayOn ? 'On' : 'Off', false);
       autoplayRow.button.addEventListener('click', function () {
         isAutoplayOn = !isAutoplayOn;

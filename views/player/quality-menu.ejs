@@ -122,14 +122,16 @@
           } else if (abrEnabled) {
             qualityRow.stateSpan.textContent = 'Auto';
           } else {
-            var tracks = [];
-            try { tracks = player.getVariantTracks(); } catch (e) {}
-            for (var i = 0; i < tracks.length; i++) {
-              if (tracks[i].active) {
-                qualityRow.stateSpan.textContent = tracks[i].height + 'p';
-                break;
+            var activeTrack = null;
+            safePlayerCall(function () { activeTrack = player.getActiveVariantTrack && player.getActiveVariantTrack(); });
+            if (!activeTrack) {
+              var tracks = [];
+              try { tracks = player.getVariantTracks(); } catch (e) {}
+              for (var i = 0; i < tracks.length; i++) {
+                if (tracks[i].active) { activeTrack = tracks[i]; break; }
               }
             }
+            qualityRow.stateSpan.textContent = activeTrack && activeTrack.height ? activeTrack.height + 'p' : '';
           }
           syncHdBadge();
         }
@@ -137,11 +139,16 @@
         function syncHdBadge() {
           var isHd = false;
           try {
-            var tracks = player.getVariantTracks();
-            for (var i = 0; i < tracks.length; i++) {
-              if (tracks[i].active && tracks[i].height >= 720) {
-                isHd = true;
-                break;
+            var activeTrack = player.getActiveVariantTrack && player.getActiveVariantTrack();
+            if (activeTrack) {
+              isHd = activeTrack.height >= 720;
+            } else {
+              var tracks = player.getVariantTracks();
+              for (var i = 0; i < tracks.length; i++) {
+                if (tracks[i].active) {
+                  isHd = tracks[i].height >= 720;
+                  break;
+                }
               }
             }
           } catch (e) {}

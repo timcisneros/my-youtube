@@ -80,16 +80,14 @@ function handleFallback(html) {
       + '<video id="player" class="player-video" poster="/api/stream/' + videoId + '/poster"></video>'
       + '</div>'
       + '<div class="player-primary"><h1 class="player-title">' + escapeHtml(title || videoId) + '</h1></div>';
-    if (window.shaka && window.PlayerEngine) {
-      shaka.polyfill.installAll();
-      if (shaka.Player.isBrowserSupported()) {
-        var video = document.getElementById('player');
-        var engine = new PlayerEngine(video, { videoId: videoId, streamToken: '' });
-        window._player = engine.getPlayer();
-        window._shakaPlayer = engine.getPlayer();
-        window._playerEngine = engine;
-        engine.init();
-      }
+    if (window.PlayerEngine) {
+      var video = document.getElementById('player');
+      var engine = new PlayerEngine(video, { videoId: videoId, streamToken: '' });
+      window._player = engine.getPlayer();
+      window._playerEngine = engine;
+      engine.init().then(function () { return engine.load(); }).catch(function (err) {
+        console.error('[player-engine] offline fallback load failed:', err);
+      });
     }
     return;
   }
@@ -590,7 +588,7 @@ function loadWatchProgress() {
     });
   }
 
-  // Destroy active Shaka player before navigating away to stop buffering
+  // Destroy active player before navigating away to stop buffering
   function destroyPlayer() {
     if (window._playerEngine) {
       window._playerEngine.destroy();

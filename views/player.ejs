@@ -9,16 +9,9 @@
     function initPlayer() {
       var container = document.getElementById('player-container');
       var video = document.getElementById('player');
-      if (!container || !video || !window.shaka || !window.PlayerEngine) return;
+      if (!container || !video || !window.PlayerEngine) return;
       // Clean up previous player instance if navigating between videos
       if (window._cleanupPlayer) window._cleanupPlayer();
-
-      shaka.polyfill.installAll();
-      if (!shaka.Player.isBrowserSupported()) {
-        container.classList.add('player-fallback');
-        container.innerHTML = '<div class="player-error">Browser does not support DASH playback</div>';
-        return;
-      }
 
       // --- Stream token + Player engine ---
       var streamToken = '<%= streamToken %>';
@@ -26,7 +19,6 @@
       var player = engine.getPlayer();
       var attachPromise = engine.init();
       window._player = player;
-      window._shakaPlayer = player;
       window._playerEngine = engine;
 
       var finalVia = '';
@@ -179,7 +171,7 @@
       var retryCount = parseInt((window.location.search.match(/[?&]retry=(\d+)/) || [])[1] || '0', 10);
       var manifestBaseUrl = '/api/stream/<%= video.videoId %>/dash.mpd?token=' + streamToken;
       var manifestUrl = manifestBaseUrl + (retryCount > 0 ? '&refresh=1' : '');
-      var wantsAutoplay = localStorage.getItem('autoplay') === '1';
+      var wantsAutoplay = localStorage.getItem('autoplay') !== '0';
 
       // --- Download button ---
       var dlBtn = document.getElementById('download-btn');
@@ -252,7 +244,6 @@
       });
 
       if (wantsAutoplay) {
-        video.muted = true;
         video.autoplay = true;
       }
 
@@ -734,13 +725,8 @@
                 new Blob([JSON.stringify({ position: video.currentTime, duration: video.duration })], { type: 'application/json' }));
             }
           });
-          if (wantsAutoplay) {
-            if (!video.paused) {
-              video.muted = false;
-            } else {
-              video.addEventListener('playing', function () { video.muted = false; }, { once: true });
-              video.play().catch(function () {});
-            }
+          if (wantsAutoplay && video.paused) {
+            video.play().catch(function () {});
           }
         }
         if (video.readyState >= 2) {
@@ -750,7 +736,7 @@
           setTimeout(reveal, 2000);
         }
       }).catch(function (err) {
-        console.error('Shaka load error:', err);
+        console.error('Player load error:', err);
         stopStatusPoll();
         setStreamVia('');
         if (err.permanent) engine.videoUnavailable = true;
@@ -876,7 +862,7 @@
 <%- include('player/keyboard-shortcuts') %>
     }
     function tryInitPlayer() {
-      if (window.shaka && window.PlayerEngine) initPlayer();
+      if (window.PlayerEngine) initPlayer();
     }
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', tryInitPlayer);

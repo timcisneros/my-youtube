@@ -3,6 +3,12 @@
       window._captionCues = [];
       window._captionsVisible = false;
 
+      function decodeCaptionText(text) {
+        var el = document.createElement('textarea');
+        el.innerHTML = text || '';
+        return el.value;
+      }
+
       function parseVTT(text) {
         var cues = [];
         var blocks = text.replace(/\r\n/g, '\n').split('\n\n');
@@ -42,10 +48,70 @@
         return cues;
       }
 
+      function parseTTML(text) {
+        var cues = [];
+        var doc = new DOMParser().parseFromString(text, 'application/xml');
+        if (doc.querySelector('parsererror')) return cues;
+        var nodes = doc.querySelectorAll('p');
+        for (var i = 0; i < nodes.length; i++) {
+          var p = nodes[i];
+          var begin = parseTtmlTime(p.getAttribute('begin'));
+          var endAttr = p.getAttribute('end');
+          var durAttr = p.getAttribute('dur');
+          var end = parseTtmlTime(endAttr);
+          var dur = parseTtmlTime(durAttr);
+          if (!isFinite(end) && isFinite(begin) && isFinite(dur)) end = begin + dur;
+          var value = decodeCaptionText((p.textContent || '').replace(/\s+/g, ' ').trim());
+          if (isFinite(begin) && isFinite(end) && end > begin && value) {
+            cues.push({ start: begin, end: end, text: value, words: null });
+          }
+        }
+        return cues;
+      }
+
       function parseTimestamp(ts) {
         var parts = ts.replace('.', ':').split(':');
         if (parts.length === 3) parts.unshift('0');
         return (+parts[0]) * 3600 + (+parts[1]) * 60 + (+parts[2]) + (+parts[3]) / 1000;
+      }
+
+      function parseTtmlTime(value) {
+        if (!value) return NaN;
+        var text = String(value).trim();
+        var clock = text.match(/^(\d+):(\d{2}):(\d{2})(?:[.,](\d+))?$/);
+        if (clock) {
+          return (+clock[1]) * 3600 + (+clock[2]) * 60 + (+clock[3]) + parseFloat('0.' + (clock[4] || '0'));
+        }
+        var offset = text.match(/^([\d.]+)(h|m|s|ms)$/);
+        if (!offset) return NaN;
+        var n = parseFloat(offset[1]);
+        if (!isFinite(n)) return NaN;
+        if (offset[2] === 'h') return n * 3600;
+        if (offset[2] === 'm') return n * 60;
+        if (offset[2] === 'ms') return n / 1000;
+        return n;
+      }
+
+      function parseCaptionPayload(text, mimeType, url) {
+        if (/ttml|xml/i.test(mimeType || url || '')) return parseTTML(text);
+        return parseVTT(text);
+      }
+
+      function stampTextTrackUrl(url) {
+        if (!url || url.indexOf('/api/stream/') === -1 || !streamToken) return url;
+        var clean = url.replace(/[?&]token=[^&]*/g, '').replace(/[?&]$/, '');
+        return clean + (clean.indexOf('?') === -1 ? '?' : '&') + 'token=' + streamToken;
+      }
+
+      function nativeTextTracks() {
+        try {
+          if (engine && engine._provider && engine._provider.getTextTracks) {
+            return engine._provider.getTextTracks().filter(function (track) {
+              return track && track.url;
+            });
+          }
+        } catch (e) {}
+        return [];
       }
 
       var _lastCueKey = '';
@@ -115,25 +181,129 @@
         captionOverlay.textContent = '';
       }
 
-      window._selectCaption = function (idx) {
-        if (idx < 0 || idx >= window._subtitleList.length) {
-          window._captionsVisible = false;
-          window._captionCues = [];
-          stopCaptionLoop();
-          window._activeCaptionIdx = -1;
+      var textController = {
+        tracks: [],
+        activeTrackId: '',
+        visible: false,
+        getTextTracks: function () {
+          var activeId = this.activeTrackId;
+          var out = this.tracks.map(function (track) {
+            return {
+              id: track.id,
+              language: track.language,
+              label: track.label,
+              source: track.source || 'server',
+              mimeType: track.mimeType || 'text/vtt',
+              url: track.url || '',
+              supported: track.supported !== false,
+              loadState: track.loadState || 'idle',
+              active: activeId === track.id
+            };
+          });
+          var seen = {};
+          for (var s = 0; s < out.length; s++) {
+            seen[(out[s].language || '') + ':' + (out[s].label || '')] = true;
+            seen[out[s].id] = true;
+          }
+          var nativeTracks = nativeTextTracks();
+          for (var n = 0; n < nativeTracks.length; n++) {
+            var nativeTrack = nativeTracks[n];
+            var key = (nativeTrack.language || '') + ':' + (nativeTrack.label || '');
+            if (seen[nativeTrack.id] || seen[key]) continue;
+            out.push({
+              id: nativeTrack.id,
+              language: nativeTrack.language || '',
+              label: nativeTrack.label || nativeTrack.language || nativeTrack.id,
+              source: nativeTrack.source || 'native-dash',
+              mimeType: nativeTrack.mimeType || '',
+              url: nativeTrack.url || '',
+              supported: nativeTrack.supported !== false,
+              loadState: nativeTrack.loadState || 'idle',
+              roles: nativeTrack.roles || [],
+              accessibility: nativeTrack.accessibility || [],
+              active: activeId === nativeTrack.id
+            });
+          }
+          return out;
+        },
+        getActiveTextTrack: function () {
+          var tracks = this.getTextTracks();
+          for (var i = 0; i < tracks.length; i++) {
+            if (tracks[i].active) return tracks[i];
+          }
+          return null;
+        },
+        selectTextTrack: function (track) {
+          var id = typeof track === 'string' ? track : track && track.id;
+          var allTracks = this.getTextTracks();
+          for (var i = 0; i < allTracks.length; i++) {
+            if (allTracks[i].id === id || allTracks[i].language === id) return window._selectCaptionTrack(allTracks[i]);
+          }
+          return window._selectCaption(-1);
+        },
+        setTextTrackVisibility: function (visible) {
+          this.visible = !!visible;
+          window._captionsVisible = this.visible && !!window._captionCues.length;
+          if (window._captionsVisible) startCaptionLoop();
+          else stopCaptionLoop();
+          if (window._ccUpdateVisual) window._ccUpdateVisual(this.visible);
           rebuildCaptionSubmenu();
           return Promise.resolve();
         }
-        var sub = window._subtitleList[idx];
-        return fetch('/api/stream/<%= video.videoId %>/subtitles/' + sub.lang + '.vtt?token=' + streamToken)
+      };
+      if (engine.setTextController) engine.setTextController(textController);
+
+      window._selectCaptionTrack = function (track) {
+        if (!track || track.supported === false) return Promise.resolve();
+        var isNative = track.source === 'native-dash' || !!track.url;
+        var url = isNative
+          ? stampTextTrackUrl(track.url)
+          : '/api/stream/<%= video.videoId %>/subtitles/' + track.language + '.vtt?token=' + streamToken;
+        if (!url) return Promise.resolve();
+        track.loadState = 'loading';
+        return fetch(url)
           .then(function (r) { return r.ok ? r.text() : ''; })
-          .then(function (vtt) {
-            window._captionCues = vtt ? parseVTT(vtt) : [];
+          .then(function (payload) {
+            window._captionCues = payload ? parseCaptionPayload(payload, track.mimeType, url) : [];
             window._captionsVisible = true;
-            window._activeCaptionIdx = idx;
+            textController.visible = true;
+            textController.activeTrackId = track.id;
+            window._activeCaptionIdx = textController.getTextTracks().findIndex(function (item) { return item.id === track.id; });
+            track.loadState = window._captionCues.length ? 'loaded' : 'empty';
+            if (isNative && engine._provider && engine._provider.selectTextTrack) {
+              engine._provider.selectTextTrack(track);
+            }
             startCaptionLoop();
+            renderCaptions();
             rebuildCaptionSubmenu();
+            player.emit('texttrackchanged', textController.getActiveTextTrack());
+          })
+          .catch(function () {
+            track.loadState = 'error';
+            window._captionCues = [];
+            textController.activeTrackId = '';
+            window._captionsVisible = false;
+            stopCaptionLoop();
+            rebuildCaptionSubmenu();
+            player.emit('texttrackchanged', null);
           });
+      };
+
+      window._selectCaption = function (idx) {
+        var tracks = textController.getTextTracks();
+        if (idx < 0 || idx >= tracks.length) {
+          window._captionsVisible = false;
+          window._captionCues = [];
+          textController.activeTrackId = '';
+          textController.visible = false;
+          if (engine._provider && engine._provider.setTextTrackVisibility) engine._provider.setTextTrackVisibility(false);
+          stopCaptionLoop();
+          window._activeCaptionIdx = -1;
+          rebuildCaptionSubmenu();
+          player.emit('texttrackchanged', null);
+          return Promise.resolve();
+        }
+        return window._selectCaptionTrack(tracks[idx]);
       };
 
       window._activeCaptionIdx = -1;
@@ -154,20 +324,21 @@
           return svg;
         }
 
-        var langs = window._subtitleList;
+        var langs = textController.getTextTracks();
 
         for (var j = 0; j < langs.length; j++) {
           (function (idx) {
             var btn = document.createElement('button');
+            btn.disabled = langs[idx].supported === false;
             var span = document.createElement('span');
-            span.textContent = langs[idx].name || langs[idx].lang;
-            if (window._activeCaptionIdx === idx) {
+            span.textContent = langs[idx].label || langs[idx].language;
+            if (langs[idx].active) {
               span.classList.add('player-chosen-item');
               btn.appendChild(makeCheckmark());
             }
             btn.appendChild(span);
             btn.addEventListener('click', function () {
-              window._selectCaption(idx);
+              player.selectTextTrack(langs[idx]);
               if (window._ccUpdateVisual) window._ccUpdateVisual(true);
             });
             captionMenu.appendChild(btn);
@@ -190,7 +361,7 @@
 
         if (_captionOverflowStateSpan) {
           _captionOverflowStateSpan.textContent = window._activeCaptionIdx >= 0
-            ? (langs[window._activeCaptionIdx].name || langs[window._activeCaptionIdx].lang)
+            ? (langs[window._activeCaptionIdx].label || langs[window._activeCaptionIdx].language)
             : 'Off';
         }
       }
@@ -200,13 +371,17 @@
           .then(function (r) { return r.ok ? r.json() : []; })
           .then(function (langs) {
             window._subtitleList = langs;
-            if (!langs.length) return;
-            fetch('/api/stream/<%= video.videoId %>/subtitles/' + langs[0].lang + '.vtt?token=' + streamToken)
-              .then(function (r) { return r.ok ? r.text() : ''; })
-              .then(function (vtt) {
-                if (vtt) window._captionCues = parseVTT(vtt);
-              })
-              .catch(function () {});
+            textController.tracks = langs.map(function (sub, idx) {
+              return {
+                id: sub.id || sub.lang || String(idx),
+                language: sub.lang || '',
+                label: sub.name || sub.lang || ('Track ' + (idx + 1)),
+                source: 'server',
+                mimeType: 'text/vtt',
+                supported: true,
+                raw: sub
+              };
+            });
             rebuildCaptionSubmenu();
             updateCcVisual();
           })

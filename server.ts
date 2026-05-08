@@ -154,6 +154,20 @@ app.use(compression({
   }
 }));
 app.use(express.json());
+
+app.post('/api/player-events', (req, res) => {
+  const rawEvents = Array.isArray(req.body?.events) ? req.body.events : [];
+  const events = rawEvents.slice(0, 20).map((event) => sanitizePlayerEvent(event)).filter(Boolean);
+  if (!events.length) return res.status(400).json({ error: 'events required' });
+  for (const event of events) {
+    logger.info('player event', {
+      ...event,
+      ip: req.ip,
+    });
+  }
+  res.json({ ok: true });
+});
+
 app.use(express.static(path.join(import.meta.dirname, 'public'), { maxAge: '1d' }));
 app.use('/vendor/shaka', express.static(path.join(import.meta.dirname, 'node_modules/shaka-player/dist'), { maxAge: '7d', immutable: true }));
 const dataDir = path.join(import.meta.dirname, 'data');
@@ -293,6 +307,50 @@ app.get('/api/watch-time/:videoId', (req, res) => {
   const wt = db.getWatchTime(req.session.userId, videoId);
   res.json({ position: wt ? wt.last_position : 0, duration: wt ? wt.duration : 0 });
 });
+
+function sanitizePlayerEvent(event: unknown) {
+  if (!event || typeof event !== 'object') return null;
+  const src = event as Record<string, unknown>;
+  const videoId = typeof src.videoId === 'string' && /^[A-Za-z0-9_-]{1,32}$/.test(src.videoId) ? src.videoId : '';
+  const type = clampText(src.type, 40);
+  if (!type) return null;
+  return {
+    type,
+    videoId,
+    provider: clampText(src.provider, 40),
+    mode: clampText(src.mode, 30),
+    fallbackReason: clampText(src.fallbackReason, 120),
+    lastError: clampText(src.lastError, 120),
+    lastHttpStatus: clampNumber(src.lastHttpStatus, 0, 599),
+    activeHeight: clampNumber(src.activeHeight, 0, 4320),
+    bandwidthEstimate: clampNumber(src.bandwidthEstimate, 0, 1_000_000_000),
+    bufferAhead: clampNumber(src.bufferAhead, 0, 600),
+    rebufferCount: clampNumber(src.rebufferCount, 0, 10_000),
+    rebufferDuration: clampNumber(src.rebufferDuration, 0, 86_400),
+    recoveryCount: clampNumber(src.recoveryCount, 0, 10_000),
+    mediaFetchRetryCount: clampNumber(src.mediaFetchRetryCount, 0, 10_000),
+    mediaUrlRefreshCount: clampNumber(src.mediaUrlRefreshCount, 0, 10_000),
+    lastRecoveryReason: clampText(src.lastRecoveryReason, 120),
+    manifestRefreshReason: clampText(src.manifestRefreshReason, 80),
+    droppedFrames: clampNumber(src.droppedFrames, 0, 10_000_000),
+    totalFrames: clampNumber(src.totalFrames, 0, 10_000_000),
+    startupMs: clampNumber(src.startupMs, 0, 300_000),
+    firstFrameMs: clampNumber(src.firstFrameMs, 0, 300_000),
+    at: clampNumber(src.at, 0, 86_400),
+    ts: clampNumber(src.ts, 0, Number.MAX_SAFE_INTEGER),
+  };
+}
+
+function clampText(value: unknown, max: number) {
+  if (typeof value !== 'string') return '';
+  return value.slice(0, max);
+}
+
+function clampNumber(value: unknown, min: number, max: number) {
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n)) return 0;
+  return Math.max(min, Math.min(max, n));
+}
 
 // Health check endpoints
 app.get('/health', async (_req, res) => {
