@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { readFileSync } from 'node:fs';
 
 async function setPlayerContent(page, html) {
   await page.setContent(html);
@@ -360,6 +361,1071 @@ test('native adapter reports only the actual active track as HD state source', a
   expect(active.tracks.filter(track => track.active && track.height >= 720)).toHaveLength(0);
 });
 
+test('native adapter exposes defensive configuration snapshots', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    player.configure({
+      abr: { enabled: false, restrictions: { minHeight: 360 } },
+      streaming: { retryParameters: { maxAttempts: 5 } },
+    });
+    const snapshot = player.getConfiguration();
+    snapshot.abr.enabled = true;
+    snapshot.abr.restrictions.minHeight = 1080;
+    snapshot.streaming.retryParameters.maxAttempts = 99;
+    return {
+      snapshot,
+      current: player.getConfiguration(),
+    };
+  });
+
+  expect(state.snapshot.abr.enabled).toBe(true);
+  expect(state.snapshot.abr.restrictions.minHeight).toBe(1080);
+  expect(state.snapshot.streaming.retryParameters.maxAttempts).toBe(99);
+  expect(state.current.abr.enabled).toBe(false);
+  expect(state.current.abr.restrictions.minHeight).toBe(360);
+  expect(state.current.streaming.retryParameters.maxAttempts).toBe(5);
+});
+
+test('native adapter exposes Shaka-shaped buffered info and timeline introspection', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    function ranges(items) {
+      return {
+        length: items.length,
+        start(index) { return items[index][0]; },
+        end(index) { return items[index][1]; },
+      };
+    }
+
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      get() { return ranges([[5.02, 10], [0, 5], [12, 12]]); },
+    });
+    video.currentTime = 7;
+
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    engine._provider = {
+      getLiveRange() { return { start: 3, end: 30 }; },
+    };
+    const loadedInfo = player.getBufferedInfo();
+    const unloadedEngine = new window.PlayerEngine(document.createElement('video'), { videoId: 'EMPTY', streamToken: '' });
+
+    return {
+      loadedInfo,
+      playhead: player.getPlayheadTime(),
+      presentationStart: player.getPresentationStartTime(),
+      unloadedInfo: unloadedEngine.getPlayer().getBufferedInfo(),
+      unloadedPlayhead: unloadedEngine.getPlayer().getPlayheadTime(),
+      unloadedPresentationStart: unloadedEngine.getPlayer().getPresentationStartTime(),
+    };
+  });
+
+  expect(state.loadedInfo).toEqual({
+    total: [{ start: 0, end: 10 }],
+    audio: [{ start: 0, end: 10 }],
+    video: [{ start: 0, end: 10 }],
+    text: [],
+  });
+  expect(state.playhead).toBe(7);
+  expect(state.presentationStart).toBe(3);
+  expect(state.unloadedInfo).toEqual({ total: [], audio: [], video: [], text: [] });
+  expect(state.unloadedPlayhead).toBe(0);
+  expect(state.unloadedPresentationStart).toBe(0);
+});
+
+test('native DASH and HLS buffered info preserve source-buffer audio and video ranges', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    function ranges(items) {
+      return {
+        length: items.length,
+        start(index) { return items[index][0]; },
+        end(index) { return items[index][1]; },
+      };
+    }
+
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      get() { return ranges([[0, 12]]); },
+    });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const dashProvider = {
+      video,
+      audioSb: { buffered: ranges([[1, 3], [3.02, 4]]) },
+      videoSb: { buffered: ranges([[0, 8], [9, 12]]) },
+    };
+    const hlsProvider = {
+      video,
+      audioSb: { buffered: ranges([[2, 6]]) },
+      sb: { buffered: ranges([[0, 5]]) },
+    };
+    engine._provider = {
+      video,
+      audioSb: dashProvider.audioSb,
+      videoSb: dashProvider.videoSb,
+      getBufferedInfo: window.NativeDashProviderForTest.getBufferedInfo,
+    };
+    return {
+      dash: window.NativeDashProviderForTest.getBufferedInfo.call(dashProvider),
+      hls: window.NativeHlsProviderForTest.getBufferedInfo.call(hlsProvider),
+      adapter: engine.getPlayer().getBufferedInfo(),
+    };
+  });
+
+  expect(state.dash).toEqual({
+    total: [{ start: 0, end: 12 }],
+    audio: [{ start: 1, end: 4 }],
+    video: [{ start: 0, end: 8 }, { start: 9, end: 12 }],
+    text: [],
+  });
+  expect(state.hls).toEqual({
+    total: [{ start: 0, end: 12 }],
+    audio: [{ start: 2, end: 6 }],
+    video: [{ start: 0, end: 5 }],
+    text: [],
+  });
+  expect(state.adapter).toEqual(state.dash);
+});
+
+test('native adapter exposes Shaka-compatible seek ranges for unloaded, VOD, and live states', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    const unloaded = player.seekRange();
+    Object.defineProperty(video, 'duration', { configurable: true, get() { return 42; } });
+    const vod = player.seekRange();
+    engine._provider = {
+      getLiveRange() { return { start: 12, end: 48 }; },
+    };
+    return {
+      unloaded,
+      vod,
+      live: player.seekRange(),
+      presentationStart: player.getPresentationStartTime(),
+    };
+  });
+
+  expect(state.unloaded).toEqual({ start: 0, end: 0 });
+  expect(state.vod).toEqual({ start: 0, end: 42 });
+  expect(state.live).toEqual({ start: 12, end: 48 });
+  expect(state.presentationStart).toBe(12);
+});
+
+test('native adapter exposes playback-rate and trick-play controls', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    const events = [];
+    player.addEventListener('ratechange', event => events.push(event.detail.playbackRate));
+    const initial = player.getPlaybackRate();
+    const first = player.setPlaybackRate(1.5);
+    const clampedHigh = player.trickPlay(3);
+    const clampedLow = player.setPlaybackRate(0.1);
+    const ignored = player.setPlaybackRate('bad');
+    const restored = player.cancelTrickPlay();
+    const stats = player.getStats();
+    return { initial, first, clampedHigh, clampedLow, ignored, restored, videoRate: video.playbackRate, events, stats };
+  });
+
+  expect(state.initial).toBe(1);
+  expect(state.first).toBe(1.5);
+  expect(state.clampedHigh).toBe(2);
+  expect(state.clampedLow).toBe(0.25);
+  expect(state.ignored).toBe(0.25);
+  expect(state.restored).toBe(1);
+  expect(state.videoRate).toBe(1);
+  expect(state.events).toEqual([1.5, 2, 0.25, 1]);
+  expect(state.stats.playbackRate).toBe(1);
+  expect(state.stats.lastPlaybackRate).toBe(1);
+  expect(state.stats.playbackRateChangeCount).toBe(4);
+});
+
+test('native adapter records I-frame preview request stats', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    engine._provider = {
+      getIFramePreview(time, trackId) {
+        if (trackId === 'missing') return Promise.resolve(null);
+        return Promise.resolve({ start: time, end: time + 2, url: '/iframe.mp4', track: { id: trackId || 'auto' } });
+      },
+      getStats() { return { provider: 'mock' }; },
+    };
+    const hit = await player.getIFramePreview(12.5, 'iframe-0');
+    const miss = await player.getIFramePreview(13, 'missing');
+    const stats = player.getStats();
+    return { hit, miss, stats };
+  });
+
+  expect(state.hit).toMatchObject({ start: 12.5, end: 14.5, url: '/iframe.mp4' });
+  expect(state.miss).toBeNull();
+  expect(state.stats.iframePreviewRequestCount).toBe(2);
+  expect(state.stats.iframePreviewSuccessCount).toBe(1);
+  expect(state.stats.iframePreviewMissCount).toBe(1);
+  expect(state.stats.lastIFramePreviewTime).toBe(13);
+  expect(state.stats.lastIFramePreviewTrackId).toBe('missing');
+});
+
+test('native adapter exposes seek lifecycle methods for unloaded and provider states', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    let currentTime = 0;
+    Object.defineProperty(video, 'currentTime', {
+      configurable: true,
+      get() { return currentTime; },
+      set(value) { currentTime = value; },
+    });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    const unloadedBegin = player.beginSeek(5);
+    const unloadedCommit = player.commitSeek(5);
+    player.endSeek();
+    const calls = [];
+    engine._provider = {
+      beginSeek(target) { calls.push(['begin', target]); return target + 1; },
+      commitSeek(target) { calls.push(['commit', target]); return target + 2; },
+      cancelSeek() { calls.push(['cancel']); },
+      endSeek() { calls.push(['end']); },
+    };
+    const delegatedBegin = player.beginSeek(10);
+    const delegatedCommit = player.commitSeek(11);
+    player.cancelSeek();
+    player.endSeek();
+    return { unloadedBegin, unloadedCommit, currentTime, delegatedBegin, delegatedCommit, calls };
+  });
+
+  expect(state.unloadedBegin).toBe(5);
+  expect(state.unloadedCommit).toBe(5);
+  expect(state.currentTime).toBe(5);
+  expect(state.delegatedBegin).toBe(11);
+  expect(state.delegatedCommit).toBe(13);
+  expect(state.calls).toEqual([['begin', 10], ['commit', 11], ['cancel'], ['end']]);
+});
+
+test('native provider seek lifecycle clamps live targets and records seek stats', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    function makeVideo() {
+      const video = document.getElementById('player').cloneNode();
+      let currentTime = 0;
+      Object.defineProperty(video, 'currentTime', {
+        configurable: true,
+        get() { return currentTime; },
+        set(value) { currentTime = value; },
+      });
+      Object.defineProperty(video, 'buffered', {
+        configurable: true,
+        get() { return { length: 0, start() { return 0; }, end() { return 0; } }; },
+      });
+      return video;
+    }
+    function engineFor(states, events) {
+      return {
+        _serverDown: false,
+        _setState(state) { states.push(state); },
+        _telemetry: { record(type, payload) { events.push({ type, payload: payload || null }); } },
+        _player: { config: { streaming: { bufferingGoal: 8, seekBufferGoal: 3 } } },
+      };
+    }
+    const dashStates = [];
+    const dashEvents = [];
+    let dashAborted = 0;
+    const dash = {
+      video: makeVideo(),
+      destroyed: false,
+      live: true,
+      liveWindow: { start: 10, end: 20 },
+      activeVideo: { id: 'v', segments: [{ start: 19, end: 21, state: 'idle' }] },
+      audio: { id: 'a', segments: [{ start: 19, end: 21, state: 'idle' }] },
+      controllers: [{ abort() { dashAborted++; } }],
+      activeRanges: { old: true },
+      requestGeneration: 0,
+      requestCancellationCount: 0,
+      pendingSeek: 0,
+      seekBufferPending: false,
+      seekBufferReadyCount: 0,
+      seekCount: 0,
+      seekCancelCount: 0,
+      seekAbortCount: 0,
+      lastSeekTarget: 0,
+      engine: engineFor(dashStates, dashEvents),
+      _tick(force) { this.ticked = force; },
+      beginSeek: window.NativeDashProviderForTest.beginSeek,
+      _onSeek: window.NativeDashProviderForTest._onSeek,
+      _clampSeekTarget: window.NativeDashProviderForTest._clampSeekTarget,
+      _availabilityWindowOverride: window.NativeDashProviderForTest._availabilityWindowOverride,
+      _effectiveLiveWindow: window.NativeDashProviderForTest._effectiveLiveWindow,
+      _seekBufferGoal: window.NativeDashProviderForTest._seekBufferGoal,
+      _bufferAheadGoal: window.NativeDashProviderForTest._bufferAheadGoal,
+      _abortRequests: window.NativeDashProviderForTest._abortRequests,
+    };
+    const dashTarget = window.NativeDashProviderForTest.commitSeek.call(dash, 25);
+    window.NativeDashProviderForTest.cancelSeek.call(dash);
+
+    const hlsStates = [];
+    const hlsEvents = [];
+    let hlsAborted = 0;
+    const hls = {
+      video: makeVideo(),
+      destroyed: false,
+      live: true,
+      liveWindow: { start: 30, end: 40 },
+      segments: [{ start: 30, end: 33, state: 'idle' }],
+      activeAudio: { id: 'aud', segments: [{ start: 30, end: 33, state: 'idle' }] },
+      controllers: [{ abort() { hlsAborted++; } }],
+      activeRanges: { old: true },
+      seekBufferPending: false,
+      seekBufferReadyCount: 0,
+      seekCount: 0,
+      seekCancelCount: 0,
+      seekAbortCount: 0,
+      lastSeekTarget: 0,
+      engine: engineFor(hlsStates, hlsEvents),
+      _appending: true,
+      _tick(force) { this.ticked = force; },
+      beginSeek: window.NativeHlsProviderForTest.beginSeek,
+      _onSeek: window.NativeHlsProviderForTest._onSeek,
+      _clampSeekTarget: window.NativeHlsProviderForTest._clampSeekTarget,
+      _seekBufferGoal: window.NativeHlsProviderForTest._seekBufferGoal,
+      _bufferAheadGoal: window.NativeDashProviderForTest._bufferAheadGoal,
+      _abortRequests: window.NativeHlsProviderForTest._abortRequests,
+    };
+    const hlsTarget = window.NativeHlsProviderForTest.commitSeek.call(hls, 20);
+    window.NativeHlsProviderForTest.endSeek.call(hls);
+
+    return {
+      dash: {
+        target: dashTarget,
+        currentTime: dash.video.currentTime,
+        requestGeneration: dash.requestGeneration,
+        requestCancellationCount: dash.requestCancellationCount,
+        seekAbortCount: dash.seekAbortCount,
+        seekCancelCount: dash.seekCancelCount,
+        seekCount: dash.seekCount,
+        seekBufferPending: dash.seekBufferPending,
+        lastSeekTarget: dash.lastSeekTarget,
+        dashAborted,
+        states: dashStates,
+        ticked: dash.ticked,
+        videoSegmentState: dash.activeVideo.segments[0].state,
+        audioSegmentState: dash.audio.segments[0].state,
+      },
+      hls: {
+        target: hlsTarget,
+        currentTime: hls.video.currentTime,
+        seekAbortCount: hls.seekAbortCount,
+        seekCount: hls.seekCount,
+        seekBufferPending: hls.seekBufferPending,
+        lastSeekTarget: hls.lastSeekTarget,
+        hlsAborted,
+        states: hlsStates,
+        ticked: hls.ticked,
+        appending: hls._appending,
+        videoSegmentState: hls.segments[0].state,
+        audioSegmentState: hls.activeAudio.segments[0].state,
+      },
+    };
+  });
+
+  expect(state.dash.target).toBe(20);
+  expect(state.dash.currentTime).toBe(20);
+  expect(state.dash.requestGeneration).toBe(1);
+  expect(state.dash.requestCancellationCount).toBe(2);
+  expect(state.dash.seekAbortCount).toBe(2);
+  expect(state.dash.seekCancelCount).toBe(1);
+  expect(state.dash.seekCount).toBe(1);
+  expect(state.dash.seekBufferPending).toBe(false);
+  expect(state.dash.lastSeekTarget).toBe(20);
+  expect(state.dash.dashAborted).toBe(1);
+  expect(state.dash.states).toContain('seeking');
+  expect(state.dash.ticked).toBe(true);
+  expect(state.dash.videoSegmentState).toBe('pending');
+  expect(state.dash.audioSegmentState).toBe('pending');
+
+  expect(state.hls.target).toBe(30);
+  expect(state.hls.currentTime).toBe(30);
+  expect(state.hls.seekAbortCount).toBe(2);
+  expect(state.hls.seekCount).toBe(1);
+  expect(state.hls.seekBufferPending).toBe(true);
+  expect(state.hls.lastSeekTarget).toBe(30);
+  expect(state.hls.hlsAborted).toBe(1);
+  expect(state.hls.states).toContain('seeking');
+  expect(state.hls.states).toContain('ready');
+  expect(state.hls.ticked).toBe(true);
+  expect(state.hls.appending).toBe(false);
+  expect(state.hls.videoSegmentState).toBe('pending');
+  expect(state.hls.audioSegmentState).toBe('pending');
+});
+
+test('watch seek bar uses player seek lifecycle without hard-coded buffer restoration', async ({ request }) => {
+  const login = await request.post('/auth/free', { maxRedirects: 0 });
+  expect(login.status()).toBeGreaterThanOrEqual(300);
+  expect(login.status()).toBeLessThan(400);
+
+  const watch = await request.get('/watch?v=dQw4w9WgXcQ');
+  expect(watch.status()).toBe(200);
+  const html = await watch.text();
+  expect(html).toContain('player.beginSeek');
+  expect(html).toContain('player.commitSeek');
+  expect(html).toContain('player.endSeek');
+  expect(html).not.toContain("streaming.bufferingGoal', 120");
+  expect(html).not.toContain("streaming.rebufferingGoal', 0.01");
+});
+
+test('watch live badge uses player live-edge API and stats', async ({ request }) => {
+  const login = await request.post('/auth/free', { maxRedirects: 0 });
+  expect(login.status()).toBeGreaterThanOrEqual(300);
+  expect(login.status()).toBeLessThan(400);
+
+  const watch = await request.get('/watch?v=dQw4w9WgXcQ');
+  expect(watch.status()).toBe(200);
+  const html = await watch.text();
+  expect(html).toContain('if (player.seekToLiveEdge) player.seekToLiveEdge();');
+  expect(html).toContain('player.getStats ? player.getStats() : null');
+  expect(html).toContain("typeof stats.atLiveEdge === 'boolean'");
+  expect(html).toContain('stats.liveLatency');
+  expect(html).not.toContain('video.currentTime = range.end');
+});
+
+test('watch user seek surfaces route through shared player seek lifecycle helper', async ({ request }) => {
+  const login = await request.post('/auth/free', { maxRedirects: 0 });
+  expect(login.status()).toBeGreaterThanOrEqual(300);
+  expect(login.status()).toBeLessThan(400);
+
+  const watch = await request.get('/watch?v=dQw4w9WgXcQ');
+  expect(watch.status()).toBe(200);
+  const html = await watch.text();
+  expect(html).toContain('function playerSeekTo(target, opts)');
+  expect(html).toContain('window._playerSeekTo = playerSeekTo');
+  expect(html).toContain("navigator.mediaSession.setActionHandler('seekbackward', function () { playerSeekTo");
+  expect(html).toContain("navigator.mediaSession.setActionHandler('seekforward', function () { playerSeekTo");
+  expect(html).toContain("navigator.mediaSession.setActionHandler('seekto', function (d) { if (d.seekTime != null) playerSeekTo(d.seekTime); });");
+  expect(html).toContain('playerSeekTo(Math.max(0, (engine.recovering ? engine.lastGoodTime : video.currentTime) - 5)');
+  expect(html).toContain('playerSeekTo(Math.min(video.duration || Infinity, (engine.recovering ? engine.lastGoodTime : video.currentTime) + 5)');
+  expect(html).toContain('playerSeekTo(dur * pct)');
+  expect(html).toContain('playerSeekTo(chapters[idx].start_time)');
+  expect(html).toContain('playerSeekTo(parseFloat(link.dataset.time))');
+  expect(html).not.toContain('video.currentTime = Math.max(0, video.currentTime - 5)');
+  expect(html).not.toContain('video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 5)');
+  expect(html).not.toContain('video.currentTime = dur * pct');
+  expect(html).not.toContain('video.currentTime = chapters[idx].start_time');
+  expect(html).not.toContain('video.currentTime = parseFloat(link.dataset.time)');
+  expect(html).not.toContain("setActionHandler('seekto', function (d) { if (d.seekTime != null) video.currentTime = d.seekTime; });");
+});
+
+test('watch playback speed controls use player adapter API', async ({ request }) => {
+  const login = await request.post('/auth/free', { maxRedirects: 0 });
+  expect(login.status()).toBeGreaterThanOrEqual(300);
+  expect(login.status()).toBeLessThan(400);
+
+  const watch = await request.get('/watch?v=dQw4w9WgXcQ');
+  expect(watch.status()).toBe(200);
+  const html = await watch.text();
+  expect(html).toContain('if (player.setPlaybackRate) player.setPlaybackRate(rate);');
+  expect(html).toContain('if (player.setPlaybackRate) player.setPlaybackRate(savedSpeed);');
+  expect(html).toContain('player.getPlaybackRate ? player.getPlaybackRate() : video.playbackRate');
+  expect(html).toContain("localStorage.getItem('player-speed')");
+  expect(html).not.toContain('video.playbackRate = Math.min(2, video.playbackRate + 0.25);');
+  expect(html).not.toContain('video.playbackRate = Math.max(0.25, video.playbackRate - 0.25);');
+  expect(html).not.toContain('video.playbackRate = rate;\n              });');
+});
+
+test('watch seek preview falls back from storyboards to native I-frame metadata', async ({ request }) => {
+  const login = await request.post('/auth/free', { maxRedirects: 0 });
+  expect(login.status()).toBeGreaterThanOrEqual(300);
+  expect(login.status()).toBeLessThan(400);
+
+  const watch = await request.get('/watch?v=dQw4w9WgXcQ');
+  expect(watch.status()).toBe(200);
+  const html = await watch.text();
+  expect(html).toContain("var previewSource = 'none';");
+  expect(html).toContain('window._seekPreviewSource = previewSource;');
+  expect(html).toContain('tooltip.dataset.previewSource = previewSource;');
+  expect(html).toContain('function requestIFramePreview(time)');
+  expect(html).toContain('player.getIFramePreview(time).then(function (preview)');
+  expect(html).toContain("setPreviewSource(lastIframePreview ? 'iframe' : 'none');");
+  expect(html).toContain("setPreviewSource('storyboard');");
+  expect(html).toContain('tooltip.dataset.previewUrl = preview.url ||');
+  expect(html).toContain("return fetch('/api/stream/");
+});
+
+test('thumbnail preview uses native I-frame metadata after storyboard failure', async ({ page }) => {
+  const source = readFileSync('views/player/thumbnail-preview.ejs', 'utf8').replaceAll('<%= video.videoId %>', 'PLAYERTEST1');
+
+  await page.setContent(`<div id="player-container" style="width:400px;height:240px"><div id="seek" style="width:400px;height:20px"></div><video id="player"></video></div>`);
+  await page.addScriptTag({ content: `
+    var container = document.getElementById('player-container');
+    var video = document.getElementById('player');
+    var seekBarContainer = document.getElementById('seek');
+    var streamToken = 'test-token';
+    var isLive = false;
+    var iframeCalls = [];
+    Object.defineProperty(video, 'duration', { configurable: true, get: function () { return 100; } });
+    function safePlayerCall(fn) { try { return fn(); } catch (e) { return null; } }
+    function getLiveRange() { return { start: 0, end: 100 }; }
+    function formatTime(value) { return String(value); }
+    function seekTimeFromMouse(e) {
+      var rect = seekBarContainer.getBoundingClientRect();
+      return ((e.clientX - rect.left) / rect.width) * video.duration;
+    }
+    var player = {
+      getIFrameTracks: function () { return [{ id: 'iframe-0', height: 360, iframeOnly: true }]; },
+      getIFramePreview: function (time) {
+        iframeCalls.push(time);
+        return Promise.resolve({ start: 24, end: 26, url: '/iframe.mp4', range: { start: 10, end: 20 }, track: { id: 'iframe-0' } });
+      }
+    };
+    window.fetch = function () { return Promise.resolve({ ok: false }); };
+  ` });
+  await page.addScriptTag({ content: source });
+
+  await page.evaluate(() => window._loadStoryboard());
+  await page.dispatchEvent('#seek', 'mousemove', { clientX: 100, clientY: 10 });
+  await page.waitForTimeout(180);
+  await expect.poll(() => page.evaluate(() => window._seekPreviewSource)).toBe('iframe');
+
+  const state = await page.evaluate(() => {
+    const tooltip = document.querySelector('.seek-thumbnail');
+    return {
+      calls: iframeCalls.length,
+      source: tooltip.dataset.previewSource,
+      url: tooltip.dataset.previewUrl,
+      range: tooltip.dataset.previewRange,
+      imageDisplay: document.querySelector('.seek-thumbnail-img').style.display,
+    };
+  });
+  expect(state.calls).toBe(1);
+  expect(state.source).toBe('iframe');
+  expect(state.url).toBe('/iframe.mp4');
+  expect(state.range).toBe('10-20');
+  expect(state.imageDisplay).toBe('none');
+});
+
+test('watch page renders centralized player cleanup hooks', async ({ request }) => {
+  const login = await request.post('/auth/free', { maxRedirects: 0 });
+  expect(login.status()).toBeGreaterThanOrEqual(300);
+  expect(login.status()).toBeLessThan(400);
+
+  const watch = await request.get('/watch?v=dQw4w9WgXcQ');
+  expect(watch.status()).toBe(200);
+  const html = await watch.text();
+
+  expect(html).toContain('function runPlayerCleanupTasks()');
+  expect(html).toContain('window._cleanupPlayer = function ()');
+  expect(html).toContain('if (window._detailsTimer)');
+  expect(html).toContain('runPlayerCleanupTasks();');
+});
+
+test('native engine destroy removes owned listeners and is idempotent', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const counts = { videoAdd: {}, videoRemove: {}, windowAdd: {}, windowRemove: {} };
+    const originalVideoAdd = video.addEventListener.bind(video);
+    const originalVideoRemove = video.removeEventListener.bind(video);
+    const originalWindowAdd = window.addEventListener.bind(window);
+    const originalWindowRemove = window.removeEventListener.bind(window);
+    video.addEventListener = function (name, fn, opts) {
+      counts.videoAdd[name] = (counts.videoAdd[name] || 0) + 1;
+      return originalVideoAdd(name, fn, opts);
+    };
+    video.removeEventListener = function (name, fn, opts) {
+      counts.videoRemove[name] = (counts.videoRemove[name] || 0) + 1;
+      return originalVideoRemove(name, fn, opts);
+    };
+    window.addEventListener = function (name, fn, opts) {
+      counts.windowAdd[name] = (counts.windowAdd[name] || 0) + 1;
+      return originalWindowAdd(name, fn, opts);
+    };
+    window.removeEventListener = function (name, fn, opts) {
+      counts.windowRemove[name] = (counts.windowRemove[name] || 0) + 1;
+      return originalWindowRemove(name, fn, opts);
+    };
+    try {
+      const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+      await engine.init();
+      engine.destroy();
+      engine.destroy();
+      return {
+        destroyed: engine.destroyed,
+        recovering: engine.isRecovering(),
+        state: engine._state,
+        counts,
+      };
+    } finally {
+      video.addEventListener = originalVideoAdd;
+      video.removeEventListener = originalVideoRemove;
+      window.addEventListener = originalWindowAdd;
+      window.removeEventListener = originalWindowRemove;
+    }
+  });
+
+  expect(state.destroyed).toBe(true);
+  expect(state.recovering).toBe(false);
+  expect(state.state).toBe('destroyed');
+  expect(state.counts.videoRemove.timeupdate).toBe(state.counts.videoAdd.timeupdate);
+  expect(state.counts.videoRemove.error).toBe(state.counts.videoAdd.error);
+  expect(state.counts.videoRemove.loadeddata).toBe(state.counts.videoAdd.loadeddata);
+  expect(state.counts.windowRemove.pagehide).toBe(state.counts.windowAdd.pagehide);
+  expect(state.counts.windowRemove.beforeunload).toBe(state.counts.windowAdd.beforeunload);
+});
+
+test('native telemetry unload summary is one-shot and detached after destroy', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const batches = [];
+    const originalBeacon = navigator.sendBeacon;
+    navigator.sendBeacon = function (url, body) {
+      batches.push({ url, body: body ? body.text ? null : String(body) : '' });
+      return true;
+    };
+    try {
+      const video = document.getElementById('player');
+      const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+      await engine.init();
+      window.dispatchEvent(new Event('pagehide'));
+      engine.destroy();
+      window.dispatchEvent(new Event('beforeunload'));
+      return {
+        batchCount: batches.length,
+        eventTypes: engine._telemetry.events.map(event => event.type),
+        telemetryDestroyed: engine._telemetry.destroyed,
+      };
+    } finally {
+      navigator.sendBeacon = originalBeacon;
+    }
+  });
+
+  expect(state.batchCount).toBe(1);
+  expect(state.eventTypes).toEqual([]);
+  expect(state.telemetryDestroyed).toBe(true);
+});
+
+test('native engine destroy rejects held network requests and clears hold stats', async ({ page }) => {
+  await page.route('**/held-destroy.m4s', route => {
+    route.fulfill({ status: 500, contentType: 'text/plain', body: 'down' });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    window.__disablePlayerTelemetry = true;
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'DESTROYHOLD', streamToken: 'test-token' });
+    await engine.init();
+    engine._setState('ready');
+    engine._startServerProbe = function () {};
+    const player = engine.getPlayer();
+    const net = player.getNetworkingEngine();
+    const request = net.request(net.RequestType.SEGMENT, { uris: ['/held-destroy.m4s'] }, { forceNetworkHold: true })
+      .then(() => ({ ok: true }))
+      .catch(err => ({ ok: false, message: err.message }));
+    for (let i = 0; i < 20; i++) {
+      if (player.getStats().networkHeldRequestCount > 0) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const before = player.getStats();
+    engine.destroy();
+    const result = await request;
+    const after = player.getStats();
+    return {
+      beforeHeld: before.networkHeldRequestCount,
+      result,
+      afterHeld: after.networkHeldRequestCount,
+      recovering: engine.isRecovering(),
+      destroyed: engine.destroyed,
+    };
+  });
+
+  expect(state.beforeHeld).toBe(1);
+  expect(state.result).toEqual({ ok: false, message: 'player-destroyed' });
+  expect(state.afterHeld).toBe(0);
+  expect(state.recovering).toBe(false);
+  expect(state.destroyed).toBe(true);
+});
+
+test('native adapter unload clears provider state and stays reusable', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" src="/old.mp4"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    let destroyed = 0;
+    let visibility = null;
+    engine.setTextController({
+      activeTrackId: 'en',
+      getTextTracks() { return []; },
+      getActiveTextTrack() { return null; },
+      selectTextTrack() { return Promise.resolve(); },
+      setTextTrackVisibility(value) { visibility = value; return Promise.resolve(); },
+    });
+    engine._provider = { destroy() { destroyed++; } };
+    engine._providerName = 'native-dash';
+    window._playerProvider = 'native-dash';
+    await player.unload();
+    const afterUnload = {
+      destroyed,
+      providerName: engine._providerName,
+      windowProvider: window._playerProvider,
+      visibility,
+      src: video.getAttribute('src'),
+      activeTrackId: engine._textController.activeTrackId,
+    };
+    let loadedUrl = '';
+    engine._loadNative = function (url) {
+      loadedUrl = url;
+      return Promise.resolve();
+    };
+    await player.load('/next.mpd');
+    return { afterUnload, loadedUrl, state: engine._state };
+  });
+
+  expect(state.afterUnload.destroyed).toBe(1);
+  expect(state.afterUnload.providerName).toBe('');
+  expect(state.afterUnload.windowProvider).toBe('');
+  expect(state.afterUnload.visibility).toBe(false);
+  expect(state.afterUnload.src).toBe(null);
+  expect(state.afterUnload.activeTrackId).toBe('');
+  expect(state.loadedUrl).toBe('/next.mpd');
+  expect(state.state).toBe('loading');
+});
+
+test('native load honors startTime and HLS MIME hints', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/ambiguous-hls', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2"',
+        '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1',
+      ].join('\n'),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    const player = engine.getPlayer();
+    window.__engine = engine;
+    window.__player = player;
+    await engine.init();
+    await player.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureTemplate=timeline', 1.5);
+    const dash = {
+      provider: window._playerProvider,
+      currentTime: video.currentTime,
+      range: player.seekRange(),
+    };
+    await player.unload();
+    await player.load('/ambiguous-hls', 1, 'application/x-mpegurl');
+    return {
+      dash,
+      hlsProvider: window._playerProvider,
+      hlsTime: video.currentTime,
+      hlsStats: player.getStats(),
+    };
+  });
+
+  expect(state.dash.provider).toBe('native-dash');
+  expect(state.dash.currentTime).toBeCloseTo(1.5, 1);
+  expect(state.dash.range.end).toBeGreaterThan(1.5);
+  expect(state.hlsProvider).toBe('native-hls');
+  expect(state.hlsTime).toBeCloseTo(1, 1);
+  expect(state.hlsStats.provider).toBe('native-hls');
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native networking engine applies filters to DASH and HLS manifests and media', async ({ page }) => {
+  const filteredRequests = [];
+  await page.route('**/api/stream/PLAYERTEST1/**', route => {
+    const headers = route.request().headers();
+    if (headers['x-native-filter']) {
+      filteredRequests.push({
+        url: route.request().url(),
+        type: headers['x-native-filter'],
+      });
+    }
+    route.continue();
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    const player = engine.getPlayer();
+    const net = player.getNetworkingEngine();
+    const responses = [];
+    net.registerRequestFilter((type, request) => {
+      request.headers['X-Native-Filter'] = type;
+    });
+    net.registerResponseFilter((type, response) => {
+      responses.push({ type, status: response.status, originalUri: response.originalUri });
+    });
+    await engine.init();
+    await player.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureTemplate=timeline');
+    const dashStats = player.getStats();
+    await player.unload();
+    await player.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=1');
+    const hlsStats = player.getStats();
+    return {
+      dashStats,
+      hlsStats,
+      responses,
+      sameEngine: net === player.getNetworkingEngine(),
+      requestType: net.RequestType.SEGMENT,
+    };
+  });
+
+  expect(state.sameEngine).toBe(true);
+  expect(state.requestType).toBe('SEGMENT');
+  expect(state.responses.some(item => item.type === 'MANIFEST' && item.status === 200)).toBe(true);
+  expect(state.responses.some(item => item.type === 'SEGMENT' && item.status === 206)).toBe(true);
+  expect(state.hlsStats.networkingManifestRequestCount).toBeGreaterThan(1);
+  expect(state.hlsStats.networkingSegmentRequestCount).toBeGreaterThan(0);
+  expect(state.hlsStats.lastNetworkingStatus).toBeGreaterThanOrEqual(200);
+  expect(state.hlsStats.networkingTotalRequestMs).toBeGreaterThanOrEqual(0);
+  expect(filteredRequests.some(item => item.url.includes('dash.mpd') && item.type === 'MANIFEST')).toBe(true);
+  expect(filteredRequests.some(item => item.url.includes('.m3u8') && item.type === 'MANIFEST')).toBe(true);
+  expect(filteredRequests.some(item => item.type === 'SEGMENT')).toBe(true);
+});
+
+test('native networking engine supports response mutation and explicit filter failures', async ({ page }) => {
+  await page.route('**/networking-text.txt', route => {
+    route.fulfill({ status: 200, contentType: 'text/plain', body: 'original' });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const engine = new window.PlayerEngine(document.getElementById('player'), { videoId: 'PLAYERTEST1', streamToken: '' });
+    const net = engine.getPlayer().getNetworkingEngine();
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    net.registerResponseFilter((type, response) => {
+      response.data = encoder.encode('mutated').buffer;
+      response.headers['x-mutated'] = '1';
+    });
+    const response = await net.request(net.RequestType.OTHER, { uris: ['/networking-text.txt'] });
+    net.clearAllResponseFilters();
+    net.registerRequestFilter(() => {
+      throw new Error('blocked');
+    });
+    let failure = '';
+    try {
+      await net.request(net.RequestType.OTHER, { uris: ['/networking-text.txt'] });
+    } catch (err) {
+      failure = err.message;
+    }
+    return {
+      text: decoder.decode(response.data),
+      mutatedHeader: response.headers['x-mutated'],
+      failure,
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(state.text).toBe('mutated');
+  expect(state.mutatedHeader).toBe('1');
+  expect(state.failure).toBe('native-network-request-filter-failed');
+  expect(state.stats.networkingOtherRequestCount).toBe(2);
+  expect(state.stats.networkingFilterErrorCount).toBe(1);
+});
+
+test('native networking engine routes HLS keys through KEY requests', async ({ page }) => {
+  const keyRequests = [];
+  await page.route('**/api/stream/PLAYERTEST1/**', route => {
+    const headers = route.request().headers();
+    if (headers['x-native-key'] === '1') keyRequests.push(route.request().url());
+    route.continue();
+  });
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => route.abort());
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    const player = engine.getPlayer();
+    player.getNetworkingEngine().registerRequestFilter((type, request) => {
+      if (type === 'KEY') request.headers['X-Native-Key'] = '1';
+    });
+    window.__player = player;
+    player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=aes'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(keyRequests.length).toBeGreaterThan(0);
+  expect(stats.networkingKeyRequestCount).toBeGreaterThan(0);
+  expect(stats.hlsKeyFetchCount).toBe(1);
+  expect(stats.fallbackReason).toBe('');
+});
+
+test('native networking engine routes DASH DRM licenses through LICENSE requests', async ({ page }) => {
+  const licenseRequests = [];
+  await page.route('**/license-test', async route => {
+    const request = route.request();
+    licenseRequests.push({
+      header: request.headers()['x-native-license'],
+      body: await request.postDataBuffer(),
+    });
+    route.fulfill({
+      status: 200,
+      contentType: 'application/octet-stream',
+      body: Buffer.from([9, 8, 7, 6]),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const engine = new window.PlayerEngine(document.getElementById('player'), { videoId: 'PLAYERTEST1', streamToken: '' });
+    const player = engine.getPlayer();
+    player.getNetworkingEngine().registerRequestFilter((type, request) => {
+      if (type === 'LICENSE') request.headers['X-Native-License'] = '1';
+    });
+    const provider = {
+      engine,
+      drmInfo: { keySystem: 'com.example.drm', licenseServerUrl: '/license-test' },
+      drmLicenseRequestCount: 0,
+      lastDrmError: '',
+    };
+    let licenseLength = 0;
+    const session = {
+      update(data) {
+        licenseLength = data.byteLength;
+        return Promise.resolve();
+      },
+    };
+    await window.NativeDashProviderForTest._handleDrmMessage.call(provider, session, new Uint8Array([1, 2, 3]).buffer);
+    return {
+      licenseLength,
+      providerRequestCount: provider.drmLicenseRequestCount,
+      lastDrmError: provider.lastDrmError,
+      stats: player.getStats(),
+    };
+  });
+
+  expect(licenseRequests).toHaveLength(1);
+  expect(licenseRequests[0].header).toBe('1');
+  expect([...licenseRequests[0].body]).toEqual([1, 2, 3]);
+  expect(state.licenseLength).toBe(4);
+  expect(state.providerRequestCount).toBe(1);
+  expect(state.lastDrmError).toBe('');
+  expect(state.stats.networkingLicenseRequestCount).toBe(1);
+});
+
+test('native timeline region events are emitted once and reflected in stats', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const events = [];
+    engine.getPlayer().addEventListener('timelineregionadded', event => events.push(event.detail));
+    const provider = {
+      engine,
+      video,
+      name: 'native-dash',
+      manifestUrl: '/manifest.mpd',
+      live: false,
+      bandwidth: 0,
+      bandwidthSamples: 0,
+      activeRanges: {},
+      videoSb: null,
+      audioSb: null,
+      videoReps: [],
+      audioReps: [],
+      textReps: [],
+      activeVideo: null,
+      audio: null,
+      timelineRegions: [],
+      timelineRegionKeys: {},
+      lastTimelineRegion: null,
+      manifestStartTime: 6,
+      getActiveVariantTrack() { return null; },
+      getTextTracks() { return []; },
+      getStats: window.NativeDashProviderForTest.getStats,
+    };
+    engine._provider = provider;
+    window.NativeDashProviderForTest._addTimelineRegions.call(provider, [
+      { id: 'ad-1', schemeIdUri: 'urn:test', value: 'ad', startTime: 5, endTime: 9, eventElement: 'payload', source: 'dash-eventstream' },
+      { id: 'ad-1', schemeIdUri: 'urn:test', value: 'ad', startTime: 5, endTime: 9, eventElement: 'payload', source: 'dash-eventstream' },
+      { id: 'ad-2', schemeIdUri: 'urn:test', value: 'ad', startTime: 10, endTime: 12, source: 'dash-eventstream' },
+    ]);
+    return {
+      events,
+      stats: provider.getStats(),
+    };
+  });
+
+  expect(state.events).toHaveLength(2);
+  expect(state.events[0]).toMatchObject({ id: 'ad-1', schemeIdUri: 'urn:test', startTime: 5, endTime: 9 });
+  expect(state.stats.timelineRegionCount).toBe(2);
+  expect(state.stats.lastTimelineRegion).toMatchObject({ id: 'ad-2', startTime: 10, endTime: 12 });
+  expect(state.stats.manifestStartTime).toBe(6);
+});
+
 test('native startup chooses a non-fuzzy initial representation within bandwidth budget', async ({ page }) => {
   await page.goto('/auth/login');
   await setPlayerContent(page, '<video id="player" style="width:1280px;height:720px"></video>');
@@ -492,6 +1558,71 @@ test('native DASH startup honors explicit minimum height before viewport fallbac
 
   expect(state.withFloorHeight).toBe(360);
   expect(state.belowFloorOnlyHeight).toBe(240);
+});
+
+test('native DASH applies bandwidth restrictions and exposes restricted tracks', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" style="width:1280px;height:720px"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    player.configure({
+      abr: {
+        useNetworkInformation: false,
+        defaultBandwidthEstimate: 5_000_000,
+        restrictions: { minBandwidth: 700_000, maxBandwidth: 1_000_000 },
+      },
+      streaming: { retryParameters: { maxAttempts: 5, baseDelay: 10, backoffFactor: 3 } },
+    });
+    const provider = {
+      engine,
+      video,
+      name: 'native-dash',
+      manifestUrl: '/manifest.mpd',
+      blacklisted: {},
+      manualTrackId: null,
+      bandwidth: 5_000_000,
+      bandwidthSamples: 0,
+      activeRanges: {},
+      videoSb: null,
+      audioSb: null,
+      audioReps: [],
+      textReps: [],
+      activeVideo: null,
+      videoReps: [
+        { id: '240', height: 240, width: 426, bandwidth: 350_000, codecs: 'avc1.42c01f' },
+        { id: '360', height: 360, width: 640, bandwidth: 800_000, codecs: 'avc1.42c01f' },
+        { id: '720', height: 720, width: 1280, bandwidth: 1_800_000, codecs: 'avc1.42c01f' },
+      ],
+      _viewportMaxHeight: window.NativeDashProviderForTest._viewportMaxHeight,
+      _candidateVideos: window.NativeDashProviderForTest._candidateVideos,
+      _chooseForBudget: window.NativeDashProviderForTest._chooseForBudget,
+      chooseVideoRep: window.NativeDashProviderForTest.chooseVideoRep,
+      getVariantTracks: window.NativeDashProviderForTest.getVariantTracks,
+      getActiveVariantTrack: window.NativeDashProviderForTest.getActiveVariantTrack,
+      getTextTracks: window.NativeDashProviderForTest.getTextTracks,
+      getStats: window.NativeDashProviderForTest.getStats,
+    };
+    provider.activeVideo = provider.chooseVideoRep();
+    engine._provider = provider;
+    return {
+      chosen: provider.activeVideo,
+      tracks: provider.getVariantTracks(),
+      stats: provider.getStats(),
+    };
+  });
+
+  expect(state.chosen.id).toBe('360');
+  expect(state.tracks.find(track => track.id === '240')).toMatchObject({ restricted: true, selectable: false, supported: true });
+  expect(state.tracks.find(track => track.id === '360')).toMatchObject({ restricted: false, selectable: true, active: true });
+  expect(state.tracks.find(track => track.id === '720')).toMatchObject({ restricted: true, selectable: false, supported: true });
+  expect(state.stats.abrEnabled).toBe(true);
+  expect(state.stats.restrictedVariantCount).toBe(2);
+  expect(state.stats.activeRestrictions).toMatchObject({ minBandwidth: 700_000, maxBandwidth: 1_000_000 });
+  expect(state.stats.effectiveRetryMaxAttempts).toBe(5);
+  expect(state.stats.effectiveRetryBaseDelay).toBe(10);
 });
 
 test('native ABR uses viewport cap and measured bandwidth', async ({ page }) => {
@@ -957,9 +2088,9 @@ test('native streaming config controls buffer targets and rebuffer readiness', a
   expect(state.bufferGoal).toBe(1);
   expect(state.rebufferGoal).toBe(0.1);
   expect(state.seekGoal).toBe(4);
-  expect(state.seekBufferPending).toBe(false);
-  expect(state.seekBufferReadyCount).toBe(1);
-  expect(state.events.map(event => event.type)).toEqual(['seek-buffer-ready']);
+  expect(state.seekBufferPending).toBe(true);
+  expect(state.seekBufferReadyCount).toBe(0);
+  expect(state.events).toEqual([]);
 });
 
 test('native streaming bufferingGoal limits scheduled segment candidates', async ({ page }) => {
@@ -1254,6 +2385,146 @@ test('native media scheduler appends fetched segments in timeline order', async 
   expect(state.events).toEqual(['scheduler-drain', 'scheduler-drain']);
 });
 
+test('native networking holds transient server errors and resumes the same request', async ({ page }) => {
+  let segmentAttempts = 0;
+  let probeAttempts = 0;
+  const events = [];
+
+  await page.route('**/network-hold-segment.m4s', route => {
+    segmentAttempts++;
+    route.fulfill({
+      status: segmentAttempts === 1 ? 500 : 200,
+      contentType: 'application/octet-stream',
+      body: segmentAttempts === 1 ? 'server down' : 'ok',
+    });
+  });
+  await page.route('**/api/stream/HOLDTEST/dash.mpd**', route => {
+    probeAttempts++;
+    route.fulfill({ status: 200, contentType: 'application/dash+xml', body: '' });
+  });
+  await page.route('**/api/player-events', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }));
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'HOLDTEST', streamToken: 'test-token' });
+    await engine.init();
+    engine._setState('ready');
+    engine.on('server-down', reason => window.__events.push({ type: 'server-down', reason }));
+    engine.on('server-up', () => window.__events.push({ type: 'server-up' }));
+    window.__events = [];
+    const networking = engine.getPlayer().getNetworkingEngine();
+    const response = await networking.request(networking.RequestType.SEGMENT, { uris: ['/network-hold-segment.m4s'] }, { forceNetworkHold: true });
+    return {
+      status: response.status,
+      body: new TextDecoder().decode(response.data),
+      recovering: engine.isRecovering(),
+      events: window.__events,
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(segmentAttempts).toBe(2);
+  expect(probeAttempts).toBeGreaterThan(0);
+  expect(state.status).toBe(200);
+  expect(state.body).toBe('ok');
+  expect(state.recovering).toBe(false);
+  expect(state.events).toEqual([{ type: 'server-down', reason: 'server-error' }, { type: 'server-up' }]);
+  expect(state.stats.networkHoldCount).toBe(1);
+  expect(state.stats.networkResumeCount).toBe(1);
+  expect(state.stats.networkHeldRequestCount).toBe(0);
+  expect(state.stats.networkHoldReason).toBe('server-error');
+  expect(state.stats.lastNetworkingStatus).toBe(200);
+});
+
+test('native networking refreshes token before resuming held 401 requests', async ({ page }) => {
+  let segmentAttempts = 0;
+  let tokenRequests = 0;
+
+  await page.route('**/token-hold-segment.m4s', route => {
+    segmentAttempts++;
+    route.fulfill({
+      status: segmentAttempts === 1 ? 401 : 200,
+      contentType: 'application/octet-stream',
+      body: segmentAttempts === 1 ? 'expired' : 'ok',
+    });
+  });
+  await page.route('**/watch/token**', route => {
+    tokenRequests++;
+    route.fulfill({ status: 200, contentType: 'application/json', body: '{"token":"fresh-token"}' });
+  });
+  await page.route('**/api/stream/TOKENHOLD/dash.mpd**', route => {
+    route.fulfill({ status: 200, contentType: 'application/dash+xml', body: '' });
+  });
+  await page.route('**/api/player-events', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }));
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TOKENHOLD', streamToken: 'old-token' });
+    const tokenEvents = [];
+    engine.on('token-refreshed', token => tokenEvents.push(token));
+    await engine.init();
+    engine._setState('ready');
+    const networking = engine.getPlayer().getNetworkingEngine();
+    const response = await networking.request(networking.RequestType.SEGMENT, { uris: ['/token-hold-segment.m4s'] }, { forceNetworkHold: true });
+    return {
+      status: response.status,
+      body: new TextDecoder().decode(response.data),
+      streamToken: engine.streamToken,
+      manifestUrl: engine.manifestUrl,
+      tokenEvents,
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(segmentAttempts).toBe(2);
+  expect(tokenRequests).toBe(1);
+  expect(state.status).toBe(200);
+  expect(state.body).toBe('ok');
+  expect(state.streamToken).toBe('fresh-token');
+  expect(state.manifestUrl).toContain('token=fresh-token');
+  expect(state.tokenEvents).toEqual(['fresh-token']);
+  expect(state.stats.networkHoldCount).toBe(1);
+  expect(state.stats.networkResumeCount).toBe(1);
+  expect(state.stats.networkHoldReason).toBe('token-expired');
+});
+
+test('native networking does not hold permanent media statuses', async ({ page }) => {
+  let segmentAttempts = 0;
+  await page.route('**/network-permanent-404.m4s', route => {
+    segmentAttempts++;
+    route.fulfill({ status: 404, contentType: 'text/plain', body: 'missing' });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'PERMTEST', streamToken: 'test-token' });
+    await engine.init();
+    engine._setState('ready');
+    const networking = engine.getPlayer().getNetworkingEngine();
+    const response = await networking.request(networking.RequestType.SEGMENT, { uris: ['/network-permanent-404.m4s'] }, { forceNetworkHold: true });
+    return {
+      status: response.status,
+      body: new TextDecoder().decode(response.data),
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(segmentAttempts).toBe(1);
+  expect(state.status).toBe(404);
+  expect(state.body).toBe('missing');
+  expect(state.stats.networkHoldCount).toBe(0);
+  expect(state.stats.networkResumeCount).toBe(0);
+});
+
 test('native telemetry posts first-party playback events only', async ({ page }) => {
   const batches = [];
   await page.route('**/api/player-events', async route => {
@@ -1442,11 +2713,107 @@ test('native DASH stall recovery force-fills before downgrading', async ({ page 
   });
   expect(state.afterFirst.tickCount).toBeGreaterThanOrEqual(2);
   expect(state.afterSecond).toMatchObject({
-    stage: 2,
+    stage: 3,
     switchedTo: '360',
     switchReason: 'stall-recovery',
     clearBuffer: true,
     blacklisted720: true,
+  });
+});
+
+test('native DASH append failure rebuilds native buffers before fallback', async ({ page }) => {
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  const state = await page.evaluate(() => {
+    function makeSourceBuffer() {
+      const listeners = {};
+      let appendCalls = 0;
+      let removeCalls = 0;
+      return {
+        get appendCalls() { return appendCalls; },
+        get removeCalls() { return removeCalls; },
+        updating: false,
+        buffered: { length: 1, start() { return 0; }, end() { return 20; } },
+        addEventListener(name, fn) { listeners[name] = fn; },
+        removeEventListener(name) { delete listeners[name]; },
+        appendBuffer() {
+          appendCalls++;
+          setTimeout(() => { if (listeners.updateend) listeners.updateend(); }, 0);
+        },
+        remove() {
+          removeCalls++;
+          setTimeout(() => { if (listeners.updateend) listeners.updateend(); }, 0);
+        },
+        changeType() {},
+      };
+    }
+
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 10; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    engine._telemetry.record = function () {};
+    let fallbackReason = '';
+    engine._fallbackToShaka = function (reason) { fallbackReason = reason; };
+    const activeVideo = { id: '720', kind: 'video', mimeType: 'video/mp4', codecs: 'avc1.42c01f', initData: new ArrayBuffer(2), segments: [{ start: 9, end: 11, state: 'failed' }] };
+    const audio = { id: 'a64', kind: 'audio', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', initData: new ArrayBuffer(1), segments: [{ start: 9, end: 11, state: 'failed' }] };
+    const provider = {
+      engine,
+      video,
+      videoSb: makeSourceBuffer(),
+      audioSb: makeSourceBuffer(),
+      videoMime: 'video/mp4; codecs="avc1.42c01f"',
+      audioMime: 'audio/mp4; codecs="mp4a.40.2"',
+      activeVideo,
+      audio,
+      appendFailures: 0,
+      recoveryCount: 0,
+      nativeRecoveryAttemptCount: 0,
+      nativeRecoverySuccessCount: 0,
+      nativeRecoveryReasons: {},
+      activeRanges: {},
+      controllers: [],
+      requestGeneration: 0,
+      requestCancellationCount: 0,
+      lastError: '',
+      blacklisted: {},
+      _bufferAheadGoal() { return 30; },
+      _tick(force) { this.ticked = force; },
+      _abortRequests: window.NativeDashProviderForTest._abortRequests,
+      _changeVideoTypeIfNeeded: window.NativeDashProviderForTest._changeVideoTypeIfNeeded,
+      _changeAudioTypeIfNeeded: window.NativeDashProviderForTest._changeAudioTypeIfNeeded,
+      _tryNativeRecovery: window.NativeDashProviderForTest._tryNativeRecovery,
+      _recordRangeError(err) { this.lastError = err.message; },
+    };
+    window.NativeDashProviderForTest._handleAppendFailure.call(provider, { kind: 'video', id: '720' }, new Error('append failed'));
+    return new Promise(resolve => setTimeout(() => resolve({
+      fallbackReason,
+      attempts: provider.nativeRecoveryAttemptCount,
+      successes: provider.nativeRecoverySuccessCount,
+      reason: provider.lastNativeRecoveryReason,
+      videoState: activeVideo.segments[0].state,
+      audioState: audio.segments[0].state,
+      videoRemoveCalls: provider.videoSb.removeCalls,
+      audioRemoveCalls: provider.audioSb.removeCalls,
+      videoAppendCalls: provider.videoSb.appendCalls,
+      audioAppendCalls: provider.audioSb.appendCalls,
+      ticked: provider.ticked === true,
+    }), 30));
+  });
+
+  expect(state).toMatchObject({
+    fallbackReason: '',
+    attempts: 1,
+    successes: 1,
+    reason: 'native-video-append',
+    videoState: 'pending',
+    audioState: 'pending',
+    videoRemoveCalls: 1,
+    audioRemoveCalls: 1,
+    videoAppendCalls: 1,
+    audioAppendCalls: 1,
+    ticked: true,
   });
 });
 
@@ -1595,11 +2962,99 @@ test('native HLS stall recovery force-fills before downgrading', async ({ page }
   });
   expect(state.afterFirst.tickCount).toBeGreaterThanOrEqual(2);
   expect(state.afterSecond).toMatchObject({
-    stage: 2,
+    stage: 3,
     switchedTo: '360',
     switchReason: 'stall-recovery',
     clearBuffer: true,
     blacklisted720: true,
+  });
+});
+
+test('native HLS append failure rebuilds native buffers before fallback', async ({ page }) => {
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  const state = await page.evaluate(() => {
+    function makeSourceBuffer() {
+      const listeners = {};
+      let appendCalls = 0;
+      let removeCalls = 0;
+      return {
+        get appendCalls() { return appendCalls; },
+        get removeCalls() { return removeCalls; },
+        updating: false,
+        buffered: { length: 1, start() { return 0; }, end() { return 20; } },
+        addEventListener(name, fn) { listeners[name] = fn; },
+        removeEventListener(name) { delete listeners[name]; },
+        appendBuffer() {
+          appendCalls++;
+          setTimeout(() => { if (listeners.updateend) listeners.updateend(); }, 0);
+        },
+        remove() {
+          removeCalls++;
+          setTimeout(() => { if (listeners.updateend) listeners.updateend(); }, 0);
+        },
+      };
+    }
+
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 10; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    engine._telemetry.record = function () {};
+    let fallbackReason = '';
+    engine._fallbackToShaka = function (reason) { fallbackReason = reason; };
+    const provider = {
+      engine,
+      video,
+      sb: makeSourceBuffer(),
+      audioSb: makeSourceBuffer(),
+      initSegment: { url: '/video-init', range: null },
+      audioInitSegment: { url: '/audio-init', range: null },
+      segments: [{ start: 9, end: 11, state: 'failed' }],
+      activeAudio: { id: 'a64', segments: [{ start: 9, end: 11, state: 'failed' }] },
+      appendFailures: 0,
+      recoveryCount: 0,
+      nativeRecoveryAttemptCount: 0,
+      nativeRecoverySuccessCount: 0,
+      nativeRecoveryReasons: {},
+      activeRanges: {},
+      controllers: [],
+      lastError: '',
+      blacklisted: {},
+      _bufferAheadGoal() { return 30; },
+      _tick(force) { this.ticked = force; },
+      _fetchRange(url) { return Promise.resolve(url === '/video-init' ? new ArrayBuffer(2) : new ArrayBuffer(1)); },
+      _tryNativeRecovery: window.NativeHlsProviderForTest._tryNativeRecovery,
+    };
+    window.NativeHlsProviderForTest._handleAppendFailure.call(provider, { kind: 'video', id: 'video', sb: provider.sb }, new Error('append failed'));
+    return new Promise(resolve => setTimeout(() => resolve({
+      fallbackReason,
+      attempts: provider.nativeRecoveryAttemptCount,
+      successes: provider.nativeRecoverySuccessCount,
+      reason: provider.lastNativeRecoveryReason,
+      videoState: provider.segments[0].state,
+      audioState: provider.activeAudio.segments[0].state,
+      videoRemoveCalls: provider.sb.removeCalls,
+      audioRemoveCalls: provider.audioSb.removeCalls,
+      videoAppendCalls: provider.sb.appendCalls,
+      audioAppendCalls: provider.audioSb.appendCalls,
+      ticked: provider.ticked === true,
+    }), 30));
+  });
+
+  expect(state).toMatchObject({
+    fallbackReason: '',
+    attempts: 1,
+    successes: 1,
+    reason: 'hls-video-append',
+    videoState: 'pending',
+    audioState: 'pending',
+    videoRemoveCalls: 1,
+    audioRemoveCalls: 1,
+    videoAppendCalls: 1,
+    audioAppendCalls: 1,
+    ticked: true,
   });
 });
 
@@ -1761,6 +3216,46 @@ test('native HLS manual quality selection ignores unsupported tracks', async ({ 
     };
   });
 
+  expect(state.switchedTo).toBe('');
+  expect(state.manualTrackId).toBe('');
+  expect(state.abrEnabled).toBe(true);
+});
+
+test('native HLS manual quality selection ignores restricted tracks', async ({ page }) => {
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const active = { id: '360', kind: 'video', mimeType: 'video/mp4', codecs: 'avc1.42c01f', bandwidth: 800_000, height: 360, active: true };
+    const restricted = { id: '720', kind: 'video', mimeType: 'video/mp4', codecs: 'avc1.42c01f', bandwidth: 1_800_000, height: 720, active: false };
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    engine.getPlayer().configure('abr.restrictions.maxHeight', 360);
+    const provider = {
+      engine,
+      video,
+      variants: [active, restricted],
+      activeVariant: active,
+      blacklisted: {},
+      destroyed: false,
+      _viewportMaxHeight() { return Infinity; },
+      _switchVariant(variant) {
+        this.switchedTo = variant.id;
+      },
+      _isCapabilityAllowed: window.NativeHlsProviderForTest._isCapabilityAllowed,
+    };
+    const tracks = window.NativeHlsProviderForTest.getVariantTracks.call(provider);
+    window.NativeHlsProviderForTest.selectVariantTrack.call(provider, { id: '720' }, true);
+    return {
+      tracks,
+      switchedTo: provider.switchedTo || '',
+      manualTrackId: provider.manualTrackId || '',
+      abrEnabled: engine.getPlayer().config.abr.enabled,
+    };
+  });
+
+  expect(state.tracks.find(track => track.id === '720')).toMatchObject({ restricted: true, selectable: false, supported: true });
   expect(state.switchedTo).toBe('');
   expect(state.manualTrackId).toBe('');
   expect(state.abrEnabled).toBe(true);
@@ -1990,6 +3485,54 @@ test('native DASH parser supports dynamic live SegmentTemplate metadata', async 
   ]);
 });
 
+test('native DASH parser preserves EventStream timeline regions', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const mpd = `<?xml version="1.0"?><MPD type="static" mediaPresentationDuration="PT8S"><Period start="PT4S" duration="PT4S">
+<EventStream schemeIdUri="urn:test:events" value="markers" timescale="1000">
+  <Event presentationTime="1500" duration="500" id="ad-1" messageData="payload-a"/>
+  <Event presentationTime="2500" duration="1000" id="ad-2">payload-b</Event>
+</EventStream>
+<AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" duration="2000" initialization="/i/$RepresentationID$" media="/v/$Number$"><Representation id="v1" bandwidth="800000" width="640" height="360" codecs="avc1.42c01f"/></SegmentTemplate></AdaptationSet>
+<AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" duration="2000" initialization="/i/$RepresentationID$" media="/a/$Number$"><Representation id="a1" bandwidth="64000" codecs="mp4a.40.2"/></SegmentTemplate></AdaptationSet>
+</Period></MPD>`;
+    const out = window.NativeDashProviderForTest.parseMPD(mpd, 'https://example.test/manifest.mpd');
+    return out.timelineRegions;
+  });
+
+  expect(parsed).toEqual([
+    expect.objectContaining({ id: 'ad-1', schemeIdUri: 'urn:test:events', value: 'markers', startTime: 5.5, endTime: 6, eventElement: 'payload-a', source: 'dash-eventstream' }),
+    expect.objectContaining({ id: 'ad-2', schemeIdUri: 'urn:test:events', value: 'markers', startTime: 6.5, endTime: 7.5, eventElement: 'payload-b', source: 'dash-eventstream' }),
+  ]);
+});
+
+test('native DASH parser derives bounded windows for dynamic number SegmentTemplate', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const mpd = `<?xml version="1.0"?><MPD type="dynamic" availabilityStartTime="2026-05-04T00:00:00Z" publishTime="2026-05-04T00:00:10Z" minimumUpdatePeriod="PT1S" timeShiftBufferDepth="PT4S"><Period start="PT0S">
+<AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" duration="2000" startNumber="1" initialization="/i/$RepresentationID$" media="/v/$Number$"><Representation id="v1" bandwidth="800000" width="640" height="360" codecs="avc1.42c01f"/></SegmentTemplate></AdaptationSet>
+<AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" duration="2000" startNumber="1" initialization="/i/$RepresentationID$" media="/a/$Number$"><Representation id="a1" bandwidth="64000" codecs="mp4a.40.2"/></SegmentTemplate></AdaptationSet>
+</Period></MPD>`;
+    const out = window.NativeDashProviderForTest.parseMPD(mpd, 'https://example.test/live/manifest.mpd');
+    return {
+      warnings: out.warnings,
+      liveWindow: out.liveWindow,
+      segments: out.video[0].templateSegments.map(seg => ({ start: seg.start, end: seg.end, url: seg.url })),
+    };
+  });
+
+  expect(parsed.warnings).toEqual(['dynamic-number-template-window-derived']);
+  expect(parsed.liveWindow).toEqual({ start: 6, end: 10 });
+  expect(parsed.segments).toEqual([
+    { start: 6, end: 8, url: 'https://example.test/v/4' },
+    { start: 8, end: 10, url: 'https://example.test/v/5' },
+  ]);
+});
+
 test('native DASH parser supports simple static multi-period timelines', async ({ page }) => {
   await page.goto('/auth/login');
   await setPlayerContent(page, '<video id="player"></video>');
@@ -2123,24 +3666,34 @@ test('native DASH parser expands bounded negative SegmentTimeline repeats', asyn
   ]);
 });
 
-test('native DASH parser rejects incompatible codec changes across periods', async ({ page }) => {
+test('native DASH parser preserves codec changes across periods', async ({ page }) => {
   await page.goto('/auth/login');
   await setPlayerContent(page, '<video id="player"></video>');
 
-  const error = await page.evaluate(() => {
+  const parsed = await page.evaluate(() => {
     const mpd = `<?xml version="1.0"?><MPD type="dynamic" availabilityStartTime="2026-05-04T00:00:00Z" timeShiftBufferDepth="PT8S">
 <Period start="PT0S" duration="PT4S"><AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" initialization="/i/$RepresentationID$" media="/v/$Time$"><SegmentTimeline><S t="0" d="2000" r="1"/></SegmentTimeline></SegmentTemplate><Representation id="v1" bandwidth="1" codecs="avc1.42c01f"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" initialization="/i/$RepresentationID$" media="/a/$Time$"><SegmentTimeline><S t="0" d="2000" r="1"/></SegmentTimeline></SegmentTemplate><Representation id="a1" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period>
-<Period start="PT4S" duration="PT4S"><AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="4000" initialization="/i/$RepresentationID$" media="/v2/$Time$"><SegmentTimeline><S t="4000" d="2000" r="1"/></SegmentTimeline></SegmentTemplate><Representation id="v1" bandwidth="1" codecs="hev1.1.6.L93.B0"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="4000" initialization="/i/$RepresentationID$" media="/a2/$Time$"><SegmentTimeline><S t="4000" d="2000" r="1"/></SegmentTimeline></SegmentTemplate><Representation id="a1" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period>
+<Period start="PT4S" duration="PT4S"><AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="4000" initialization="/i2/$RepresentationID$" media="/v2/$Time$"><SegmentTimeline><S t="4000" d="2000" r="1"/></SegmentTimeline></SegmentTemplate><Representation id="v1" bandwidth="1" codecs="avc1.4d401f"/></AdaptationSet><AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="4000" initialization="/i/$RepresentationID$" media="/a2/$Time$"><SegmentTimeline><S t="4000" d="2000" r="1"/></SegmentTimeline></SegmentTemplate><Representation id="a1" bandwidth="1" codecs="mp4a.40.2"/></AdaptationSet></Period>
 </MPD>`;
-    try {
-      window.NativeDashProviderForTest.parseMPD(mpd, 'https://example.test/manifest.mpd');
-      return '';
-    } catch (err) {
-      return err.message;
-    }
+    const out = window.NativeDashProviderForTest.parseMPD(mpd, 'https://example.test/manifest.mpd');
+    return {
+      warnings: out.warnings,
+      generations: out.video[0].periodGenerations.map(gen => ({ periodIndex: gen.periodIndex, codecs: gen.codecs, initUrl: gen.initUrl })),
+      segments: out.video[0].templateSegments.map(seg => ({ start: seg.start, codecs: seg.codecs, initUrl: seg.initUrl })),
+    };
   });
 
-  expect(error).toBe('dash-multiperiod-codec-unsupported');
+  expect(parsed.warnings).toContain('dash-multiperiod-codec-transition');
+  expect(parsed.generations).toEqual([
+    { periodIndex: 0, codecs: 'avc1.42c01f', initUrl: 'https://example.test/i/v1' },
+    { periodIndex: 1, codecs: 'avc1.4d401f', initUrl: 'https://example.test/i2/v1' },
+  ]);
+  expect(parsed.segments).toEqual([
+    { start: 0, codecs: 'avc1.42c01f', initUrl: 'https://example.test/i/v1' },
+    { start: 2, codecs: 'avc1.42c01f', initUrl: 'https://example.test/i/v1' },
+    { start: 4, codecs: 'avc1.4d401f', initUrl: 'https://example.test/i2/v1' },
+    { start: 6, codecs: 'avc1.4d401f', initUrl: 'https://example.test/i2/v1' },
+  ]);
 });
 
 test('native DASH parser preserves audio track language and label metadata', async ({ page }) => {
@@ -2148,7 +3701,7 @@ test('native DASH parser preserves audio track language and label metadata', asy
   await setPlayerContent(page, '<video id="player"></video>');
 
   const parsed = await page.evaluate(() => {
-    const mpd = `<?xml version="1.0"?><MPD type="static" mediaPresentationDuration="PT4S"><Period>
+    const mpd = `<?xml version="1.0"?><MPD xmlns:cenc="urn:mpeg:cenc:2013" type="static" mediaPresentationDuration="PT4S"><Period>
 <AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1" duration="2" initialization="/v/$RepresentationID$/init.mp4" media="/v/$RepresentationID$/$Number$.m4s"/>
 <Representation id="v1" bandwidth="800000" width="640" height="360" codecs="avc1.42c01f"/></AdaptationSet>
 <AdaptationSet mimeType="audio/mp4" lang="es" label="Spanish"><SegmentTemplate timescale="1" duration="2" initialization="/a/$RepresentationID$/init.mp4" media="/a/$RepresentationID$/$Number$.m4s"/>
@@ -2231,6 +3784,34 @@ test('native DASH parser preserves track roles accessibility and text metadata',
       supported: true,
       source: 'native-dash',
     },
+  ]);
+});
+
+test('native DASH parser preserves DRM ContentProtection metadata', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const mpd = `<?xml version="1.0"?><MPD type="static" mediaPresentationDuration="PT4S"><Period>
+<AdaptationSet mimeType="video/mp4">
+<ContentProtection schemeIdUri="urn:mpeg:dash:mp4protection:2011" default_KID="00112233-4455-6677-8899-aabbccddeeff"/>
+<ContentProtection schemeIdUri="urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e"><pssh>AAECAw==</pssh></ContentProtection>
+<Representation id="v1" bandwidth="800000" width="640" height="360" codecs="avc1.42c01f"><BaseURL>/v.mp4</BaseURL><SegmentBase indexRange="0-1"><Initialization range="0-1"/></SegmentBase></Representation>
+</AdaptationSet>
+<AdaptationSet mimeType="audio/mp4"><Representation id="a1" bandwidth="64000" codecs="mp4a.40.2"><BaseURL>/a.mp4</BaseURL><SegmentBase indexRange="0-1"><Initialization range="0-1"/></SegmentBase></Representation></AdaptationSet>
+</Period></MPD>`;
+    const out = window.NativeDashProviderForTest.parseMPD(mpd, 'https://example.test/manifest.mpd');
+    return out.video[0].drmInfos.map(info => ({
+      keySystem: info.keySystem,
+      schemeIdUri: info.schemeIdUri,
+      defaultKid: info.defaultKid,
+      pssh: info.pssh ? Array.from(info.pssh) : null,
+    }));
+  });
+
+  expect(parsed).toEqual([
+    expect.objectContaining({ keySystem: '', defaultKid: '00112233445566778899aabbccddeeff' }),
+    expect.objectContaining({ keySystem: 'org.w3.clearkey', pssh: [0, 1, 2, 3] }),
   ]);
 });
 
@@ -2339,6 +3920,254 @@ test('native DASH exposes audio tracks and switches audio without touching video
   expect(state.audioAppendCalls).toBe(1);
   expect(state.generation).toBe(1);
   expect(state.ticked).toBe(true);
+});
+
+test('native DASH appends period init and changes type at codec boundary', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    function makeSourceBuffer() {
+      const listeners = {};
+      const appended = [];
+      const types = [];
+      return {
+        get appended() { return appended; },
+        get types() { return types; },
+        updating: false,
+        buffered: { length: 0, start() { return 0; }, end() { return 0; } },
+        addEventListener(name, fn) { listeners[name] = fn; },
+        removeEventListener(name) { delete listeners[name]; },
+        appendBuffer(data) {
+          appended.push(data.byteLength);
+          setTimeout(() => { if (listeners.updateend) listeners.updateend(); }, 0);
+        },
+        changeType(type) { types.push(type); },
+      };
+    }
+
+    const originalIsTypeSupported = window.MediaSource && window.MediaSource.isTypeSupported;
+    Object.defineProperty(window.MediaSource, 'isTypeSupported', {
+      configurable: true,
+      value() { return true; },
+    });
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    engine._telemetry.record = function () {};
+    const videoSb = makeSourceBuffer();
+    const rep = {
+      id: 'v1',
+      kind: 'video',
+      mimeType: 'video/mp4',
+      codecs: 'avc1.42c01f',
+      initData: new ArrayBuffer(1),
+      _appendedInitKey: 'video|v1|p0|video/mp4|avc1.42c01f|https://example.test/i/v1|',
+    };
+    const seg = {
+      start: 4,
+      end: 6,
+      url: 'https://example.test/v2/4000',
+      generationKey: 'video|v1|p1|video/mp4|avc1.4d401f|https://example.test/i2/v1|',
+      mimeType: 'video/mp4',
+      codecs: 'avc1.4d401f',
+      initUrl: 'https://example.test/i2/v1',
+      appendWindow: { start: 4, end: 8 },
+    };
+    const provider = {
+      engine,
+      video,
+      videoSb,
+      videoMime: 'video/mp4; codecs="avc1.42c01f"',
+      _fetchRange(url) {
+        return Promise.resolve(url.endsWith('/i2/v1') ? new ArrayBuffer(2) : new ArrayBuffer(0));
+      },
+      _changeVideoTypeIfNeeded: window.NativeDashProviderForTest._changeVideoTypeIfNeeded,
+      _prepareSegmentGeneration: window.NativeDashProviderForTest._prepareSegmentGeneration,
+      _initDataForSegment: window.NativeDashProviderForTest._initDataForSegment,
+      _appendSegmentData: window.NativeDashProviderForTest._appendSegmentData,
+    };
+    await provider._appendSegmentData(rep, videoSb, seg, new ArrayBuffer(3));
+    if (originalIsTypeSupported) {
+      Object.defineProperty(window.MediaSource, 'isTypeSupported', {
+        configurable: true,
+        value: originalIsTypeSupported,
+      });
+    }
+    return {
+      videoMime: provider.videoMime,
+      appended: videoSb.appended,
+      types: videoSb.types,
+      appendedInitKey: rep._appendedInitKey,
+    };
+  });
+
+  expect(state.types).toEqual(['video/mp4; codecs="avc1.4d401f"']);
+  expect(state.appended).toEqual([2, 3]);
+  expect(state.videoMime).toBe('video/mp4; codecs="avc1.4d401f"');
+  expect(state.appendedInitKey).toContain('p1');
+});
+
+test('native DASH rebuilds source buffer at codec boundary when changeType is unavailable', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    function makeSourceBuffer(label) {
+      const listeners = {};
+      const appended = [];
+      return {
+        label,
+        get appended() { return appended; },
+        updating: false,
+        buffered: { length: 0, start() { return 0; }, end() { return 0; } },
+        addEventListener(name, fn) { listeners[name] = fn; },
+        removeEventListener(name) { delete listeners[name]; },
+        appendBuffer(data) {
+          appended.push(data.byteLength);
+          setTimeout(() => { if (listeners.updateend) listeners.updateend(); }, 0);
+        },
+        abort() {},
+      };
+    }
+
+    const originalIsTypeSupported = window.MediaSource && window.MediaSource.isTypeSupported;
+    Object.defineProperty(window.MediaSource, 'isTypeSupported', {
+      configurable: true,
+      value() { return true; },
+    });
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 4; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    engine._telemetry.record = function () {};
+    const oldSb = makeSourceBuffer('old');
+    const created = [];
+    const removed = [];
+    const mediaSource = {
+      readyState: 'open',
+      removeSourceBuffer(sb) { removed.push(sb.label); },
+      addSourceBuffer(type) {
+        const sb = makeSourceBuffer(type);
+        created.push({ type, sb });
+        return sb;
+      },
+    };
+    const rep = {
+      id: 'v1',
+      kind: 'video',
+      mimeType: 'video/mp4',
+      codecs: 'avc1.42c01f',
+      initData: new ArrayBuffer(1),
+      segments: [{ start: 0, end: 2, appended: true, state: 'appended' }],
+      _appendedInitKey: 'video|v1|p0|video/mp4|avc1.42c01f|https://example.test/i/v1|',
+    };
+    const seg = {
+      start: 4,
+      end: 6,
+      url: 'https://example.test/v2/4000',
+      generationKey: 'video|v1|p1|video/mp4|avc1.4d401f|https://example.test/i2/v1|',
+      mimeType: 'video/mp4',
+      codecs: 'avc1.4d401f',
+      initUrl: 'https://example.test/i2/v1',
+      appendWindow: { start: 4, end: 8 },
+    };
+    const provider = {
+      engine,
+      video,
+      mediaSource,
+      videoSb: oldSb,
+      videoMime: 'video/mp4; codecs="avc1.42c01f"',
+      _fetchRange(url) {
+        return Promise.resolve(url.endsWith('/i2/v1') ? new ArrayBuffer(2) : new ArrayBuffer(0));
+      },
+      _changeVideoTypeIfNeeded: window.NativeDashProviderForTest._changeVideoTypeIfNeeded,
+      _rebuildSourceBufferForPeriod: window.NativeDashProviderForTest._rebuildSourceBufferForPeriod,
+      _prepareSegmentGeneration: window.NativeDashProviderForTest._prepareSegmentGeneration,
+      _initDataForSegment: window.NativeDashProviderForTest._initDataForSegment,
+      _appendSegmentData: window.NativeDashProviderForTest._appendSegmentData,
+    };
+    await provider._appendSegmentData(rep, oldSb, seg, new ArrayBuffer(3));
+    if (originalIsTypeSupported) {
+      Object.defineProperty(window.MediaSource, 'isTypeSupported', {
+        configurable: true,
+        value: originalIsTypeSupported,
+      });
+    }
+    return {
+      removed,
+      createdTypes: created.map(item => item.type),
+      oldAppended: oldSb.appended,
+      replacementAppended: provider.videoSb.appended,
+      videoMime: provider.videoMime,
+      appendedInitKey: rep._appendedInitKey,
+      periodTransitionCount: provider.periodTransitionCount,
+      sourceBufferRebuildAttemptCount: provider.sourceBufferRebuildAttemptCount,
+      sourceBufferRebuildSuccessCount: provider.sourceBufferRebuildSuccessCount,
+      lastPeriodTransitionReason: provider.lastPeriodTransitionReason,
+      segmentState: rep.segments[0].state,
+    };
+  });
+
+  expect(state.removed).toEqual(['old']);
+  expect(state.createdTypes).toEqual(['video/mp4; codecs="avc1.4d401f"']);
+  expect(state.oldAppended).toEqual([]);
+  expect(state.replacementAppended).toEqual([2, 3]);
+  expect(state.videoMime).toBe('video/mp4; codecs="avc1.4d401f"');
+  expect(state.appendedInitKey).toContain('p1');
+  expect(state.periodTransitionCount).toBe(1);
+  expect(state.sourceBufferRebuildAttemptCount).toBe(1);
+  expect(state.sourceBufferRebuildSuccessCount).toBe(1);
+  expect(state.lastPeriodTransitionReason).toBe('sourcebuffer-rebuild');
+  expect(state.segmentState).toBe('pending');
+});
+
+test('native DASH rejects unsupported period codec transitions explicitly', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const error = await page.evaluate(async () => {
+    const originalIsTypeSupported = window.MediaSource && window.MediaSource.isTypeSupported;
+    Object.defineProperty(window.MediaSource, 'isTypeSupported', {
+      configurable: true,
+      value(type) { return !String(type).includes('hev1'); },
+    });
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const rep = {
+      id: 'v1',
+      kind: 'video',
+      mimeType: 'video/mp4',
+      codecs: 'avc1.42c01f',
+      _appendedInitKey: 'video|v1|p0|video/mp4|avc1.42c01f|https://example.test/i/v1|',
+    };
+    const provider = {
+      engine,
+      video,
+      videoSb: { changeType() {} },
+      videoMime: 'video/mp4; codecs="avc1.42c01f"',
+      _changeVideoTypeIfNeeded: window.NativeDashProviderForTest._changeVideoTypeIfNeeded,
+      _prepareSegmentGeneration: window.NativeDashProviderForTest._prepareSegmentGeneration,
+    };
+    try {
+      await provider._prepareSegmentGeneration(rep, provider.videoSb, {
+        generationKey: 'video|v1|p1|video/mp4|hev1.1.6.L93.B0|https://example.test/i2/v1|',
+        mimeType: 'video/mp4',
+        codecs: 'hev1.1.6.L93.B0',
+        initUrl: 'https://example.test/i2/v1',
+      });
+      return '';
+    } catch (err) {
+      return err.message;
+    } finally {
+      if (originalIsTypeSupported) {
+        Object.defineProperty(window.MediaSource, 'isTypeSupported', {
+          configurable: true,
+          value: originalIsTypeSupported,
+        });
+      }
+    }
+  });
+
+  expect(error).toBe('dash-period-codec-change-unsupported');
 });
 
 test('adapter text track APIs render selected cues through the caption overlay', async ({ page }) => {
@@ -2508,6 +4337,294 @@ test('adapter routes native DASH sidecar text through caption controller', async
   expect(state.overlayText).toBe('Native DASH captions');
 });
 
+test('native DASH sidecar VTT renders cues without Shaka text pipeline', async ({ page }) => {
+  await page.route('**/captions/native-dash-render.vtt**', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'text/vtt',
+      body: 'WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nProvider DASH captions\n',
+    });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video><div class="custom-caption-container"></div>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const overlay = document.querySelector('.custom-caption-container');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 1; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const provider = {
+      engine,
+      video,
+      name: 'native-dash',
+      textReps: [
+        { id: 'dash-en', source: 'native-dash', language: 'en', label: 'DASH English', mimeType: 'text/vtt', roles: ['subtitle'], accessibility: [], url: '/captions/native-dash-render.vtt', supported: true },
+        { id: 'dash-ttml', source: 'native-dash', language: 'es', label: 'DASH Spanish', mimeType: 'application/ttml+xml', roles: ['subtitle'], accessibility: [], url: '/captions/native-dash.ttml', supported: true },
+      ],
+      activeTextTrackId: '',
+      textTrackVisibility: false,
+      textCueCache: {},
+      textLoadStates: {},
+      getTextTracks: window.NativeDashProviderForTest.getTextTracks,
+      getActiveTextTrack: window.NativeDashProviderForTest.getActiveTextTrack,
+      selectTextTrack: window.NativeDashProviderForTest.selectTextTrack,
+      setTextTrackVisibility: window.NativeDashProviderForTest.setTextTrackVisibility,
+    };
+    engine._provider = provider;
+    const player = engine.getPlayer();
+    await player.selectTextTrack(player.getTextTracks().find(track => track.id === 'dash-en'));
+    const selected = {
+      active: player.getActiveTextTrack(),
+      overlayText: overlay.textContent,
+      cues: window._captionCues,
+      visible: window._captionsVisible,
+    };
+    await player.setTextTrackVisibility(false);
+    const hidden = {
+      active: player.getActiveTextTrack(),
+      overlayText: overlay.textContent,
+      cues: window._captionCues,
+      visible: window._captionsVisible,
+    };
+    const ttml = player.getTextTracks().find(track => track.id === 'dash-ttml');
+    return { selected, hidden, ttml };
+  });
+
+  expect(state.selected.active).toMatchObject({ id: 'dash-en', active: true, loadState: 'loaded', renderSupported: true });
+  expect(state.selected.overlayText).toBe('Provider DASH captions');
+  expect(state.selected.cues).toHaveLength(1);
+  expect(state.selected.visible).toBe(true);
+  expect(state.hidden.active).toBeNull();
+  expect(state.hidden.overlayText).toBe('');
+  expect(state.hidden.cues).toBeNull();
+  expect(state.hidden.visible).toBe(false);
+  expect(state.ttml).toMatchObject({ id: 'dash-ttml', supported: true, renderSupported: true });
+});
+
+test('native TTML parser supports clock, duration, offsets, entities, and malformed XML', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => ({
+    cues: window.NativeDashProviderForTest.parseTtmlCues(`<?xml version="1.0"?>
+<tt xmlns="http://www.w3.org/ns/ttml"><body><div>
+<p begin="00:00:01.500" end="00:00:03.000">Hello &amp; welcome</p>
+<p begin="4s" dur="1500ms">Second   cue</p>
+<p begin="0.1m" end="0.125m">Offset cue</p>
+</div></body></tt>`),
+    malformed: window.NativeDashProviderForTest.parseTtmlCues('<tt><body><p begin="1s" end="2s">Broken'),
+  }));
+
+  expect(parsed.cues).toEqual([
+    { start: 1.5, end: 3, text: 'Hello & welcome' },
+    { start: 4, end: 5.5, text: 'Second cue' },
+    { start: 6, end: 7.5, text: 'Offset cue' },
+  ]);
+  expect(parsed.malformed).toEqual([]);
+});
+
+test('native DASH sidecar TTML renders cues without Shaka text pipeline', async ({ page }) => {
+  await page.route('**/captions/native-dash-render.ttml**', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/ttml+xml',
+      body: '<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="00:00:00.000" end="00:00:04.000">Provider DASH TTML &amp; captions</p></div></body></tt>',
+    });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video><div class="custom-caption-container"></div>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const overlay = document.querySelector('.custom-caption-container');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 1; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const provider = {
+      engine,
+      video,
+      name: 'native-dash',
+      textReps: [
+        { id: 'dash-ttml', source: 'native-dash', language: 'en', label: 'DASH TTML', mimeType: 'application/ttml+xml', roles: ['subtitle'], accessibility: [], url: '/captions/native-dash-render.ttml', supported: true },
+      ],
+      activeTextTrackId: '',
+      textTrackVisibility: false,
+      textCueCache: {},
+      textLoadStates: {},
+      getTextTracks: window.NativeDashProviderForTest.getTextTracks,
+      getActiveTextTrack: window.NativeDashProviderForTest.getActiveTextTrack,
+      selectTextTrack: window.NativeDashProviderForTest.selectTextTrack,
+      setTextTrackVisibility: window.NativeDashProviderForTest.setTextTrackVisibility,
+    };
+    engine._provider = provider;
+    const player = engine.getPlayer();
+    await player.selectTextTrack(player.getTextTracks()[0]);
+    return {
+      active: player.getActiveTextTrack(),
+      overlayText: overlay.textContent,
+      cues: window._captionCues,
+      visible: window._captionsVisible,
+      lastTextTrackError: provider.lastTextTrackError,
+    };
+  });
+
+  expect(state.active).toMatchObject({ id: 'dash-ttml', active: true, loadState: 'loaded', renderSupported: true });
+  expect(state.overlayText).toBe('Provider DASH TTML & captions');
+  expect(state.cues).toEqual([{ start: 0, end: 4, text: 'Provider DASH TTML & captions' }]);
+  expect(state.visible).toBe(true);
+  expect(state.lastTextTrackError).toBe('');
+});
+
+test('native HLS subtitle VTT renders cues through the native overlay', async ({ page }) => {
+  await page.route('**/captions/native-hls-render.vtt**', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'text/vtt',
+      body: 'WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nProvider HLS captions\n',
+    });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video><div class="custom-caption-container"></div>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const overlay = document.querySelector('.custom-caption-container');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 1; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const provider = {
+      engine,
+      video,
+      name: 'native-hls',
+      subtitleRenditions: [
+        { id: 'subs:English', language: 'en', label: 'English', mimeType: 'text/vtt', url: '/captions/native-hls-render.vtt', active: false },
+      ],
+      activeTextTrackId: '',
+      textTrackVisibility: false,
+      textCueCache: {},
+      textLoadStates: {},
+      getTextTracks: window.NativeHlsProviderForTest.getTextTracks,
+      getActiveTextTrack: window.NativeHlsProviderForTest.getActiveTextTrack,
+      selectTextTrack: window.NativeHlsProviderForTest.selectTextTrack,
+      setTextTrackVisibility: window.NativeHlsProviderForTest.setTextTrackVisibility,
+    };
+    engine._provider = provider;
+    const player = engine.getPlayer();
+    await player.selectTextTrack(player.getTextTracks()[0]);
+    return {
+      active: player.getActiveTextTrack(),
+      overlayText: overlay.textContent,
+      cues: window._captionCues,
+      visible: window._captionsVisible,
+    };
+  });
+
+  expect(state.active).toMatchObject({ id: 'subs:English', source: 'native-hls', active: true, loadState: 'loaded', renderSupported: true });
+  expect(state.overlayText).toBe('Provider HLS captions');
+  expect(state.cues).toHaveLength(1);
+  expect(state.visible).toBe(true);
+});
+
+test('native HLS subtitle TTML renders cues through the native overlay', async ({ page }) => {
+  await page.route('**/captions/native-hls-render.ttml**', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/ttml+xml',
+      body: '<?xml version="1.0"?><tt xmlns="http://www.w3.org/ns/ttml"><body><div><p begin="1s" dur="3s">Provider HLS TTML captions</p></div></body></tt>',
+    });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video><div class="custom-caption-container"></div>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const overlay = document.querySelector('.custom-caption-container');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 2; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const provider = {
+      engine,
+      video,
+      name: 'native-hls',
+      subtitleRenditions: [
+        { id: 'subs:TTML', language: 'en', label: 'English TTML', mimeType: 'application/ttml+xml', url: '/captions/native-hls-render.ttml', active: false },
+      ],
+      activeTextTrackId: '',
+      textTrackVisibility: false,
+      textCueCache: {},
+      textLoadStates: {},
+      getTextTracks: window.NativeHlsProviderForTest.getTextTracks,
+      getActiveTextTrack: window.NativeHlsProviderForTest.getActiveTextTrack,
+      selectTextTrack: window.NativeHlsProviderForTest.selectTextTrack,
+      setTextTrackVisibility: window.NativeHlsProviderForTest.setTextTrackVisibility,
+    };
+    engine._provider = provider;
+    const player = engine.getPlayer();
+    await player.selectTextTrack(player.getTextTracks()[0]);
+    return {
+      active: player.getActiveTextTrack(),
+      overlayText: overlay.textContent,
+      cues: window._captionCues,
+      visible: window._captionsVisible,
+      lastTextTrackError: provider.lastTextTrackError,
+    };
+  });
+
+  expect(state.active).toMatchObject({ id: 'subs:TTML', source: 'native-hls', active: true, loadState: 'loaded', renderSupported: true });
+  expect(state.overlayText).toBe('Provider HLS TTML captions');
+  expect(state.cues).toEqual([{ start: 1, end: 4, text: 'Provider HLS TTML captions' }]);
+  expect(state.visible).toBe(true);
+  expect(state.lastTextTrackError).toBe('');
+});
+
+test('native text track fetch failures are non-fatal and do not fall back', async ({ page }) => {
+  await page.route('**/captions/native-missing.vtt**', route => {
+    route.fulfill({ status: 404, contentType: 'text/plain', body: 'missing' });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video><div class="custom-caption-container"></div>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 1; } });
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    const provider = {
+      engine,
+      video,
+      name: 'native-dash',
+      activeVideo: { id: 'v1', height: 720, bandwidth: 1200000, mimeType: 'video/mp4', codecs: 'avc1.42c01f' },
+      videoReps: [{ id: 'v1', height: 720, bandwidth: 1200000, mimeType: 'video/mp4', codecs: 'avc1.42c01f' }],
+      audioReps: [],
+      textReps: [
+        { id: 'dash-missing', source: 'native-dash', language: 'en', label: 'Missing', mimeType: 'text/vtt', roles: ['subtitle'], accessibility: [], url: '/captions/native-missing.vtt', supported: true },
+      ],
+      activeTextTrackId: '',
+      textTrackVisibility: false,
+      textCueCache: {},
+      textLoadStates: {},
+      getTextTracks: window.NativeDashProviderForTest.getTextTracks,
+      getActiveTextTrack: window.NativeDashProviderForTest.getActiveTextTrack,
+      selectTextTrack: window.NativeDashProviderForTest.selectTextTrack,
+      setTextTrackVisibility: window.NativeDashProviderForTest.setTextTrackVisibility,
+      getActiveVariantTrack: window.NativeDashProviderForTest.getActiveVariantTrack,
+      getStats: window.NativeDashProviderForTest.getStats,
+    };
+    engine._provider = provider;
+    const player = engine.getPlayer();
+    await player.selectTextTrack(player.getTextTracks()[0]);
+    return {
+      active: player.getActiveTextTrack(),
+      overlayText: document.querySelector('.custom-caption-container').textContent,
+      fallbackReason: engine._fallbackReason || '',
+      lastTextTrackError: provider.lastTextTrackError,
+      stats: player.getStats(),
+    };
+  });
+
+  expect(state.active).toMatchObject({ id: 'dash-missing', active: true, loadState: 'error' });
+  expect(state.overlayText).toBe('');
+  expect(state.fallbackReason).toBe('');
+  expect(state.lastTextTrackError).toBe('http-404');
+  expect(state.stats.lastTextTrackError).toBe('http-404');
+});
+
 test('fallback provider exposes normalized audio and text track stats', async ({ page }) => {
   await page.route('**/api/stream/TESTVIDEO04/dash.mpd**', route => {
     route.fulfill({
@@ -2651,6 +4768,47 @@ test('native DASH live fixture starts near live edge and reports live stats with
   expect(shakaRequests).toHaveLength(0);
 });
 
+test('native DASH live number-template fixture plays without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+
+  const logs = [];
+  page.on('console', msg => logs.push(msg.text()));
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureLive=number'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-dash');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').buffered.length > 0, null, { timeout: 10_000 });
+
+  const state = await page.evaluate(() => {
+    window.__player.seekToLiveEdge();
+    return {
+      stats: window.__player.getStats(),
+      currentTime: document.getElementById('player').currentTime,
+    };
+  });
+  expect(state.stats.isLive).toBe(true);
+  expect(state.stats.liveWindowEnd).toBeGreaterThan(state.stats.liveWindowStart);
+  expect(state.stats.liveLatency).toBeGreaterThanOrEqual(0);
+  expect(state.stats.manifestCompatibilityWarnings).toContain('dynamic-number-template-window-derived');
+  expect(state.currentTime).toBeGreaterThanOrEqual(state.stats.liveWindowStart);
+  expect(shakaRequests).toHaveLength(0);
+  expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
+});
+
 test('native DASH dynamic multi-period fixture plays without Shaka fallback', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -2685,6 +4843,42 @@ test('native DASH dynamic multi-period fixture plays without Shaka fallback', as
   expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
 });
 
+test('native DASH period codec transition fixture plays without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  const logs = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  page.on('console', msg => logs.push(msg.text()));
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 4, startupBufferGoal: 2, maxConcurrentRequests: 2 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixturePeriodCodec=1'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-dash');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 2.4, null, { timeout: 12_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-dash');
+  expect(stats.periodCount).toBe(2);
+  expect(stats.manifestCompatibilityWarnings).toContain('dash-multiperiod-codec-transition');
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(0);
+  expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
+});
+
 test('native DASH sliding live fixture advances its manifest window', async ({ page }) => {
   await page.goto('/auth/login');
   await setPlayerContent(page, '<video id="player"></video>');
@@ -2700,6 +4894,29 @@ test('native DASH sliding live fixture advances its manifest window', async ({ p
 
   expect(windows[1].start).toBeGreaterThanOrEqual(windows[0].start);
   expect(windows[1].end).toBeGreaterThanOrEqual(windows[0].end);
+});
+
+test('native DASH number-template live fixture advances its generated window', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const windows = await page.evaluate(async () => {
+    const key = 'n' + Date.now() + Math.random();
+    const firstText = await fetch('/api/stream/PLAYERTEST1/dash.mpd?fixtureLive=number-sliding&fixtureLiveKey=' + key).then(resp => resp.text());
+    const secondText = await fetch('/api/stream/PLAYERTEST1/dash.mpd?fixtureLive=number-sliding&fixtureLiveKey=' + key).then(resp => resp.text());
+    const first = window.NativeDashProviderForTest.parseMPD(firstText, location.origin + '/api/stream/PLAYERTEST1/dash.mpd');
+    const second = window.NativeDashProviderForTest.parseMPD(secondText, location.origin + '/api/stream/PLAYERTEST1/dash.mpd');
+    return [first, second].map(item => ({
+      liveWindow: item.liveWindow,
+      urls: item.video[0].templateSegments.map(seg => seg.url),
+      warnings: item.warnings,
+    }));
+  });
+
+  expect(windows[0].warnings).toEqual(['dynamic-number-template-window-derived']);
+  expect(windows[1].liveWindow.start).toBeGreaterThanOrEqual(windows[0].liveWindow.start);
+  expect(windows[1].liveWindow.end).toBeGreaterThan(windows[0].liveWindow.end);
+  expect(windows[1].urls.at(-1)).not.toBe(windows[0].urls.at(-1));
 });
 
 test('native DASH live refresh merges a sliding window without fallback', async ({ page }) => {
@@ -2774,42 +4991,222 @@ test('native DASH live refresh merges a sliding window without fallback', async 
   expect(state.ticked).toBe(true);
 });
 
-test('native DASH live adapter exposes live range and seeks to live edge', async ({ page }) => {
+test('native DASH live refresh preserves period codec generation metadata', async ({ page }) => {
+  const manifest = includeCodecPeriod => `<?xml version="1.0"?><MPD type="dynamic" availabilityStartTime="2026-05-04T00:00:00Z" minimumUpdatePeriod="PT1S" timeShiftBufferDepth="PT8S">
+<Period id="p0" start="PT0S" duration="PT2S">
+<AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" initialization="/i/$RepresentationID$" media="/v/$Time$"><SegmentTimeline><S t="0" d="2000"/></SegmentTimeline></SegmentTemplate>
+<Representation id="v1" bandwidth="800000" width="640" height="360" codecs="avc1.42c01f"/></AdaptationSet>
+<AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" initialization="/ai/$RepresentationID$" media="/a/$Time$"><SegmentTimeline><S t="0" d="2000"/></SegmentTimeline></SegmentTemplate>
+<Representation id="a1" bandwidth="64000" codecs="mp4a.40.2"/></AdaptationSet>
+</Period>
+${includeCodecPeriod ? `<Period id="p1" start="PT2S" duration="PT2S">
+<AdaptationSet mimeType="video/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="2000" initialization="/i2/$RepresentationID$" media="/v2/$Time$"><SegmentTimeline><S t="2000" d="2000"/></SegmentTimeline></SegmentTemplate>
+<Representation id="v1" bandwidth="800000" width="640" height="360" codecs="avc1.4d401f"/></AdaptationSet>
+<AdaptationSet mimeType="audio/mp4"><SegmentTemplate timescale="1000" presentationTimeOffset="2000" initialization="/ai/$RepresentationID$" media="/a2/$Time$"><SegmentTimeline><S t="2000" d="2000"/></SegmentTimeline></SegmentTemplate>
+<Representation id="a1" bandwidth="64000" codecs="mp4a.40.2"/></AdaptationSet>
+</Period>` : ''}
+</MPD>`;
+
+  await page.route('**/live-codec.mpd**', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/dash+xml',
+      body: manifest(true),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(firstManifest => {
+    const first = window.NativeDashProviderForTest.parseMPD(firstManifest, location.origin + '/live-codec.mpd');
+    const videoRep = first.video[0];
+    const audioRep = first.audio[0];
+    videoRep.segments = videoRep.templateSegments.slice();
+    audioRep.segments = audioRep.templateSegments.slice();
+    videoRep.segments[0].appended = true;
+    videoRep.segments[0].state = 'appended';
+    const provider = {
+      manifestUrl: '/live-codec.mpd',
+      manifestText: '',
+      live: true,
+      destroyed: false,
+      videoReps: [videoRep],
+      audioReps: [audioRep],
+      activeVideo: videoRep,
+      audio: audioRep,
+      liveWindow: first.liveWindow,
+      minimumUpdatePeriod: 1,
+      manifestCompatibilityWarnings: [],
+      manifestRefreshCount: 0,
+      manifestRefreshFailed: false,
+      recoveryCount: 0,
+      lastError: '',
+      engine: { streamToken: '', _telemetry: { record() {} } },
+      _tick() { this.ticked = true; },
+      _updateLiveWindowFromReps: window.NativeDashProviderForTest._updateLiveWindowFromReps,
+      _evictExpiredLiveSegmentState: window.NativeDashProviderForTest._evictExpiredLiveSegmentState,
+      _refreshManifest: window.NativeDashProviderForTest._refreshManifest,
+    };
+    return provider._refreshManifest().then(() => ({
+      refreshCount: provider.manifestRefreshCount,
+      warnings: provider.manifestCompatibilityWarnings,
+      generations: provider.videoReps[0].periodGenerations.map(gen => ({ periodIndex: gen.periodIndex, codecs: gen.codecs, initPath: new URL(gen.initUrl).pathname })),
+      segments: provider.videoReps[0].segments.map(seg => ({ start: seg.start, codecs: seg.codecs, initPath: new URL(seg.initUrl).pathname, appended: !!seg.appended, state: seg.state || 'pending' })),
+      ticked: !!provider.ticked,
+    }));
+  }, manifest(false));
+
+  expect(state.refreshCount).toBe(1);
+  expect(state.warnings).toContain('dash-multiperiod-codec-transition');
+  expect(state.generations).toEqual([
+    { periodIndex: 0, codecs: 'avc1.42c01f', initPath: '/i/v1' },
+    { periodIndex: 1, codecs: 'avc1.4d401f', initPath: '/i2/v1' },
+  ]);
+  expect(state.segments).toEqual([
+    { start: 0, codecs: 'avc1.42c01f', initPath: '/i/v1', appended: true, state: 'appended' },
+    { start: 2, codecs: 'avc1.4d401f', initPath: '/i2/v1', appended: false, state: 'pending' },
+  ]);
+  expect(state.ticked).toBe(true);
+});
+
+test('native live adapters expose live range and seek to live edge through lifecycle', async ({ page }) => {
   await page.goto('/auth/login');
   await setPlayerContent(page, '<video id="player"></video>');
 
   const state = await page.evaluate(() => {
-    const video = document.getElementById('player');
-    let currentTime = 0;
-    Object.defineProperty(video, 'currentTime', {
-      configurable: true,
-      get() { return currentTime; },
-      set(value) { currentTime = value; },
-    });
-    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
-    const provider = {
+    function makeVideo() {
+      const video = document.getElementById('player').cloneNode();
+      let currentTime = 0;
+      Object.defineProperty(video, 'currentTime', {
+        configurable: true,
+        get() { return currentTime; },
+        set(value) { currentTime = value; },
+      });
+      Object.defineProperty(video, 'buffered', {
+        configurable: true,
+        get() { return { length: 0, start() { return 0; }, end() { return 0; } }; },
+      });
+      return video;
+    }
+    function engineFor(states) {
+      return {
+        _serverDown: false,
+        _setState(state) { states.push(state); },
+        _telemetry: { record() {} },
+        _player: { config: { streaming: { bufferingGoal: 8, seekBufferGoal: 3 }, manifest: {} } },
+      };
+    }
+    const dashStates = [];
+    const dash = {
       live: true,
       liveWindow: { start: 20, end: 40 },
-      video,
+      video: makeVideo(),
+      destroyed: false,
+      activeVideo: { id: 'v', segments: [{ start: 34, end: 36, state: 'idle' }] },
+      audio: { id: 'a', segments: [{ start: 34, end: 36, state: 'idle' }] },
+      controllers: [],
+      activeRanges: {},
+      requestGeneration: 0,
+      requestCancellationCount: 0,
+      pendingSeek: 0,
+      seekBufferPending: false,
+      seekBufferReadyCount: 0,
       seekCount: 0,
+      seekAbortCount: 0,
+      lastSeekTarget: 0,
+      liveLatency: 0,
+      atLiveEdge: false,
+      engine: engineFor(dashStates),
       isLive() { return true; },
       getLiveRange: window.NativeDashProviderForTest.getLiveRange,
       seekToLiveEdge: window.NativeDashProviderForTest.seekToLiveEdge,
-      _onSeek() { this.seekCount++; },
+      commitSeek: window.NativeDashProviderForTest.commitSeek,
+      beginSeek: window.NativeDashProviderForTest.beginSeek,
+      _onSeek: window.NativeDashProviderForTest._onSeek,
+      _clampSeekTarget: window.NativeDashProviderForTest._clampSeekTarget,
+      _availabilityWindowOverride: window.NativeDashProviderForTest._availabilityWindowOverride,
+      _effectiveLiveWindow: window.NativeDashProviderForTest._effectiveLiveWindow,
+      _seekBufferGoal: window.NativeDashProviderForTest._seekBufferGoal,
+      _bufferAheadGoal: window.NativeDashProviderForTest._bufferAheadGoal,
+      _abortRequests: window.NativeDashProviderForTest._abortRequests,
+      _updateLiveWindowFromReps() {},
+      _updateLivePositionStats: window.NativeDashProviderForTest._updateLivePositionStats,
+      _tick(force) { this.ticked = force; },
     };
-    engine._provider = provider;
-    const player = engine.getPlayer();
-    player.seekToLiveEdge();
+    const hlsStates = [];
+    const hls = {
+      live: true,
+      liveWindow: { start: 50, end: 80 },
+      video: makeVideo(),
+      destroyed: false,
+      segments: [{ start: 74, end: 76, state: 'idle' }],
+      activeAudio: { id: 'aud', segments: [{ start: 74, end: 76, state: 'idle' }] },
+      controllers: [],
+      activeRanges: {},
+      seekBufferPending: false,
+      seekBufferReadyCount: 0,
+      seekCount: 0,
+      seekAbortCount: 0,
+      lastSeekTarget: 0,
+      liveLatency: 0,
+      atLiveEdge: false,
+      engine: engineFor(hlsStates),
+      isLive() { return true; },
+      getLiveRange: window.NativeHlsProviderForTest.getLiveRange,
+      seekToLiveEdge: window.NativeHlsProviderForTest.seekToLiveEdge,
+      commitSeek: window.NativeHlsProviderForTest.commitSeek,
+      beginSeek: window.NativeHlsProviderForTest.beginSeek,
+      _onSeek: window.NativeHlsProviderForTest._onSeek,
+      _clampSeekTarget: window.NativeHlsProviderForTest._clampSeekTarget,
+      _seekBufferGoal: window.NativeHlsProviderForTest._seekBufferGoal,
+      _bufferAheadGoal: window.NativeDashProviderForTest._bufferAheadGoal,
+      _abortRequests: window.NativeHlsProviderForTest._abortRequests,
+      _tick(force) { this.ticked = force; },
+    };
+    window.NativeDashProviderForTest.seekToLiveEdge.call(dash);
+    window.NativeHlsProviderForTest.seekToLiveEdge.call(hls);
     return {
-      range: player.getLiveRange(),
-      currentTime: video.currentTime,
-      seekCount: provider.seekCount,
+      dash: {
+        range: window.NativeDashProviderForTest.getLiveRange.call(dash),
+        currentTime: dash.video.currentTime,
+        seekCount: dash.seekCount,
+        seekBufferPending: dash.seekBufferPending,
+        lastSeekTarget: dash.lastSeekTarget,
+        liveLatency: dash.liveLatency,
+        atLiveEdge: dash.atLiveEdge,
+        states: dashStates,
+        ticked: dash.ticked,
+      },
+      hls: {
+        range: window.NativeHlsProviderForTest.getLiveRange.call(hls),
+        currentTime: hls.video.currentTime,
+        seekCount: hls.seekCount,
+        seekBufferPending: hls.seekBufferPending,
+        lastSeekTarget: hls.lastSeekTarget,
+        states: hlsStates,
+        ticked: hls.ticked,
+      },
     };
   });
 
-  expect(state.range).toEqual({ start: 20, end: 40 });
-  expect(state.currentTime).toBe(34);
-  expect(state.seekCount).toBe(1);
+  expect(state.dash.range).toEqual({ start: 20, end: 40 });
+  expect(state.dash.currentTime).toBe(34);
+  expect(state.dash.seekCount).toBe(1);
+  expect(state.dash.seekBufferPending).toBe(true);
+  expect(state.dash.lastSeekTarget).toBe(34);
+  expect(state.dash.liveLatency).toBe(6);
+  expect(state.dash.atLiveEdge).toBe(true);
+  expect(state.dash.states).toContain('seeking');
+  expect(state.dash.ticked).toBe(true);
+
+  expect(state.hls.range).toEqual({ start: 50, end: 80 });
+  expect(state.hls.currentTime).toBe(74);
+  expect(state.hls.seekCount).toBe(1);
+  expect(state.hls.seekBufferPending).toBe(true);
+  expect(state.hls.lastSeekTarget).toBe(74);
+  expect(state.hls.states).toContain('seeking');
+  expect(state.hls.ticked).toBe(true);
 });
 
 test('native DASH jumps small buffered gaps before stall fallback', async ({ page }) => {
@@ -2941,7 +5338,228 @@ test('native DASH applies append windows and skips expired live segments', async
   expect(state.kept.state).toBe('pending');
 });
 
-test('DRM DASH manifest falls back with explicit reason', async ({ page }) => {
+test('native DASH ClearKey DRM initializes EME and answers license messages', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const originalAccess = navigator.requestMediaKeySystemAccess;
+    let requestedKeySystem = '';
+    let requestedConfig = null;
+    let sessionUpdate = '';
+    const video = document.getElementById('player');
+    video.setMediaKeys = keys => {
+      video.__mediaKeys = keys;
+      return Promise.resolve();
+    };
+    navigator.requestMediaKeySystemAccess = (keySystem, configs) => {
+      requestedKeySystem = keySystem;
+      requestedConfig = configs[0];
+      return Promise.resolve({
+        createMediaKeys() {
+          return Promise.resolve({
+            createSession() {
+              const listeners = {};
+              return {
+                addEventListener(type, fn) { listeners[type] = fn; },
+                generateRequest() {
+                  listeners.message({ message: new Uint8Array([1, 2, 3]).buffer });
+                  return Promise.resolve();
+                },
+                update(payload) {
+                  sessionUpdate = new TextDecoder().decode(payload);
+                  return Promise.resolve();
+                },
+                close() { return Promise.resolve(); },
+              };
+            },
+          });
+        },
+      });
+    };
+    try {
+      const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+      const player = engine.getPlayer();
+      player.configure({
+        drm: {
+          clearKeys: {
+            '00112233445566778899aabbccddeeff': 'ffeeddccbbaa99887766554433221100',
+          },
+        },
+      });
+      const provider = {
+        engine,
+        video,
+        activeVideo: { id: 'v1', kind: 'video', mimeType: 'video/mp4', codecs: 'avc1.42c01f', drmInfos: [{ keySystem: 'org.w3.clearkey', defaultKid: '00112233445566778899aabbccddeeff' }] },
+        audio: { id: 'a1', kind: 'audio', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', drmInfos: [{ keySystem: 'org.w3.clearkey', defaultKid: '00112233445566778899aabbccddeeff' }] },
+        drmSessions: [],
+        drmSessionCount: 0,
+        drmLicenseRequestCount: 0,
+        lastDrmError: '',
+        _ensureDrmReady: window.NativeDashProviderForTest._ensureDrmReady,
+        _onEncrypted: window.NativeDashProviderForTest._onEncrypted,
+        _handleDrmMessage: window.NativeDashProviderForTest._handleDrmMessage,
+      };
+      await provider._ensureDrmReady();
+      provider._onEncrypted({ initDataType: 'cenc', initData: new Uint8Array([9]).buffer });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      return {
+        requestedKeySystem,
+        requestedConfig,
+        hasMediaKeys: !!video.__mediaKeys,
+        sessionCount: provider.drmSessionCount,
+        requestCount: provider.drmLicenseRequestCount,
+        lastDrmError: provider.lastDrmError,
+        sessionUpdate: JSON.parse(sessionUpdate),
+      };
+    } finally {
+      navigator.requestMediaKeySystemAccess = originalAccess;
+    }
+  });
+
+  expect(state.requestedKeySystem).toBe('org.w3.clearkey');
+  expect(state.requestedConfig.videoCapabilities[0].contentType).toBe('video/mp4; codecs="avc1.42c01f"');
+  expect(state.hasMediaKeys).toBe(true);
+  expect(state.sessionCount).toBe(1);
+  expect(state.requestCount).toBe(1);
+  expect(state.lastDrmError).toBe('');
+  expect(state.sessionUpdate).toEqual({
+    keys: [{ kty: 'oct', kid: 'ABEiM0RVZneImaq7zN3u_w', k: '_-7dzLuqmYh3ZlVEMyIRAA' }],
+  });
+});
+
+test('native DASH configured Widevine DRM initializes EME and requests licenses natively', async ({ page }) => {
+  const licenseRequests = [];
+  await page.route('**/widevine-license', async route => {
+    licenseRequests.push({
+      header: route.request().headers()['x-widevine-filter'],
+      body: await route.request().postDataBuffer(),
+    });
+    route.fulfill({
+      status: 200,
+      contentType: 'application/octet-stream',
+      body: Buffer.from([7, 8, 9, 10]),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const originalAccess = navigator.requestMediaKeySystemAccess;
+    let requestedKeySystem = '';
+    let requestedConfig = null;
+    let sessionUpdate = [];
+    let resolveUpdate;
+    const updatePromise = new Promise(resolve => { resolveUpdate = resolve; });
+    const video = document.getElementById('player');
+    video.setMediaKeys = keys => {
+      video.__mediaKeys = keys;
+      return Promise.resolve();
+    };
+    navigator.requestMediaKeySystemAccess = (keySystem, configs) => {
+      requestedKeySystem = keySystem;
+      requestedConfig = configs[0];
+      return Promise.resolve({
+        createMediaKeys() {
+          return Promise.resolve({
+            createSession() {
+              const listeners = {};
+              return {
+                addEventListener(type, fn) { listeners[type] = fn; },
+                generateRequest() {
+                  listeners.message({ message: new Uint8Array([1, 2, 3, 4]).buffer });
+                  return Promise.resolve();
+                },
+                update(payload) {
+                  sessionUpdate = Array.from(new Uint8Array(payload));
+                  resolveUpdate();
+                  return Promise.resolve();
+                },
+                close() { return Promise.resolve(); },
+              };
+            },
+          });
+        },
+      });
+    };
+    try {
+      const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+      const player = engine.getPlayer();
+      player.configure({
+        drm: {
+          servers: {
+            'com.widevine.alpha': '/widevine-license',
+          },
+        },
+      });
+      player.getNetworkingEngine().registerRequestFilter((type, request) => {
+        if (type === 'LICENSE') request.headers['X-Widevine-Filter'] = '1';
+      });
+      const provider = {
+        engine,
+        video,
+        manifestUrl: '/widevine.mpd',
+        live: false,
+        bandwidth: 0,
+        bandwidthSamples: 0,
+        activeRanges: {},
+        videoSb: null,
+        audioSb: null,
+        videoReps: [],
+        audioReps: [],
+        textReps: [],
+        timelineRegions: [],
+        activeVideo: { id: 'v1', kind: 'video', mimeType: 'video/mp4', codecs: 'avc1.42c01f', drmInfos: [{ keySystem: 'com.widevine.alpha', defaultKid: '00112233445566778899aabbccddeeff' }] },
+        audio: { id: 'a1', kind: 'audio', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', drmInfos: [{ keySystem: 'com.widevine.alpha', defaultKid: '00112233445566778899aabbccddeeff' }] },
+        drmSessions: [],
+        drmSessionCount: 0,
+        drmLicenseRequestCount: 0,
+        lastDrmError: '',
+        getStats: window.NativeDashProviderForTest.getStats,
+        getActiveVariantTrack: window.NativeDashProviderForTest.getActiveVariantTrack,
+        getTextTracks: () => [],
+        _ensureDrmReady: window.NativeDashProviderForTest._ensureDrmReady,
+        _onEncrypted: window.NativeDashProviderForTest._onEncrypted,
+        _handleDrmMessage: window.NativeDashProviderForTest._handleDrmMessage,
+      };
+      engine._provider = provider;
+      await provider._ensureDrmReady();
+      provider._onEncrypted({ initDataType: 'cenc', initData: new Uint8Array([9]).buffer });
+      await updatePromise;
+      return {
+        requestedKeySystem,
+        requestedConfig,
+        hasMediaKeys: !!video.__mediaKeys,
+        sessionCount: provider.drmSessionCount,
+        requestCount: provider.drmLicenseRequestCount,
+        lastDrmError: provider.lastDrmError,
+        sessionUpdate,
+        stats: player.getStats(),
+      };
+    } finally {
+      navigator.requestMediaKeySystemAccess = originalAccess;
+    }
+  });
+
+  expect(licenseRequests).toHaveLength(1);
+  expect(licenseRequests[0].header).toBe('1');
+  expect([...licenseRequests[0].body]).toEqual([1, 2, 3, 4]);
+  expect(state.requestedKeySystem).toBe('com.widevine.alpha');
+  expect(state.requestedConfig.videoCapabilities[0].contentType).toBe('video/mp4; codecs="avc1.42c01f"');
+  expect(state.hasMediaKeys).toBe(true);
+  expect(state.sessionCount).toBe(1);
+  expect(state.requestCount).toBe(1);
+  expect(state.lastDrmError).toBe('');
+  expect(state.sessionUpdate).toEqual([7, 8, 9, 10]);
+  expect(state.stats.drmKeySystem).toBe('com.widevine.alpha');
+  expect(state.stats.drmLicenseServerConfigured).toBe(true);
+  expect(state.stats.drmSessionCount).toBe(1);
+  expect(state.stats.drmLicenseRequestCount).toBe(1);
+  expect(state.stats.networkingLicenseRequestCount).toBe(1);
+});
+
+test('DRM DASH manifest falls back with explicit unconfigured Widevine reason', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/api/stream/DRMTEST0001/dash.mpd**', route => {
     route.fulfill({
@@ -2949,6 +5567,7 @@ test('DRM DASH manifest falls back with explicit reason', async ({ page }) => {
       contentType: 'application/dash+xml',
       body: `<?xml version="1.0"?><MPD type="static" mediaPresentationDuration="PT1S"><Period>
 <AdaptationSet mimeType="video/mp4"><ContentProtection schemeIdUri="urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"/><Representation id="v" bandwidth="1" codecs="avc1.42c01f"><BaseURL>/x</BaseURL><SegmentBase indexRange="0-1"><Initialization range="0-1"/></SegmentBase></Representation></AdaptationSet>
+<AdaptationSet mimeType="audio/mp4"><Representation id="a" bandwidth="1" codecs="mp4a.40.2"><BaseURL>/a</BaseURL><SegmentBase indexRange="0-1"><Initialization range="0-1"/></SegmentBase></Representation></AdaptationSet>
 </Period></MPD>`,
     });
   });
@@ -2979,7 +5598,7 @@ test('DRM DASH manifest falls back with explicit reason', async ({ page }) => {
 
   expect(shakaRequests).toHaveLength(1);
   expect(stats.provider).toBe('shaka-fallback');
-  expect(stats.fallbackReason).toBe('dash-drm-unsupported');
+  expect(stats.fallbackReason).toBe('dash-widevine-license-unconfigured');
 });
 
 test('native DASH retries a failed media range without Shaka fallback or reset', async ({ page }) => {
@@ -3023,6 +5642,52 @@ test('native DASH retries a failed media range without Shaka fallback or reset',
   expect(state.stats.lastHttpStatus).toBe(500);
   expect(shakaRequests).toHaveLength(0);
   expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
+});
+
+test('native DASH media retry count honors streaming retry parameters', async ({ page }) => {
+  let attempts = 0;
+  await page.route('**/retry-configured.m4s', route => {
+    attempts++;
+    route.fulfill({
+      status: attempts < 3 ? 500 : 200,
+      contentType: 'application/octet-stream',
+      body: attempts < 3 ? 'fail' : 'ok',
+    });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+    engine.getPlayer().configure({
+      streaming: { retryParameters: { maxAttempts: 3, baseDelay: 1, backoffFactor: 1 } },
+    });
+    const provider = {
+      engine,
+      requestGeneration: 0,
+      controllers: [],
+      segmentCacheHitCount: 0,
+      segmentCacheMissCount: 0,
+      mediaFetchRetryCount: 0,
+      recoveryCount: 0,
+      _recordRangeRecovery: window.NativeDashProviderForTest._recordRangeRecovery,
+      _recordRangeError: window.NativeDashProviderForTest._recordRangeError,
+      _recordBandwidthSample: window.NativeDashProviderForTest._recordBandwidthSample,
+      _fetchRange: window.NativeDashProviderForTest._fetchRange,
+    };
+    const data = await provider._fetchRange('/retry-configured.m4s', null, { phase: 'media' });
+    return {
+      byteLength: data.byteLength,
+      retries: provider.mediaFetchRetryCount,
+      recoveryCount: provider.recoveryCount,
+    };
+  });
+
+  expect(attempts).toBe(3);
+  expect(state.byteLength).toBe(2);
+  expect(state.retries).toBe(2);
+  expect(state.recoveryCount).toBe(2);
 });
 
 test('native DASH refreshes media URLs after exhausted CDN expiry errors', async ({ page }) => {
@@ -3213,6 +5878,54 @@ test('fallback provider exposes normalized stats and reason', async ({ page }) =
   expect(stats.activeVariant.height).toBe(360);
 });
 
+test('native fallback forwards Shaka-compatible start time and seek range', async ({ page }) => {
+  await page.route('**/api/stream/TESTVIDEO02/dash.mpd**', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/dash+xml',
+      body: '<?xml version="1.0"?><MPD type="static" mediaPresentationDuration="PT1S"><Period></Period></MPD>',
+    });
+  });
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/javascript',
+      body: [
+        'window.__shakaLoadArgs=[];',
+        'window.shaka={};',
+        'shaka.polyfill={installAll:function(){}};',
+        'shaka.Player=function(){this.attach=function(){return Promise.resolve()};this.configure=function(){};this.addEventListener=function(){};this.load=function(url,start){window.__shakaLoadArgs.push({url:url,start:start});return Promise.resolve()};this.seekRange=function(){return{start:5,end:25}};this.getBufferedInfo=function(){return{total:[],audio:[],video:[],text:[]}};this.getVariantTracks=function(){return[{id:"s",height:360,active:true}]};this.destroy=function(){return Promise.resolve()};};',
+        'shaka.Player.isBrowserSupported=function(){return true};',
+        'shaka.net={NetworkingEngine:{PluginPriority:{APPLICATION:1},registerScheme:function(){}}};',
+        'shaka.util={Error:{Severity:{RECOVERABLE:1},Category:{NETWORK:1},Code:{OPERATION_ABORTED:1}},AbortableOperation:function(promise){return promise}};',
+      ].join(''),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO02', streamToken: 'test-token' });
+    const player = engine.getPlayer();
+    await engine.init();
+    await player.load(undefined, 12);
+    return {
+      provider: window._playerProvider,
+      args: window.__shakaLoadArgs,
+      range: player.seekRange(),
+    };
+  });
+
+  expect(state.provider).toBe('shaka-fallback');
+  expect(state.args).toHaveLength(1);
+  expect(state.args[0].start).toBe(12);
+  expect(state.args[0].url).toContain('/api/stream/TESTVIDEO02/dash.mpd');
+  expect(state.range).toEqual({ start: 5, end: 25 });
+});
+
 test('native progressive fixture plays without Shaka fallback and exposes URL stats', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -3294,12 +6007,555 @@ video.mp4
   ]);
   expect(parsed.map).toEqual({ url: 'https://example.test/hls/video.mp4', range: { start: 0, end: 99 } });
   expect(parsed.segments).toEqual([
-    { start: 0, end: 2, duration: 2, mediaSequence: 0, url: 'https://example.test/hls/video.mp4', range: { start: 100, end: 299 } },
-    { start: 2, end: 4, duration: 2, mediaSequence: 1, url: 'https://example.test/hls/video.mp4', range: { start: 300, end: 499 } },
+    { start: 0, end: 2, duration: 2, mediaSequence: 0, discontinuity: false, discontinuitySequence: 0, url: 'https://example.test/hls/video.mp4', range: { start: 100, end: 299 } },
+    { start: 2, end: 4, duration: 2, mediaSequence: 1, discontinuity: false, discontinuitySequence: 0, url: 'https://example.test/hls/video.mp4', range: { start: 300, end: 499 } },
   ]);
   expect(parsed.duration).toBe(4);
   expect(parsed.mediaSequence).toBe(0);
   expect(parsed.endList).toBe(true);
+});
+
+test('native HLS parser preserves discontinuity metadata', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const media = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:10
+#EXT-X-DISCONTINUITY-SEQUENCE:4
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="100@0"
+#EXTINF:2.000,
+#EXT-X-BYTERANGE:200@100
+video.mp4
+#EXT-X-DISCONTINUITY
+#EXTINF:2.000,
+#EXT-X-BYTERANGE:200@300
+video.mp4`;
+    const out = window.NativeDashProviderForTest.parseHlsPlaylist(media, 'https://example.test/hls/live.m3u8');
+    return {
+      discontinuity: out.discontinuity,
+      discontinuitySequence: out.discontinuitySequence,
+      discontinuityCount: out.discontinuityCount,
+      endList: out.endList,
+      segments: out.segments,
+    };
+  });
+
+  expect(parsed.discontinuity).toBe(true);
+  expect(parsed.discontinuitySequence).toBe(4);
+  expect(parsed.discontinuityCount).toBe(1);
+  expect(parsed.endList).toBe(false);
+  expect(parsed.segments).toEqual([
+    expect.objectContaining({ mediaSequence: 10, discontinuity: false, discontinuitySequence: 4 }),
+    expect.objectContaining({ mediaSequence: 11, discontinuity: true, discontinuitySequence: 5 }),
+  ]);
+});
+
+test('native HLS parser preserves EXT-X-START and DATERANGE metadata', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const media = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-START:TIME-OFFSET=-3.5,PRECISE=YES
+#EXT-X-TARGETDURATION:2
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="100@0"
+#EXT-X-DATERANGE:ID="ad-1",CLASS="ad",START-DATE="2026-05-10T12:00:00Z",DURATION=4.5,X-ASSET-ID="asset-7"
+#EXT-X-PROGRAM-DATE-TIME:2026-05-10T12:00:00Z
+#EXTINF:2.000,
+seg-a.m4s
+#EXTINF:2.000,
+seg-b.m4s
+#EXT-X-ENDLIST`;
+    const out = window.NativeDashProviderForTest.parseHlsPlaylist(media, 'https://example.test/hls/live.m3u8');
+    return {
+      start: out.start,
+      dateRanges: out.dateRanges,
+      segments: out.segments.map(seg => ({ start: seg.start, end: seg.end, programDateTimeMs: seg.programDateTimeMs })),
+    };
+  });
+
+  expect(parsed.start).toEqual({ timeOffset: -3.5, precise: true });
+  expect(parsed.dateRanges).toEqual([
+    expect.objectContaining({
+      id: 'ad-1',
+      class: 'ad',
+      startDate: '2026-05-10T12:00:00Z',
+      duration: 4.5,
+      customAttributes: { 'X-ASSET-ID': 'asset-7' },
+    }),
+  ]);
+  expect(parsed.segments[0]).toMatchObject({ start: 0, end: 2, programDateTimeMs: Date.parse('2026-05-10T12:00:00Z') });
+  expect(parsed.segments[1]).toMatchObject({ start: 2, end: 4, programDateTimeMs: Date.parse('2026-05-10T12:00:02Z') });
+});
+
+test('native HLS parser preserves AES-128 key metadata and key resets', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const media = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:7
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="100@0"
+#EXT-X-KEY:METHOD=AES-128,URI="key-a.bin",IV=0x00000000000000000000000000000009
+#EXTINF:2.000,
+seg-a.m4s
+#EXT-X-KEY:METHOD=AES-128,URI="key-b.bin"
+#EXTINF:2.000,
+seg-b.m4s
+#EXT-X-KEY:METHOD=NONE
+#EXTINF:2.000,
+seg-c.m4s`;
+    const out = window.NativeDashProviderForTest.parseHlsPlaylist(media, 'https://example.test/hls/live.m3u8');
+    return {
+      encrypted: out.encrypted,
+      unsupportedEncryption: out.unsupportedEncryption,
+      segments: out.segments.map(seg => ({
+        mediaSequence: seg.mediaSequence,
+        url: seg.url,
+        key: seg.key ? {
+          method: seg.key.method,
+          uri: seg.key.uri,
+          iv: seg.key.iv ? Array.from(seg.key.iv) : null,
+        } : null,
+      })),
+    };
+  });
+
+  expect(parsed.encrypted).toBe(true);
+  expect(parsed.unsupportedEncryption).toBe(false);
+  expect(parsed.segments).toEqual([
+    { mediaSequence: 7, url: 'https://example.test/hls/seg-a.m4s', key: { method: 'AES-128', uri: 'https://example.test/hls/key-a.bin', iv: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9] } },
+    { mediaSequence: 8, url: 'https://example.test/hls/seg-b.m4s', key: { method: 'AES-128', uri: 'https://example.test/hls/key-b.bin', iv: null } },
+    { mediaSequence: 9, url: 'https://example.test/hls/seg-c.m4s', key: null },
+  ]);
+});
+
+test('native HLS parser preserves low-latency playlist metadata', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const media = `#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:2
+#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12.0,CAN-SKIP-DATERANGES=YES,HOLD-BACK=6.0,PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES
+#EXT-X-PART-INF:PART-TARGET=0.33334
+#EXT-X-MAP:URI="video.mp4",BYTERANGE="100@0"
+#EXT-X-SKIP:SKIPPED-SEGMENTS=3
+#EXT-X-PART:DURATION=0.33334,URI="filePart271.0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.33334,URI="filePart271.1.m4s",BYTERANGE="400@100"
+#EXTINF:2.000,
+seg-271.m4s
+#EXT-X-PRELOAD-HINT:TYPE=PART,URI="filePart272.0.m4s",BYTERANGE-START=0,BYTERANGE-LENGTH=400
+#EXT-X-RENDITION-REPORT:URI="low.m3u8",LAST-MSN=271,LAST-PART=1`;
+    const out = window.NativeDashProviderForTest.parseHlsPlaylist(media, 'https://example.test/hls/live/hi.m3u8');
+    return {
+      lowLatencyPlaylist: out.lowLatencyPlaylist,
+      partTargetDuration: out.partTargetDuration,
+      partialSegmentCount: out.partialSegmentCount,
+      skippedSegmentCount: out.skippedSegmentCount,
+      serverControl: out.serverControl,
+      preloadHints: out.preloadHints,
+      renditionReports: out.renditionReports,
+      warnings: out.warnings,
+      segments: out.segments,
+    };
+  });
+
+  expect(parsed.lowLatencyPlaylist).toBe(true);
+  expect(parsed.partTargetDuration).toBeCloseTo(0.33334, 5);
+  expect(parsed.partialSegmentCount).toBe(2);
+  expect(parsed.skippedSegmentCount).toBe(3);
+  expect(parsed.serverControl).toMatchObject({ canSkipUntil: 12, canSkipDateRanges: true, holdBack: 6, partHoldBack: 1, canBlockReload: true });
+  expect(parsed.preloadHints).toEqual([expect.objectContaining({ type: 'PART', url: 'https://example.test/hls/live/filePart272.0.m4s', byteRangeStart: 0, byteRangeLength: 400 })]);
+  expect(parsed.renditionReports).toEqual([expect.objectContaining({ url: 'https://example.test/hls/live/low.m3u8', lastMsn: 271, lastPart: 1 })]);
+  expect(parsed.warnings).toContain('hls-delta-update-skipped-segments');
+  expect(parsed.segments).toHaveLength(1);
+  expect(parsed.segments[0].parts).toEqual([
+    expect.objectContaining({ url: 'https://example.test/hls/live/filePart271.0.m4s', duration: 0.33334, independent: true, gap: false, range: null }),
+    expect.objectContaining({ url: 'https://example.test/hls/live/filePart271.1.m4s', duration: 0.33334, independent: false, gap: false, range: { start: 100, end: 499 } }),
+  ]);
+});
+
+test('native HLS parser keeps I-frame and content steering metadata out of playable variants', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const parsed = await page.evaluate(() => {
+    const master = `#EXTM3U
+#EXT-X-CONTENT-STEERING:SERVER-URI="steering.json",PATHWAY-ID="cdn-a"
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-a"
+v360.m3u8
+#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=120000,RESOLUTION=640x360,CODECS="avc1.42c01f",PATHWAY-ID="cdn-a",URI="iframes-360.m3u8"`;
+    const out = window.NativeDashProviderForTest.parseHlsPlaylist(master, 'https://example.test/hls/master.m3u8');
+    return {
+      variants: out.variants,
+      iframeVariants: out.iframeVariants,
+      contentSteeringUri: out.contentSteeringUri,
+      contentSteeringPathwayId: out.contentSteeringPathwayId,
+    };
+  });
+
+  expect(parsed.variants).toHaveLength(1);
+  expect(parsed.variants[0]).toMatchObject({ url: 'https://example.test/hls/v360.m3u8', height: 360, pathwayId: 'cdn-a' });
+  expect(parsed.iframeVariants).toEqual([
+    expect.objectContaining({ id: 'iframe-0', url: 'https://example.test/hls/iframes-360.m3u8', height: 360, bandwidth: 120000, codecs: 'avc1.42c01f', pathwayId: 'cdn-a', iframeOnly: true }),
+  ]);
+  expect(parsed.contentSteeringUri).toBe('https://example.test/hls/steering.json');
+  expect(parsed.contentSteeringPathwayId).toBe('cdn-a');
+});
+
+test('native HLS content steering prefers steered pathway without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  const mediaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/steering.json', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ VERSION: 1, TTL: 30, 'PATHWAY-PRIORITY': ['cdn-b', 'cdn-a'] }),
+    });
+  });
+  await page.route('**/steered-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-CONTENT-STEERING:SERVER-URI="/steering.json",PATHWAY-ID="cdn-a"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-a"',
+        '/cdn-a-media.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-b"',
+        '/cdn-b-media.m3u8',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/cdn-*-media.m3u8', async route => {
+    mediaRequests.push(route.request().url());
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: await resp.text() });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/steered-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.contentSteeringPathwayId).toBe('cdn-b');
+  expect(stats.contentSteeringPriority).toEqual(['cdn-b', 'cdn-a']);
+  expect(stats.contentSteeringRequestCount).toBe(1);
+  expect(stats.lastContentSteeringError).toBe('');
+  expect(stats.activeVariant).toMatchObject({ pathwayId: 'cdn-b' });
+  expect(mediaRequests.some(url => url.includes('/cdn-b-media.m3u8'))).toBe(true);
+  expect(mediaRequests.some(url => url.includes('/cdn-a-media.m3u8'))).toBe(false);
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS content steering failure keeps original pathway native', async ({ page }) => {
+  const shakaRequests = [];
+  const mediaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/steering-missing.json', route => {
+    route.fulfill({ status: 404, body: 'missing steering' });
+  });
+  await page.route('**/steering-fail-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-CONTENT-STEERING:SERVER-URI="/steering-missing.json",PATHWAY-ID="cdn-a"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-a"',
+        '/fail-cdn-a-media.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-b"',
+        '/fail-cdn-b-media.m3u8',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/fail-cdn-*-media.m3u8', async route => {
+    mediaRequests.push(route.request().url());
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: await resp.text() });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/steering-fail-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.contentSteeringPathwayId).toBe('cdn-a');
+  expect(stats.contentSteeringRequestCount).toBe(1);
+  expect(stats.lastContentSteeringError).toBe('content-steering-http-404');
+  expect(stats.fallbackReason).toBe('');
+  expect(mediaRequests.some(url => url.includes('/fail-cdn-a-media.m3u8'))).toBe(true);
+  expect(mediaRequests.some(url => url.includes('/fail-cdn-b-media.m3u8'))).toBe(false);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS content steering reload can switch pathway on live refresh', async ({ page }) => {
+  const shakaRequests = [];
+  const mediaRequests = [];
+  let steeringRequests = 0;
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/steering-live.json', route => {
+    steeringRequests++;
+    route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        VERSION: 1,
+        TTL: 0,
+        'RELOAD-URI': '/steering-live.json',
+        'PATHWAY-PRIORITY': steeringRequests === 1 ? ['cdn-a', 'cdn-b'] : ['cdn-b', 'cdn-a'],
+      }),
+    });
+  });
+  await page.route('**/steering-live-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-CONTENT-STEERING:SERVER-URI="/steering-live.json",PATHWAY-ID="cdn-a"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-a"',
+        '/live-cdn-a-media.m3u8',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2",PATHWAY-ID="cdn-b"',
+        '/live-cdn-b-media.m3u8',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/live-cdn-*-media.m3u8', async route => {
+    mediaRequests.push(route.request().url());
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=live');
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: await resp.text() });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/steering-live-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await expect.poll(() => page.evaluate(() => window.__player.getStats().contentSteeringPathwayId)).toBe('cdn-a');
+
+  await page.evaluate(() => window.__engine._provider._refreshMediaPlaylist('test-refresh'));
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.contentSteeringPathwayId).toBe('cdn-b');
+  expect(stats.contentSteeringRequestCount).toBe(2);
+  expect(stats.contentSteeringSwitchCount).toBeGreaterThan(0);
+  expect(stats.lastSwitchReason).toBe('content-steering');
+  expect(stats.fallbackReason).toBe('');
+  expect(mediaRequests.some(url => url.includes('/live-cdn-a-media.m3u8'))).toBe(true);
+  expect(mediaRequests.some(url => url.includes('/live-cdn-b-media.m3u8'))).toBe(true);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS lazily loads I-frame playlist and returns preview segment metadata', async ({ page }) => {
+  const shakaRequests = [];
+  const iframeRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/iframe-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2"',
+        '/iframe-media.m3u8',
+        '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=120000,RESOLUTION=640x360,CODECS="avc1.42c01f",URI="/iframe-only.m3u8"',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/iframe-media.m3u8', async route => {
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: await resp.text() });
+  });
+  await page.route('**/iframe-only.m3u8', route => {
+    iframeRequests.push(route.request().url());
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-VERSION:7',
+        '#EXT-X-TARGETDURATION:2',
+        '#EXT-X-MAP:URI="/iframe-init.mp4",BYTERANGE="100@0"',
+        '#EXTINF:2.000,',
+        '#EXT-X-BYTERANGE:200@100',
+        '/iframe-segments.mp4',
+        '#EXTINF:2.000,',
+        '#EXT-X-BYTERANGE:200@300',
+        '/iframe-segments.mp4',
+        '#EXT-X-ENDLIST',
+      ].join('\n'),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/iframe-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  const before = await page.evaluate(() => ({
+    tracks: window.__player.getIFrameTracks(),
+    stats: window.__player.getStats(),
+    variants: window.__player.getVariantTracks(),
+  }));
+  expect(before.tracks).toEqual([
+    expect.objectContaining({ id: 'iframe-0', height: 360, iframeOnly: true, loaded: false }),
+  ]);
+  expect(before.stats.iframePlaylistRequestCount).toBe(0);
+  expect(before.variants).toHaveLength(1);
+
+  const preview = await page.evaluate(() => window.__player.getIFramePreview(2.5));
+  const origin = await page.evaluate(() => location.origin);
+  const after = await page.evaluate(() => ({
+    tracks: window.__player.getIFrameTracks(),
+    stats: window.__player.getStats(),
+  }));
+
+  expect(preview).toMatchObject({
+    track: expect.objectContaining({ id: 'iframe-0', height: 360, iframeOnly: true }),
+    start: 2,
+    end: 4,
+    url: origin + '/iframe-segments.mp4',
+    range: { start: 300, end: 499 },
+  });
+  expect(after.tracks[0]).toMatchObject({ loaded: true });
+  expect(after.stats.iframePlaylistRequestCount).toBe(1);
+  expect(after.stats.iframeSegmentCount).toBe(2);
+  expect(after.stats.lastIFramePlaylistError).toBe('');
+  expect(iframeRequests).toHaveLength(1);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS bad I-frame playlist is non-fatal and keeps playback native', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/bad-iframe-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2"',
+        '/bad-iframe-media.m3u8',
+        '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=120000,RESOLUTION=640x360,CODECS="avc1.42c01f",URI="/bad-iframe-only.m3u8"',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/bad-iframe-media.m3u8', async route => {
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: await resp.text() });
+  });
+  await page.route('**/bad-iframe-only.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:2\n#EXT-X-ENDLIST',
+    });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    return engine.init().then(() => engine.load('/bad-iframe-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  const preview = await page.evaluate(() => window.__player.getIFramePreview(1));
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(preview).toBeNull();
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.fallbackReason).toBe('');
+  expect(stats.iframePlaylistRequestCount).toBe(1);
+  expect(stats.lastIFramePlaylistError).toBe('hls-iframe-playlist-empty');
+  expect(shakaRequests).toHaveLength(0);
 });
 
 test('native HLS fixture plays through MSE without Shaka fallback', async ({ page }) => {
@@ -3337,6 +6593,539 @@ test('native HLS fixture plays through MSE without Shaka fallback', async ({ pag
   expect(stats.mediaFetchCompletedCount).toBeLessThanOrEqual(2);
   expect(stats.schedulerDrainCount).toBe(stats.mediaFetchCompletedCount);
   expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS low-latency playlist fetches and appends partial segments without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  const partialRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**llpart=0', route => {
+    partialRequests.push(route.request().url());
+    route.continue();
+  });
+  await page.route('**/ll-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-CONTENT-STEERING:SERVER-URI="/steering.json",PATHWAY-ID="cdn-a"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2"',
+        '/ll-media.m3u8',
+        '#EXT-X-I-FRAME-STREAM-INF:BANDWIDTH=120000,RESOLUTION=640x360,CODECS="avc1.42c01f",URI="/iframes-360.m3u8"',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/ll-media.m3u8', async route => {
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    let text = await resp.text();
+    const firstRange = text.match(/#EXT-X-BYTERANGE:([^\n]+)\n(\/api\/stream\/PLAYERTEST1\/fmt\/v360)/);
+    const partRange = firstRange ? firstRange[1] : '';
+    const partUrl = firstRange ? firstRange[2] + '?llpart=0' : 'seg-0.part.m4s';
+    text = text.replace('#EXTM3U', [
+      '#EXTM3U',
+      '#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12.0,HOLD-BACK=6.0,PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES',
+      '#EXT-X-PART-INF:PART-TARGET=0.33334',
+      '#EXT-X-SKIP:SKIPPED-SEGMENTS=2',
+    ].join('\n'));
+    text = text.replace('#EXTINF:', [
+      `#EXT-X-PART:DURATION=0.33334,URI="${partUrl}",BYTERANGE="${partRange}",INDEPENDENT=YES`,
+      '#EXTINF:',
+    ].join('\n'));
+    text = text.replace('#EXT-X-ENDLIST', [
+      '#EXT-X-PRELOAD-HINT:TYPE=PART,URI="next.part.m4s"',
+      '#EXT-X-RENDITION-REPORT:URI="low.m3u8",LAST-MSN=1,LAST-PART=1',
+    ].join('\n'));
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: text });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/ll-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const state = await page.evaluate(() => ({
+    stats: window.__player.getStats(),
+    tracks: window.__player.getVariantTracks(),
+  }));
+  expect(state.stats.provider).toBe('native-hls');
+  expect(state.stats.lowLatencyPlaylist).toBe(true);
+  expect(state.stats.partialSegmentCount).toBe(1);
+  expect(state.stats.partialSegmentRequestCount).toBeGreaterThan(0);
+  expect(state.stats.partialSegmentAppendCount).toBeGreaterThan(0);
+  expect(state.stats.partialSegmentFallbackCount).toBe(0);
+  expect(state.stats.preloadHintCount).toBe(1);
+  expect(state.stats.renditionReportCount).toBe(1);
+  expect(state.stats.skippedSegmentCount).toBe(2);
+  expect(state.stats.iframeVariantCount).toBe(1);
+  expect(state.stats.contentSteeringUri).toBe('/steering.json');
+  expect(state.stats.manifestCompatibilityWarnings).toContain('hls-delta-update-skipped-segments');
+  expect(state.stats.fallbackReason).toBe('');
+  expect(state.tracks).toHaveLength(1);
+  expect(state.tracks[0]).toMatchObject({ height: 360, selectable: true });
+  expect(partialRequests.length).toBeGreaterThan(0);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS falls back to full segment when a low-latency part is missing', async ({ page }) => {
+  const shakaRequests = [];
+  const partialRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**llpart=missing', route => {
+    partialRequests.push(route.request().url());
+    route.fulfill({ status: 404, body: 'missing part' });
+  });
+  await page.route('**/ll-missing-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2"',
+        '/ll-missing-media.m3u8',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/ll-missing-media.m3u8', async route => {
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    let text = await resp.text();
+    const firstRange = text.match(/#EXT-X-BYTERANGE:([^\n]+)\n(\/api\/stream\/PLAYERTEST1\/fmt\/v360)/);
+    const partRange = firstRange ? firstRange[1] : '';
+    text = text.replace('#EXTM3U', [
+      '#EXTM3U',
+      '#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12.0,HOLD-BACK=6.0,PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES',
+      '#EXT-X-PART-INF:PART-TARGET=0.33334',
+    ].join('\n'));
+    text = text.replace('#EXTINF:', [
+      `#EXT-X-PART:DURATION=0.33334,URI="/missing.part.m4s?llpart=missing",BYTERANGE="${partRange}",INDEPENDENT=YES`,
+      '#EXTINF:',
+    ].join('\n'));
+    text = text.replace('#EXT-X-ENDLIST', '');
+    route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: text });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/ll-missing-master.m3u8'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.lowLatencyPlaylist).toBe(true);
+  expect(stats.partialSegmentRequestCount).toBeGreaterThan(0);
+  expect(stats.partialSegmentFallbackCount).toBeGreaterThan(0);
+  expect(stats.partialSegmentAppendCount).toBe(0);
+  expect(stats.fallbackReason).toBe('');
+  expect(partialRequests.length).toBeGreaterThan(0);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS applies EXT-X-START unless load startTime is explicit', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  await page.route('**/start-master.m3u8', route => {
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: [
+        '#EXTM3U',
+        '#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360,CODECS="avc1.42c01f,mp4a.40.2"',
+        '/start-media.m3u8',
+      ].join('\n'),
+    });
+  });
+  await page.route('**/start-media.m3u8', async route => {
+    const url = new URL(route.request().url());
+    const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
+    const text = await resp.text();
+    route.fulfill({
+      status: 200,
+      contentType: 'application/vnd.apple.mpegurl',
+      body: text.replace('#EXTM3U', '#EXTM3U\n#EXT-X-START:TIME-OFFSET=-2,PRECISE=YES'),
+    });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    const player = engine.getPlayer();
+    window.__engine = engine;
+    window.__player = player;
+    await engine.init();
+    await player.load('/start-master.m3u8');
+    const manifestStart = { currentTime: video.currentTime, stats: player.getStats() };
+    await player.unload();
+    await player.load('/start-master.m3u8', 1);
+    return {
+      manifestStart,
+      explicitStart: { currentTime: video.currentTime, stats: player.getStats() },
+    };
+  });
+
+  expect(state.manifestStart.stats.provider).toBe('native-hls');
+  expect(state.manifestStart.stats.manifestStartTime).toBeCloseTo(4, 1);
+  expect(state.manifestStart.currentTime).toBeCloseTo(4, 1);
+  expect(state.explicitStart.currentTime).toBeCloseTo(1, 1);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS AES-128 fMP4 fixture decrypts without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=aes'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.encryptedSegmentCount).toBeGreaterThan(0);
+  expect(stats.hlsKeyFetchCount).toBe(1);
+  expect(stats.hlsKeyCacheHitCount).toBeGreaterThanOrEqual(0);
+  expect(stats.lastDecryptionError).toBe('');
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS AES-128 key rotation decrypts without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 4, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=aes-rotate'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 3, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.encryptedSegmentCount).toBeGreaterThanOrEqual(2);
+  expect(stats.hlsKeyFetchCount).toBe(2);
+  expect(stats.lastDecryptionError).toBe('');
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS live fixture starts near live edge without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=live'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').buffered.length > 0, null, { timeout: 10_000 });
+
+  const state = await page.evaluate(() => {
+    window.__player.seekToLiveEdge();
+    return {
+      stats: window.__player.getStats(),
+      currentTime: document.getElementById('player').currentTime,
+    };
+  });
+  expect(state.stats.provider).toBe('native-hls');
+  expect(state.stats.isLive).toBe(true);
+  expect(state.stats.liveWindowEnd).toBeGreaterThan(state.stats.liveWindowStart);
+  expect(state.stats.playlistMediaSequence).toBe(0);
+  expect(state.currentTime).toBeGreaterThanOrEqual(state.stats.liveWindowStart);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS sliding live fixture advances its playlist window', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const windows = await page.evaluate(async () => {
+    const key = 'hls' + Date.now() + Math.random();
+    const firstText = await fetch('/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=sliding&fixtureLiveKey=' + key).then(resp => resp.text());
+    const secondText = await fetch('/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=sliding&fixtureLiveKey=' + key).then(resp => resp.text());
+    const first = window.NativeDashProviderForTest.parseHlsPlaylist(firstText, location.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8');
+    const second = window.NativeDashProviderForTest.parseHlsPlaylist(secondText, location.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8');
+    return [first, second].map(item => ({
+      mediaSequence: item.mediaSequence,
+      liveWindow: { start: item.segments[0].start, end: item.segments[item.segments.length - 1].end },
+      endList: item.endList,
+    }));
+  });
+
+  expect(windows[0].endList).toBe(false);
+  expect(windows[1].mediaSequence).toBeGreaterThanOrEqual(windows[0].mediaSequence);
+  expect(windows[1].liveWindow.start).toBeGreaterThanOrEqual(windows[0].liveWindow.start);
+  expect(windows[1].liveWindow.end).toBeGreaterThanOrEqual(windows[0].liveWindow.end);
+});
+
+test('native HLS discontinuity fixture plays across boundary without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  const logs = [];
+  await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
+    shakaRequests.push(route.request().url());
+    route.abort();
+  });
+  page.on('console', msg => logs.push(msg.text()));
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 4, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=live-discontinuity'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => document.getElementById('player').play());
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 3, null, { timeout: 12_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.isLive).toBe(true);
+  expect(stats.discontinuitySequence).toBe(3);
+  expect(stats.discontinuityCount).toBeGreaterThan(0);
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(0);
+  expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
+});
+
+test('native HLS MPEG-TS fixture uses lazy Shaka transmuxer without fallback', async ({ page }) => {
+  const shakaRequests = [];
+  page.on('request', request => {
+    if (request.url().includes('/vendor/shaka/shaka-player.compiled.js')) shakaRequests.push(request.url());
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=ts'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => { document.getElementById('player').play().catch(() => {}); });
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.mode).toBe('hls');
+  expect(stats.transmuxerProvider).toBe('shaka-ts');
+  expect(stats.transmuxedSegmentCount).toBeGreaterThan(0);
+  expect(stats.transmuxedVideoSegmentCount).toBeGreaterThan(0);
+  expect(stats.transmuxerLoadMs).toBeGreaterThan(0);
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(1);
+});
+
+test('native HLS AES-128 MPEG-TS fixture decrypts before transmuxing without fallback', async ({ page }) => {
+  const shakaRequests = [];
+  page.on('request', request => {
+    if (request.url().includes('/vendor/shaka/shaka-player.compiled.js')) shakaRequests.push(request.url());
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=ts-aes'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => { document.getElementById('player').play().catch(() => {}); });
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.encryptedSegmentCount).toBeGreaterThan(0);
+  expect(stats.transmuxerProvider).toBe('shaka-ts');
+  expect(stats.transmuxedVideoSegmentCount).toBeGreaterThan(0);
+  expect(stats.lastDecryptionError).toBe('');
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(1);
+});
+
+test('native HLS MPEG-TS muxed audio/video plays without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  page.on('request', request => {
+    if (request.url().includes('/vendor/shaka/shaka-player.compiled.js')) shakaRequests.push(request.url());
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 1 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=ts-muxed'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => { document.getElementById('player').play().catch(() => {}); });
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.muxedTsAudio).toBe(true);
+  expect(stats.transmuxerProvider).toBe('shaka-ts');
+  expect(stats.transmuxedVideoSegmentCount).toBeGreaterThan(0);
+  expect(stats.transmuxedAudioSegmentCount).toBeGreaterThan(0);
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(1);
+});
+
+test('native HLS MPEG-TS audio group plays without Shaka fallback', async ({ page }) => {
+  const shakaRequests = [];
+  page.on('request', request => {
+    if (request.url().includes('/vendor/shaka/shaka-player.compiled.js')) shakaRequests.push(request.url());
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({ streaming: { bufferingGoal: 2, startupBufferGoal: 1, maxConcurrentRequests: 2 } });
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=ts-groups'));
+  });
+
+  await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
+  await page.evaluate(() => { document.getElementById('player').play().catch(() => {}); });
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+
+  const stats = await page.evaluate(() => window.__player.getStats());
+  expect(stats.provider).toBe('native-hls');
+  expect(stats.muxedTsAudio).toBe(false);
+  expect(stats.activeAudio).toMatchObject({ language: 'en', label: 'English' });
+  expect(stats.transmuxerProvider).toBe('shaka-ts');
+  expect(stats.transmuxedVideoSegmentCount).toBeGreaterThan(0);
+  expect(stats.transmuxedAudioSegmentCount).toBeGreaterThan(0);
+  expect(stats.fallbackReason).toBe('');
+  expect(shakaRequests).toHaveLength(1);
 });
 
 test('native HLS manual quality selection updates active variant without Shaka', async ({ page }) => {
@@ -3546,7 +7335,7 @@ test('unsupported HLS video variants fall back with explicit reason', async ({ p
   expect(shakaRequests.length).toBe(1);
 });
 
-test('encrypted HLS falls back with explicit reason', async ({ page }) => {
+test('unsupported encrypted HLS falls back with explicit reason', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/api/stream/HLSUNSUP001/dash.mpd**', route => {
     route.fulfill({
@@ -3559,7 +7348,7 @@ test('encrypted HLS falls back with explicit reason', async ({ page }) => {
     route.fulfill({
       status: 200,
       contentType: 'application/vnd.apple.mpegurl',
-      body: '#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="/key"\n#EXTINF:2,\nseg.m4s\n#EXT-X-ENDLIST',
+      body: '#EXTM3U\n#EXT-X-KEY:METHOD=SAMPLE-AES,URI="/key"\n#EXTINF:2,\nseg.m4s\n#EXT-X-ENDLIST',
     });
   });
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -3590,7 +7379,7 @@ test('encrypted HLS falls back with explicit reason', async ({ page }) => {
 
   expect(shakaRequests).toHaveLength(1);
   expect(stats.provider).toBe('shaka-fallback');
-  expect(stats.fallbackReason).toBe('hls-encrypted-unsupported');
+  expect(stats.fallbackReason).toBe('hls-sample-aes-unsupported');
 });
 
 test('supported HLS uses native URL provider and live-like stats', async ({ page }) => {

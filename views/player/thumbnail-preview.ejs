@@ -23,8 +23,22 @@
         var rafId = 0;
         var pendingX = 0, pendingTime = 0;
         var showTimer = 0;
-        // Resolved once during _loadStoryboard: maps sheet index → URL
+        var previewSource = 'none';
+        var storyboardLoaded = false;
+        var storyboardFailed = false;
+        var iframeRequestId = 0;
+        var iframePreviewPending = false;
+        var lastIframePreviewKey = '';
+        var lastIframePreview = null;
+        // Resolved once during _loadStoryboard: maps sheet index -> URL
         var sheetUrl = function () { return ''; };
+
+        function setPreviewSource(source) {
+          previewSource = source || 'none';
+          tooltip.dataset.previewSource = previewSource;
+          window._seekPreviewSource = previewSource;
+        }
+        setPreviewSource('none');
 
         function preloadSheet(idx) {
           if (sheetImages[idx]) return;
@@ -34,6 +48,50 @@
           img.addEventListener('error', function () { delete sheetImages[idx]; }, { once: true });
           img.src = url;
           sheetImages[idx] = img;
+        }
+
+        function hasIFramePreviewSupport() {
+          if (!player || !player.getIFramePreview) return false;
+          if (!player.getIFrameTracks) return true;
+          var tracks = safePlayerCall(function () { return player.getIFrameTracks(); }) || [];
+          return tracks.length > 0;
+        }
+
+        function updateIFrameTooltipMetadata(preview) {
+          if (!preview) {
+            delete tooltip.dataset.previewStart;
+            delete tooltip.dataset.previewEnd;
+            delete tooltip.dataset.previewUrl;
+            delete tooltip.dataset.previewRange;
+            return;
+          }
+          tooltip.dataset.previewStart = String(preview.start || 0);
+          tooltip.dataset.previewEnd = String(preview.end || preview.start || 0);
+          tooltip.dataset.previewUrl = preview.url || '';
+          tooltip.dataset.previewRange = preview.range ? (preview.range.start + '-' + preview.range.end) : '';
+        }
+
+        function requestIFramePreview(time) {
+          if (!hasIFramePreviewSupport()) return;
+          var key = String(Math.max(0, Math.round((Number(time) || 0) * 2) / 2));
+          if (iframePreviewPending && key === lastIframePreviewKey) return;
+          if (lastIframePreview && key === lastIframePreviewKey) return;
+          lastIframePreviewKey = key;
+          iframePreviewPending = true;
+          var requestId = ++iframeRequestId;
+          player.getIFramePreview(time).then(function (preview) {
+            if (requestId !== iframeRequestId) return;
+            iframePreviewPending = false;
+            lastIframePreview = preview || null;
+            updateIFrameTooltipMetadata(lastIframePreview);
+            setPreviewSource(lastIframePreview ? 'iframe' : 'none');
+          }).catch(function () {
+            if (requestId !== iframeRequestId) return;
+            iframePreviewPending = false;
+            lastIframePreview = null;
+            updateIFrameTooltipMetadata(null);
+            setPreviewSource('none');
+          });
         }
 
         function renderFrame() {
@@ -62,8 +120,11 @@
           }
           if (!sbData) {
             thumbImg.style.display = 'none';
+            if (storyboardLoaded || storyboardFailed) requestIFramePreview(pendingTime);
             return;
           }
+          setPreviewSource('storyboard');
+          updateIFrameTooltipMetadata(null);
           thumbImg.style.display = '';
           var timeBase = isLive ? getLiveRange().start : 0;
           var frameIdx = Math.floor((pendingTime - timeBase) / sbData.interval);
@@ -127,11 +188,18 @@
         });
 
         window._loadStoryboard = function () {
-          fetch('/api/stream/<%= video.videoId %>/storyboard?token=' + streamToken)
+          return fetch('/api/stream/<%= video.videoId %>/storyboard?token=' + streamToken)
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (data) {
-              if (!data) return;
+              storyboardLoaded = true;
+              if (!data) {
+                storyboardFailed = true;
+                setPreviewSource('none');
+                return null;
+              }
               sbData = data;
+              storyboardFailed = false;
+              setPreviewSource('storyboard');
               sheetUrl = data.live
                 ? function (idx) { return data.urlTemplate + idx + '?token=' + streamToken; }
                 : function (idx) { return idx < data.sheets.length ? data.sheets[idx] + '?token=' + streamToken : ''; };
@@ -147,7 +215,13 @@
               thumbImg.style.backgroundSize = bgSize;
               tooltip.style.width = dw + 'px';
               preloadSheet(0);
+              return data;
             })
-            .catch(function () {});
+            .catch(function () {
+              storyboardLoaded = true;
+              storyboardFailed = true;
+              setPreviewSource('none');
+              return null;
+            });
         };
       })();

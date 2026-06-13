@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import crypto from 'crypto';
 
 const FIXTURE_VIDEO_ID = 'PLAYERTEST1';
 const FIXTURE_DIR = path.join(os.tmpdir(), 'my-youtube-player-fixtures');
@@ -13,6 +14,10 @@ const FIXTURE_VIDEO_REPS = [
 ];
 const fixtureFaultCounts = new Map<string, number>();
 const fixtureLiveSeq = new Map<string, number>();
+const FIXTURE_HLS_KEYS = [
+  Buffer.from('00112233445566778899aabbccddeeff', 'hex'),
+  Buffer.from('ffeeddccbbaa99887766554433221100', 'hex'),
+];
 
 type BoxRange = { start: number; end: number };
 type FixtureFormat = {
@@ -40,43 +45,122 @@ function ensureFixtureFiles() {
   fs.mkdirSync(FIXTURE_DIR, { recursive: true });
   const audioPath = path.join(FIXTURE_DIR, 'audio.mp4');
   const videoPaths = FIXTURE_VIDEO_REPS.map(rep => path.join(FIXTURE_DIR, `${rep.formatId}.mp4`));
-  if (fs.existsSync(audioPath) && videoPaths.every(filePath => fs.existsSync(filePath))) return;
+  const videoMainPaths = FIXTURE_VIDEO_REPS.map(rep => path.join(FIXTURE_DIR, `${rep.formatId}-main.mp4`));
+  const tsPaths = FIXTURE_VIDEO_REPS.map(rep => path.join(FIXTURE_DIR, `${rep.formatId}.ts`));
+  const muxedTsPaths = FIXTURE_VIDEO_REPS.map(rep => path.join(FIXTURE_DIR, `${rep.formatId}-muxed.ts`));
+  const audioTsPath = path.join(FIXTURE_DIR, 'audio.ts');
+  if (
+    fs.existsSync(audioPath)
+    && videoPaths.every(filePath => fs.existsSync(filePath))
+    && videoMainPaths.every(filePath => fs.existsSync(filePath))
+    && tsPaths.every(filePath => fs.existsSync(filePath))
+    && muxedTsPaths.every(filePath => fs.existsSync(filePath))
+    && fs.existsSync(audioTsPath)
+  ) return;
 
-  execFileSync('ffmpeg', [
-    '-y',
-    '-f', 'lavfi',
-    '-i', `testsrc=size=${FIXTURE_VIDEO_REPS[0].width}x${FIXTURE_VIDEO_REPS[0].height}:rate=24:duration=${FIXTURE_DURATION}`,
-    '-f', 'lavfi',
-    '-i', `sine=frequency=440:duration=${FIXTURE_DURATION}`,
-    ...FIXTURE_VIDEO_REPS.flatMap((rep, index) => [
-      '-map', '0:v',
-      '-an',
-      '-vf', `scale=${rep.width}:${rep.height}`,
-      '-c:v', 'libx264',
-      '-preset', 'ultrafast',
-      '-profile:v', 'baseline',
-      '-level:v', '3.1',
-      '-pix_fmt', 'yuv420p',
-      '-b:v', rep.bitrate,
-      '-maxrate', rep.bitrate,
-      '-bufsize', rep.bitrate,
-      '-g', '24',
-      '-keyint_min', '24',
-      '-sc_threshold', '0',
+  if (!fs.existsSync(audioPath) || !videoPaths.every(filePath => fs.existsSync(filePath))) {
+    execFileSync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi',
+      '-i', `testsrc=size=${FIXTURE_VIDEO_REPS[0].width}x${FIXTURE_VIDEO_REPS[0].height}:rate=24:duration=${FIXTURE_DURATION}`,
+      '-f', 'lavfi',
+      '-i', `sine=frequency=440:duration=${FIXTURE_DURATION}`,
+      ...FIXTURE_VIDEO_REPS.flatMap((rep, index) => [
+        '-map', '0:v',
+        '-an',
+        '-vf', `scale=${rep.width}:${rep.height}`,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-profile:v', 'baseline',
+        '-level:v', '3.1',
+        '-pix_fmt', 'yuv420p',
+        '-b:v', rep.bitrate,
+        '-maxrate', rep.bitrate,
+        '-bufsize', rep.bitrate,
+        '-g', '24',
+        '-keyint_min', '24',
+        '-sc_threshold', '0',
+        '-movflags', '+faststart+dash+frag_keyframe+global_sidx',
+        videoPaths[index],
+      ]),
+      '-map', '1:a',
+      '-vn',
+      '-c:a', 'aac',
+      '-b:a', '64k',
       '-movflags', '+faststart+dash+frag_keyframe+global_sidx',
-      videoPaths[index],
-    ]),
-    '-map', '1:a',
-    '-vn',
-    '-c:a', 'aac',
-    '-b:a', '64k',
-    '-movflags', '+faststart+dash+frag_keyframe+global_sidx',
-    audioPath,
-  ], { stdio: 'ignore' });
+      audioPath,
+    ], { stdio: 'ignore' });
+  }
+
+  if (!videoMainPaths.every(filePath => fs.existsSync(filePath))) {
+    execFileSync('ffmpeg', [
+      '-y',
+      '-f', 'lavfi',
+      '-i', `testsrc=size=${FIXTURE_VIDEO_REPS[0].width}x${FIXTURE_VIDEO_REPS[0].height}:rate=24:duration=${FIXTURE_DURATION}`,
+      ...FIXTURE_VIDEO_REPS.flatMap((rep, index) => [
+        '-map', '0:v',
+        '-an',
+        '-vf', `scale=${rep.width}:${rep.height}`,
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-profile:v', 'main',
+        '-level:v', '3.1',
+        '-pix_fmt', 'yuv420p',
+        '-b:v', rep.bitrate,
+        '-maxrate', rep.bitrate,
+        '-bufsize', rep.bitrate,
+        '-g', '24',
+        '-keyint_min', '24',
+        '-sc_threshold', '0',
+        '-movflags', '+faststart+dash+frag_keyframe+global_sidx',
+        videoMainPaths[index],
+      ]),
+    ], { stdio: 'ignore' });
+  }
+
+  FIXTURE_VIDEO_REPS.forEach((_rep, index) => {
+    if (fs.existsSync(tsPaths[index])) return;
+    execFileSync('ffmpeg', [
+      '-y',
+      '-i', videoPaths[index],
+      '-an',
+      '-c:v', 'copy',
+      '-bsf:v', 'h264_mp4toannexb',
+      '-f', 'mpegts',
+      tsPaths[index],
+    ], { stdio: 'ignore' });
+  });
+
+  if (!fs.existsSync(audioTsPath)) {
+    execFileSync('ffmpeg', [
+      '-y',
+      '-i', audioPath,
+      '-vn',
+      '-c:a', 'copy',
+      '-f', 'mpegts',
+      audioTsPath,
+    ], { stdio: 'ignore' });
+  }
+
+  FIXTURE_VIDEO_REPS.forEach((_rep, index) => {
+    if (fs.existsSync(muxedTsPaths[index])) return;
+    execFileSync('ffmpeg', [
+      '-y',
+      '-i', videoPaths[index],
+      '-i', audioPath,
+      '-map', '0:v',
+      '-map', '1:a',
+      '-c:v', 'copy',
+      '-bsf:v', 'h264_mp4toannexb',
+      '-c:a', 'copy',
+      '-f', 'mpegts',
+      muxedTsPaths[index],
+    ], { stdio: 'ignore' });
+  });
 }
 
 function fixtureVideoFormats(): Record<string, FixtureFormat> {
-  return Object.fromEntries(FIXTURE_VIDEO_REPS.map(rep => {
+  const baseline = FIXTURE_VIDEO_REPS.map(rep => {
     const filePath = path.join(FIXTURE_DIR, `${rep.formatId}.mp4`);
     return [rep.formatId, {
       formatId: rep.formatId,
@@ -87,8 +171,23 @@ function fixtureVideoFormats(): Record<string, FixtureFormat> {
       codecs: 'avc1.42c01f',
       width: rep.width,
       height: rep.height,
-    }];
-  }));
+    }] as const;
+  });
+  const main = FIXTURE_VIDEO_REPS.map(rep => {
+    const formatId = `${rep.formatId}-main`;
+    const filePath = path.join(FIXTURE_DIR, `${formatId}.mp4`);
+    return [formatId, {
+      formatId,
+      filePath,
+      contentType: 'video/mp4',
+      ...rangesFor(filePath),
+      bandwidth: rep.bandwidth,
+      codecs: 'avc1.4d401f',
+      width: rep.width,
+      height: rep.height,
+    }] as const;
+  });
+  return Object.fromEntries([...baseline, ...main]);
 }
 
 function getFixtureFormats(): Record<string, FixtureFormat> {
@@ -119,6 +218,7 @@ function buildFixtureMPD(videoId: string, query: Record<string, unknown> = {}) {
   const faultQuery = fixtureFaultQuery(query);
   const templateMode = firstQueryValue(query.fixtureTemplate);
   const segmentListMode = firstQueryValue(query.fixtureSegmentList);
+  if (firstQueryValue(query.fixturePeriodCodec)) return buildFixturePeriodCodecMPD(videoId, videos, audio);
   if (firstQueryValue(query.fixtureLive)) return buildFixtureLiveMPD(videoId, videos, audio, query);
   if (templateMode) return buildFixtureTemplateMPD(videoId, videos, audio, templateMode);
   if (segmentListMode) return buildFixtureSegmentListMPD(videoId, videos, audio, segmentListMode);
@@ -144,20 +244,40 @@ ${videos.map(video => `<Representation id="${video.formatId}" bandwidth="${video
 function buildFixtureHlsMaster(videoId: string, query: Record<string, unknown> = {}) {
   const formats = getFixtureFormats();
   const videos = FIXTURE_VIDEO_REPS.map(rep => formats[rep.formatId]);
-  const mediaGroups = firstQueryValue(query.fixtureHls) === 'groups';
-  const hlsQuery = mediaGroups ? 'fixtureHls=groups' : 'fixtureHls=1';
+  const fixtureMode = firstQueryValue(query.fixtureHls);
+  const mediaGroups = fixtureMode === 'groups' || fixtureMode === 'ts-groups';
+  const tsMode = fixtureMode === 'ts' || fixtureMode === 'ts-muxed' || fixtureMode === 'ts-groups' || fixtureMode === 'ts-aes';
+  const muxedTsMode = fixtureMode === 'ts-muxed';
+  const hlsQuery = hlsFixtureQuery(query, tsMode ? fixtureMode : (mediaGroups ? 'groups' : (fixtureMode || '1')));
   const subtitleData = encodeURIComponent('WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nNative HLS captions\n');
   return `#EXTM3U
 #EXT-X-VERSION:7
 ${mediaGroups ? `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-main",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="/api/stream/${videoId}/hls/a64.m3u8?${hlsQuery}",CODECS="mp4a.40.2"
 #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English captions",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="data:text/vtt,${subtitleData}"` : ''}
-${videos.map(video => `#EXT-X-STREAM-INF:BANDWIDTH=${video.bandwidth + (mediaGroups ? formats.a64.bandwidth : 0)},RESOLUTION=${video.width}x${video.height},CODECS="${mediaGroups ? `${video.codecs},mp4a.40.2` : video.codecs}"${mediaGroups ? ',AUDIO="audio-main",SUBTITLES="subs"' : ''}
+${videos.map(video => `#EXT-X-STREAM-INF:BANDWIDTH=${video.bandwidth + (mediaGroups || muxedTsMode ? formats.a64.bandwidth : 0)},RESOLUTION=${video.width}x${video.height},CODECS="${mediaGroups || muxedTsMode ? `${video.codecs},mp4a.40.2` : video.codecs}"${mediaGroups ? ',AUDIO="audio-main",SUBTITLES="subs"' : ''}
 /api/stream/${videoId}/hls/${video.formatId}.m3u8?${hlsQuery}`).join('\n')}`;
 }
 
-function buildFixtureHlsMedia(videoId: string, formatId: string) {
+function buildFixtureHlsMedia(videoId: string, formatId: string, query: Record<string, unknown> = {}) {
   const fmt = getFixtureFormats()[formatId];
   if (!fmt) return '';
+  const fixtureMode = firstQueryValue(query.fixtureHls);
+  if (fixtureMode === 'live' || fixtureMode === 'sliding' || fixtureMode === 'live-discontinuity') {
+    return buildFixtureLiveHlsMedia(videoId, fmt, query, fixtureMode);
+  }
+  if (fixtureMode === 'aes' || fixtureMode === 'aes-rotate' || fixtureMode === 'ts-aes') {
+    return buildFixtureEncryptedHlsMedia(videoId, fmt, fixtureMode);
+  }
+  if (fixtureMode === 'ts' || fixtureMode === 'ts-muxed' || fixtureMode === 'ts-groups') {
+    const tsKind = formatId === 'a64' ? 'audio' : (fixtureMode === 'ts-muxed' ? 'muxed' : 'video');
+    return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:${FIXTURE_DURATION}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:${FIXTURE_DURATION}.000,
+/api/stream/${videoId}/hls-ts/${fmt.formatId}.ts?fixtureTs=${tsKind}
+#EXT-X-ENDLIST`;
+  }
   const segments = segmentsFor(fmt.filePath, fmt.indexRange.end);
   if (!segments.length) return '';
   const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map(seg => seg.end - seg.start))));
@@ -172,11 +292,60 @@ ${segments.map(seg => `#EXTINF:${(seg.end - seg.start).toFixed(3)},
 #EXT-X-ENDLIST`;
 }
 
+function buildFixtureEncryptedHlsMedia(videoId: string, fmt: FixtureFormat, fixtureMode: string) {
+  if (fixtureMode === 'ts-aes') {
+    return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:${FIXTURE_DURATION}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-KEY:METHOD=AES-128,URI="/api/stream/${videoId}/hls-key/0.key"
+#EXTINF:${FIXTURE_DURATION}.000,
+/api/stream/${videoId}/hls-aes/${fmt.formatId}/0.ts?fixtureTs=video&fixtureKey=0
+#EXT-X-ENDLIST`;
+  }
+  const segments = segmentsFor(fmt.filePath, fmt.indexRange.end);
+  if (!segments.length) return '';
+  const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map(seg => seg.end - seg.start))));
+  return `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:${targetDuration}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="/api/stream/${videoId}/fmt/${fmt.formatId}",BYTERANGE="${fmt.initRange.end - fmt.initRange.start + 1}@${fmt.initRange.start}"
+${segments.map((seg, index) => {
+    const keyId = fixtureMode === 'aes-rotate' ? index % FIXTURE_HLS_KEYS.length : 0;
+    return `#EXT-X-KEY:METHOD=AES-128,URI="/api/stream/${videoId}/hls-key/${keyId}.key"
+#EXTINF:${(seg.end - seg.start).toFixed(3)},
+/api/stream/${videoId}/hls-aes/${fmt.formatId}/${index}.bin?fixtureKey=${keyId}`;
+  }).join('\n')}
+#EXT-X-ENDLIST`;
+}
+
+function buildFixtureLiveHlsMedia(videoId: string, fmt: FixtureFormat, query: Record<string, unknown>, fixtureMode: string) {
+  const allSegments = segmentsFor(fmt.filePath, fmt.indexRange.end);
+  if (!allSegments.length) return '';
+  const sliding = fixtureMode === 'sliding';
+  const seq = fixtureLiveSequence(`${videoId}:${fmt.formatId}`, query, sliding);
+  const segments = sliding ? slidingLiveSegments(allSegments, seq) : allSegments;
+  const mediaSequence = sliding ? Math.min(seq, Math.max(0, allSegments.length - segments.length)) : 0;
+  const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map(seg => seg.end - seg.start))));
+  const discontinuityIndex = fixtureMode === 'live-discontinuity' && segments.length > 1 ? Math.floor(segments.length / 2) : -1;
+  return `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:${targetDuration}
+#EXT-X-MEDIA-SEQUENCE:${mediaSequence}
+${fixtureMode === 'live-discontinuity' ? '#EXT-X-DISCONTINUITY-SEQUENCE:3\n' : ''}#EXT-X-MAP:URI="/api/stream/${videoId}/fmt/${fmt.formatId}",BYTERANGE="${fmt.initRange.end - fmt.initRange.start + 1}@${fmt.initRange.start}"
+${segments.map((seg, index) => `${index === discontinuityIndex ? '#EXT-X-DISCONTINUITY\n' : ''}#EXTINF:${(seg.end - seg.start).toFixed(3)},
+#EXT-X-BYTERANGE:${seg.range.end - seg.range.start + 1}@${seg.range.start}
+/api/stream/${videoId}/fmt/${fmt.formatId}`).join('\n')}`;
+}
+
 function buildFixtureLiveMPD(videoId: string, videos: FixtureFormat[], audio: FixtureFormat, query: Record<string, unknown> = {}) {
   const publishTime = new Date().toISOString();
   const availabilityStartTime = new Date(Date.now() - 60_000).toISOString();
   const sliding = firstQueryValue(query.fixtureLive) === 'sliding';
   const multiperiod = firstQueryValue(query.fixtureLive) === 'multiperiod';
+  const numberTemplate = firstQueryValue(query.fixtureLive) === 'number' || firstQueryValue(query.fixtureLive) === 'number-sliding';
+  if (numberTemplate) return buildFixtureLiveNumberTemplateMPD(videoId, videos, audio, query);
   if (multiperiod) return buildFixtureLiveMultiPeriodMPD(videoId, videos, audio, availabilityStartTime, publishTime);
   const seq = fixtureLiveSequence(videoId, query, sliding);
   const templateAttrs = (fmt: FixtureFormat) => {
@@ -186,6 +355,34 @@ function buildFixtureLiveMPD(videoId: string, videos: FixtureFormat[], audio: Fi
   };
   return `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" availabilityStartTime="${availabilityStartTime}" publishTime="${publishTime}" minimumUpdatePeriod="PT1S" timeShiftBufferDepth="PT30S" minBufferTime="PT0.5S">
+<Period id="live" start="PT0S">
+<AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
+${videos.map(video => `<Representation id="${video.formatId}" bandwidth="${video.bandwidth}" width="${video.width}" height="${video.height}" codecs="${video.codecs}">
+${templateAttrs(video)}
+</Representation>`).join('\n')}
+</AdaptationSet>
+<AdaptationSet mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1" lang="en" label="English">
+<Representation id="${audio.formatId}" bandwidth="${audio.bandwidth}" codecs="${audio.codecs}" audioSamplingRate="${audio.audioSamplingRate}">
+${templateAttrs(audio)}
+</Representation>
+</AdaptationSet>
+</Period>
+</MPD>`;
+}
+
+function buildFixtureLiveNumberTemplateMPD(videoId: string, videos: FixtureFormat[], audio: FixtureFormat, query: Record<string, unknown> = {}) {
+  const sliding = firstQueryValue(query.fixtureLive) === 'number-sliding';
+  const seq = fixtureLiveSequence(`${videoId}:dash-number`, query, sliding);
+  const allSegments = segmentsFor(videos[0].filePath, videos[0].indexRange.end);
+  const segmentDurationMs = allSegments[0] ? Math.round((allSegments[0].end - allSegments[0].start) * 1000) : 2000;
+  const segmentCount = allSegments.length || Math.ceil(FIXTURE_DURATION * 1000 / segmentDurationMs);
+  const lastSegment = Math.min(segmentCount, Math.max(2, 2 + seq));
+  const publishOffsetMs = lastSegment * segmentDurationMs;
+  const availabilityStartTime = new Date(Date.now() - publishOffsetMs).toISOString();
+  const publishTime = new Date(Date.now()).toISOString();
+  const templateAttrs = (fmt: FixtureFormat) => `<SegmentTemplate timescale="1000" duration="${segmentDurationMs}" startNumber="1" initialization="/api/stream/${videoId}/tmpl/${fmt.formatId}/init" media="/api/stream/${videoId}/tmpl/${fmt.formatId}/seg/$Number$"/>`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" availabilityStartTime="${availabilityStartTime}" publishTime="${publishTime}" minimumUpdatePeriod="PT1S" timeShiftBufferDepth="PT4S" minBufferTime="PT0.5S">
 <Period id="live" start="PT0S">
 <AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
 ${videos.map(video => `<Representation id="${video.formatId}" bandwidth="${video.bandwidth}" width="${video.width}" height="${video.height}" codecs="${video.codecs}">
@@ -223,6 +420,41 @@ ${periodAttrs(audio, start, duration)}
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-live:2011" type="dynamic" availabilityStartTime="${availabilityStartTime}" publishTime="${publishTime}" minimumUpdatePeriod="PT1S" timeShiftBufferDepth="PT30S" minBufferTime="PT0.5S">
 ${period('live-a', 0, 2)}
 ${period('live-b', 2, 4)}
+</MPD>`;
+}
+
+function buildFixturePeriodCodecMPD(videoId: string, videos: FixtureFormat[], audio: FixtureFormat) {
+  const formats = getFixtureFormats();
+  const periodAttrs = (fmt: FixtureFormat, periodStart: number, periodDuration: number) => {
+    const segments = segmentsFor(fmt.filePath, fmt.indexRange.end)
+      .filter(seg => seg.start >= periodStart && seg.start < periodStart + periodDuration);
+    return `<SegmentTemplate timescale="1000" presentationTimeOffset="${periodStart * 1000}" initialization="/api/stream/${videoId}/tmpl/${fmt.formatId}/init" media="/api/stream/${videoId}/tmpl/${fmt.formatId}/seg/$Time$"><SegmentTimeline>${segments.map(seg => `<S t="${Math.round(seg.start * 1000)}" d="${Math.round((seg.end - seg.start) * 1000)}"/>`).join('')}</SegmentTimeline></SegmentTemplate>`;
+  };
+  const audioAttrs = () => {
+    const segments = segmentsFor(audio.filePath, audio.indexRange.end);
+    return `<SegmentTemplate timescale="1000" presentationTimeOffset="0" initialization="/api/stream/${videoId}/tmpl/${audio.formatId}/init" media="/api/stream/${videoId}/tmpl/${audio.formatId}/seg/$Time$"><SegmentTimeline>${segments.map(seg => `<S t="${Math.round(seg.start * 1000)}" d="${Math.round((seg.end - seg.start) * 1000)}"/>`).join('')}</SegmentTimeline></SegmentTemplate>`;
+  };
+  const videoSet = (start: number, duration: number, mainProfile: boolean) => `<AdaptationSet mimeType="video/mp4" segmentAlignment="true" startWithSAP="1">
+${videos.map(video => {
+    const fmt = mainProfile ? formats[`${video.formatId}-main`] : video;
+    return `<Representation id="${video.formatId}" bandwidth="${fmt.bandwidth}" width="${fmt.width}" height="${fmt.height}" codecs="${fmt.codecs}">
+${periodAttrs(fmt, start, duration)}
+</Representation>`;
+  }).join('\n')}
+</AdaptationSet>`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="PT${FIXTURE_DURATION}.000S" minBufferTime="PT0.5S">
+<Period id="codec-a" start="PT0S" duration="PT${FIXTURE_DURATION}S">
+${videoSet(0, 2, false)}
+<AdaptationSet mimeType="audio/mp4" segmentAlignment="true" startWithSAP="1" lang="en" label="English">
+<Representation id="${audio.formatId}" bandwidth="${audio.bandwidth}" codecs="${audio.codecs}" audioSamplingRate="${audio.audioSamplingRate}">
+${audioAttrs()}
+</Representation>
+</AdaptationSet>
+</Period>
+<Period id="codec-b" start="PT2S" duration="PT4S">
+${videoSet(2, 4, true)}
+</Period>
 </MPD>`;
 }
 
@@ -376,6 +608,68 @@ function serveFixtureProgressive(videoId: string, req, res) {
   return true;
 }
 
+function serveFixtureTsSegment(videoId: string, formatId: string, req, res) {
+  if (!isPlayerFixtureVideo(videoId)) return false;
+  const fmt = getFixtureFormats()[formatId];
+  if (!fmt) {
+    res.status(404).json({ error: 'Fixture format not found' });
+    return true;
+  }
+  const kind = firstQueryValue(req.query.fixtureTs);
+  const filename = kind === 'audio'
+    ? 'audio.ts'
+    : (kind === 'muxed' ? `${fmt.formatId}-muxed.ts` : `${fmt.formatId}.ts`);
+  const tsPath = path.join(FIXTURE_DIR, filename);
+  if (!fs.existsSync(tsPath)) {
+    res.status(404).json({ error: 'Fixture TS not found' });
+    return true;
+  }
+  const stat = fs.statSync(tsPath);
+  res.status(200);
+  res.set('Content-Type', 'video/mp2t');
+  res.set('Content-Length', String(stat.size));
+  res.set('Cache-Control', 'no-store');
+  fs.createReadStream(tsPath).pipe(res);
+  return true;
+}
+
+function serveFixtureHlsKey(videoId: string, keyId: string, _req, res) {
+  if (!isPlayerFixtureVideo(videoId)) return false;
+  const index = boundedInt(keyId, 0, FIXTURE_HLS_KEYS.length - 1);
+  const key = FIXTURE_HLS_KEYS[index];
+  res.status(200);
+  res.set('Content-Type', 'application/octet-stream');
+  res.set('Content-Length', String(key.length));
+  res.set('Cache-Control', 'no-store');
+  res.end(key);
+  return true;
+}
+
+function serveFixtureEncryptedHlsSegment(videoId: string, formatId: string, segmentId: string, req, res) {
+  if (!isPlayerFixtureVideo(videoId)) return false;
+  const fmt = getFixtureFormats()[formatId];
+  if (!fmt) {
+    res.status(404).json({ error: 'Fixture format not found' });
+    return true;
+  }
+  const sequence = boundedInt(segmentId, 0, 1000);
+  const keyId = boundedInt(firstQueryValue(req.query.fixtureKey), 0, FIXTURE_HLS_KEYS.length - 1);
+  const bytes = firstQueryValue(req.query.fixtureTs)
+    ? readFixtureTsBytes(fmt.formatId, firstQueryValue(req.query.fixtureTs))
+    : readFixtureSegmentBytes(fmt, sequence);
+  if (!bytes) {
+    res.status(404).json({ error: 'Fixture encrypted segment not found' });
+    return true;
+  }
+  const encrypted = encryptFixtureHlsSegment(bytes, FIXTURE_HLS_KEYS[keyId], hlsFixtureIv(sequence));
+  res.status(200);
+  res.set('Content-Type', 'application/octet-stream');
+  res.set('Content-Length', String(encrypted.length));
+  res.set('Cache-Control', 'no-store');
+  res.end(encrypted);
+  return true;
+}
+
 function serveFixtureTemplatePart(videoId: string, formatId: string, part: string, _req, res) {
   if (!isPlayerFixtureVideo(videoId)) return false;
   const fmt = getFixtureFormats()[formatId];
@@ -396,6 +690,37 @@ function serveFixtureTemplatePart(videoId: string, formatId: string, part: strin
   return true;
 }
 
+function readFixtureSegmentBytes(fmt: FixtureFormat, sequence: number) {
+  const segments = segmentsFor(fmt.filePath, fmt.indexRange.end);
+  const seg = segments[sequence];
+  if (!seg) return null;
+  const length = seg.range.end - seg.range.start + 1;
+  const buf = Buffer.alloc(length);
+  const fd = fs.openSync(fmt.filePath, 'r');
+  fs.readSync(fd, buf, 0, length, seg.range.start);
+  fs.closeSync(fd);
+  return buf;
+}
+
+function readFixtureTsBytes(formatId: string, kind: string | undefined) {
+  const filename = kind === 'audio'
+    ? 'audio.ts'
+    : (kind === 'muxed' ? `${formatId}-muxed.ts` : `${formatId}.ts`);
+  const tsPath = path.join(FIXTURE_DIR, filename);
+  return fs.existsSync(tsPath) ? fs.readFileSync(tsPath) : null;
+}
+
+function encryptFixtureHlsSegment(bytes: Buffer, key: Buffer, iv: Buffer) {
+  const cipher = crypto.createCipheriv('aes-128-cbc', key, iv);
+  return Buffer.concat([cipher.update(bytes), cipher.final()]);
+}
+
+function hlsFixtureIv(sequence: number) {
+  const iv = Buffer.alloc(16);
+  iv.writeUInt32BE(sequence >>> 0, 12);
+  return iv;
+}
+
 function templatePartRange(fmt: FixtureFormat, part: string) {
   if (part === 'init') return fmt.initRange;
   const segments = segmentsFor(fmt.filePath, fmt.indexRange.end);
@@ -414,6 +739,16 @@ function fixtureFaultQuery(query: Record<string, unknown>) {
   }
   const text = params.toString();
   return text ? `?${text.replace(/&/g, '&amp;')}` : '';
+}
+
+function hlsFixtureQuery(query: Record<string, unknown>, fixtureHls: string) {
+  const params = new URLSearchParams();
+  params.set('fixtureHls', fixtureHls);
+  for (const key of ['fixtureLiveKey', 'fixtureLiveSeq']) {
+    const value = firstQueryValue(query[key]);
+    if (value) params.set(key, value);
+  }
+  return params.toString();
 }
 
 function fixtureFaultFor(query, formatId: string, fmt: FixtureFormat, start: number, end: number) {
@@ -545,5 +880,8 @@ export {
   isPlayerFixtureVideo,
   serveFixtureFormat,
   serveFixtureProgressive,
+  serveFixtureEncryptedHlsSegment,
+  serveFixtureHlsKey,
+  serveFixtureTsSegment,
   serveFixtureTemplatePart,
 };

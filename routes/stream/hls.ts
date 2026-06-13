@@ -13,7 +13,14 @@ import {
   selectBestHlsFormat,
 } from './shared.js';
 import { extractFormats } from './extraction.js';
-import { buildFixtureHlsMaster, buildFixtureHlsMedia, isPlayerFixtureVideo } from './player-fixture.js';
+import {
+  buildFixtureHlsMaster,
+  buildFixtureHlsMedia,
+  isPlayerFixtureVideo,
+  serveFixtureEncryptedHlsSegment,
+  serveFixtureHlsKey,
+  serveFixtureTsSegment,
+} from './player-fixture.js';
 
 // Cache rewritten HLS manifests to avoid re-parsing on every request
 const hlsRewriteCache = new LRUMap(200);
@@ -151,11 +158,39 @@ function mountHlsRoutes(router) {
     if (!isPlayerFixtureVideo(videoId) || !req.query.fixtureHls) {
       return res.status(404).json({ error: 'HLS fixture not found' });
     }
-    const body = buildFixtureHlsMedia(videoId, formatId);
+    const body = buildFixtureHlsMedia(videoId, formatId, req.query);
     if (!body) return res.status(404).json({ error: 'HLS fixture format not found' });
     res.set('Content-Type', 'application/vnd.apple.mpegurl');
     res.set('Cache-Control', 'no-store');
     res.send(body);
+  });
+
+  router.get('/:videoId/hls-ts/:formatId.ts', (req, res) => {
+    const { videoId, formatId } = req.params;
+    if (!serveFixtureTsSegment(videoId, formatId, req, res)) {
+      return res.status(404).json({ error: 'HLS fixture TS not found' });
+    }
+  });
+
+  router.get('/:videoId/hls-key/:keyId.key', (req, res) => {
+    const { videoId, keyId } = req.params;
+    if (!serveFixtureHlsKey(videoId, keyId, req, res)) {
+      return res.status(404).json({ error: 'HLS fixture key not found' });
+    }
+  });
+
+  router.get('/:videoId/hls-aes/:formatId/:segmentId.bin', (req, res) => {
+    const { videoId, formatId, segmentId } = req.params;
+    if (!serveFixtureEncryptedHlsSegment(videoId, formatId, segmentId, req, res)) {
+      return res.status(404).json({ error: 'HLS encrypted fixture segment not found' });
+    }
+  });
+
+  router.get('/:videoId/hls-aes/:formatId/:segmentId.ts', (req, res) => {
+    const { videoId, formatId, segmentId } = req.params;
+    if (!serveFixtureEncryptedHlsSegment(videoId, formatId, segmentId, req, res)) {
+      return res.status(404).json({ error: 'HLS encrypted fixture segment not found' });
+    }
   });
 
   // HLS segment/sub-manifest proxy — use query param since encoded URLs are too long for path params

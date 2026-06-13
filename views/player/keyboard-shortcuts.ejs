@@ -12,15 +12,12 @@
           case 'ArrowLeft':
           case 'j':
             e.preventDefault();
-            if (engine.recovering) { engine.seekDuringRecovery(Math.max(0, engine.lastGoodTime - 5)); break; }
-            video.currentTime = Math.max(0, video.currentTime - 5);
-            if (video.ended) video.play().catch(function () {});
+            playerSeekTo(Math.max(0, (engine.recovering ? engine.lastGoodTime : video.currentTime) - 5), { resumeEnded: true });
             break;
           case 'ArrowRight':
           case 'l':
             e.preventDefault();
-            if (engine.recovering) { engine.seekDuringRecovery(Math.min(video.duration || Infinity, engine.lastGoodTime + 5)); break; }
-            video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 5);
+            playerSeekTo(Math.min(video.duration || Infinity, (engine.recovering ? engine.lastGoodTime : video.currentTime) + 5));
             break;
           case 'ArrowUp':
             e.preventDefault();
@@ -45,11 +42,23 @@
             break;
           case '>':
             e.preventDefault();
-            video.playbackRate = Math.min(2, video.playbackRate + 0.25);
+            safePlayerCall(function () {
+              if (player.setPlaybackRate) player.setPlaybackRate((player.getPlaybackRate ? player.getPlaybackRate() : video.playbackRate) + 0.25);
+              else {
+                var nextRate = Math.min(2, video.playbackRate + 0.25);
+                video.playbackRate = nextRate;
+              }
+            });
             break;
           case '<':
             e.preventDefault();
-            video.playbackRate = Math.max(0.25, video.playbackRate - 0.25);
+            safePlayerCall(function () {
+              if (player.setPlaybackRate) player.setPlaybackRate((player.getPlaybackRate ? player.getPlaybackRate() : video.playbackRate) - 0.25);
+              else {
+                var previousRate = Math.max(0.25, video.playbackRate - 0.25);
+                video.playbackRate = previousRate;
+              }
+            });
             break;
           case 'p':
             // Picture-in-Picture toggle
@@ -65,7 +74,7 @@
             var pct = parseInt(e.key) / 10;
             var dur = video.duration || 0;
             if (dur && !isLive) {
-              video.currentTime = dur * pct;
+              playerSeekTo(dur * pct);
             }
             break;
         }
@@ -86,10 +95,16 @@
         window.removeEventListener('resize', _invalidateSeekRects);
         document.removeEventListener('fullscreenchange', _invalidateSeekRects);
         if (window._stallTimer) { clearInterval(window._stallTimer); window._stallTimer = null; }
+        if (stallTimer) { clearInterval(stallTimer); stallTimer = null; }
+        if (bufferTimer) { clearPlayerTimeout(bufferTimer); bufferTimer = 0; }
         if (window._watchTimeSaveTimer) { clearInterval(window._watchTimeSaveTimer); window._watchTimeSaveTimer = null; }
+        if (window._detailsTimer) { clearInterval(window._detailsTimer); window._detailsTimer = null; }
         if (dlPollTimer) { clearInterval(dlPollTimer); dlPollTimer = null; }
+        runPlayerCleanupTasks();
         stopCaptionLoop();
         stopStatusPoll();
         if (window._playerEngine) { window._playerEngine.destroy(); window._playerEngine = null; }
+        window._playerSeekTo = null;
+        window._player = null;
         window._shakaPlayer = null;
       };

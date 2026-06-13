@@ -154,32 +154,51 @@
       var isSeeking = false;
       var isDragging = false;
 
+      function seekTargetFromValue(pct) {
+        if (isLive) {
+          var lr = getLiveRange();
+          return lr.start + pct * (lr.end - lr.start);
+        }
+        return pct * (video.duration || 0);
+      }
+
+      function beginPlayerSeek(target) {
+        safePlayerCall(function () {
+          if (player.beginSeek) player.beginSeek(target);
+        });
+      }
+
+      function commitPlayerSeek(target) {
+        if (window._playerSeekTo) {
+          window._playerSeekTo(target, { begin: false });
+          return;
+        }
+        if (engine.recovering) {
+          engine.seekDuringRecovery(target);
+          return;
+        }
+        safePlayerCall(function () {
+          if (player.commitSeek) player.commitSeek(target);
+          else video.currentTime = target;
+        });
+      }
+
       function seekTo(pct) {
         seekValue = pct;
         isSeeking = true;
         updateSeekBars();
         updateThumbPosition();
-        if (isLive) {
-          var lr = getLiveRange();
-          var end = lr.end;
-          var start = lr.start;
-          var target = start + pct * (end - start);
-          clearTimeout(seekDebounce);
-          seekDebounce = setTimeout(function () {
-            if (engine.recovering) { engine.seekDuringRecovery(target); isSeeking = false; return; }
-            video.currentTime = target;
-            isSeeking = false;
-          }, 125);
-        } else {
+        var target = seekTargetFromValue(pct);
+        beginPlayerSeek(target);
+        if (!isLive) {
           var duration = video.duration || 0;
-          timeDisplay.textContent = formatTime(pct * duration) + ' / ' + formatTime(duration);
-          clearTimeout(seekDebounce);
-          seekDebounce = setTimeout(function () {
-            if (engine.recovering) { engine.seekDuringRecovery(pct * duration); isSeeking = false; return; }
-            video.currentTime = pct * duration;
-            isSeeking = false;
-          }, 125);
+          timeDisplay.textContent = formatTime(target) + ' / ' + formatTime(duration);
         }
+        clearTimeout(seekDebounce);
+        seekDebounce = setTimeout(function () {
+          commitPlayerSeek(target);
+          isSeeking = false;
+        }, 125);
       }
 
       seekBarContainer.addEventListener('mousedown', function (e) {
@@ -196,24 +215,7 @@
         if (!isDragging) return;
         isDragging = false;
         clearTimeout(seekDebounce);
-        if (engine.recovering) {
-          if (isLive) {
-            var lr = getLiveRange();
-            engine.seekDuringRecovery(lr.start + seekValue * (lr.end - lr.start));
-          } else {
-            engine.seekDuringRecovery(seekValue * (video.duration || 0));
-          }
-          isSeeking = false;
-          return;
-        }
-        if (isLive) {
-          var lr = getLiveRange();
-          var end = lr.end;
-          var start = lr.start;
-          video.currentTime = start + seekValue * (end - start);
-        } else {
-          video.currentTime = seekValue * (video.duration || 0);
-        }
+        commitPlayerSeek(seekTargetFromValue(seekValue));
         if (video.ended) video.play().catch(function () {});
         isSeeking = false;
       });
@@ -231,8 +233,9 @@
           timeDisplay.style.cursor = 'pointer';
           timeDisplay.addEventListener('click', function () {
             if (!isLive) return;
-            var range = getLiveRange();
-            video.currentTime = range.end;
+            safePlayerCall(function () {
+              if (player.seekToLiveEdge) player.seekToLiveEdge();
+            });
           });
         } else if (!isLive && wasLive) {
           timeDisplay.classList.remove('player-live');
@@ -246,9 +249,14 @@
           var start = lr.start;
           var range = end - start || 1;
           seekValue = (video.currentTime - start) / range;
-          var behindLive = end - video.currentTime > 10;
+          var stats = safePlayerCall(function () { return player.getStats ? player.getStats() : null; }) || null;
+          var behindLive = stats && typeof stats.atLiveEdge === 'boolean'
+            ? !stats.atLiveEdge
+            : end - video.currentTime > 10;
+          var liveLatency = stats && isFinite(stats.liveLatency) ? stats.liveLatency : Math.max(0, end - video.currentTime);
           var dot = timeDisplay.querySelector('.live-dot');
           if (dot) dot.style.background = behindLive ? '#888' : '#f00';
+          timeDisplay.title = behindLive ? 'Go live (' + formatTime(Math.round(liveLatency)) + ' behind)' : 'Live';
           updateSeekBars();
           updateThumbPosition();
           return;
@@ -343,26 +351,17 @@
       });
 
 
-      // --- Fast seeking ---
+      // --- Seek lifecycle ---
       var seekRestoreTimer = 0;
-      var seekingActive = false;
       video.addEventListener('seeking', function () {
         if (seekRestoreTimer) { clearTimeout(seekRestoreTimer); seekRestoreTimer = 0; }
-        if (!seekingActive) {
-          seekingActive = true;
-          safePlayerCall(function () {
-            player.configure('streaming.rebufferingGoal', 0.01);
-            player.configure('streaming.bufferingGoal', 1);
-          });
-        }
+        beginPlayerSeek(video.currentTime || 0);
       });
       video.addEventListener('seeked', function () {
         if (seekRestoreTimer) clearTimeout(seekRestoreTimer);
         seekRestoreTimer = setTimeout(function () {
-          seekingActive = false;
           safePlayerCall(function () {
-            player.configure('streaming.rebufferingGoal', 0.3);
-            player.configure('streaming.bufferingGoal', 120);
+            if (player.endSeek) player.endSeek();
           });
         }, 300);
       });
