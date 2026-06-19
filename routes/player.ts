@@ -7,6 +7,14 @@ import db from '../db.js';
 
 const router = Router();
 
+function playerDrmServers(): Record<string, string> {
+  const servers: Record<string, string> = {};
+  if (process.env.WIDEVINE_LICENSE_URL) {
+    servers['com.widevine.alpha'] = process.env.WIDEVINE_LICENSE_URL;
+  }
+  return servers;
+}
+
 router.get('/', ensureAuth, async (req, res) => {
   const videoId = req.query.v as string;
   if (!videoId) return res.redirect('/');
@@ -86,7 +94,18 @@ router.get('/', ensureAuth, async (req, res) => {
         if (h > downloadedHeight) downloadedHeight = h;
       }
     }
-    await res.streamContent('player', { video, tags, startTime, streamToken, currentRating, savedPosition, inlineMPD, inlineVia, downloadedHeight });
+    await res.streamContent('player', {
+      video,
+      tags,
+      startTime,
+      streamToken,
+      currentRating,
+      savedPosition,
+      inlineMPD,
+      inlineVia,
+      downloadedHeight,
+      playerDrmServers: playerDrmServers(),
+    });
   } catch (err) {
     console.error('Player error:', err.message);
     res.end('<div class="player-error">Failed to load video</div></main><script src="/app.js"></script>\n</body>\n</html>');

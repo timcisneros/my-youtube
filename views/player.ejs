@@ -18,6 +18,10 @@
       var engine = new PlayerEngine(video, { videoId: '<%= video.videoId %>', streamToken: streamToken });
       var player = engine.getPlayer();
       var attachPromise = engine.init();
+      var playerDrmServers = <%- JSON.stringify(typeof playerDrmServers !== 'undefined' ? playerDrmServers : {}) %>;
+      if (playerDrmServers && Object.keys(playerDrmServers).length) {
+        player.configure({ drm: { servers: playerDrmServers } });
+      }
       window._player = player;
       window._playerEngine = engine;
 

@@ -6,6 +6,45 @@ async function setPlayerContent(page, html) {
   await page.addScriptTag({ path: 'public/native-player-engine.js' });
 }
 
+const KNOWN_FALLBACK_REASONS = new Set([
+  'dash-widevine-license-unconfigured',
+  'dash-playready-unsupported',
+  'hls-sample-aes-unsupported',
+  'hls-no-supported-audio',
+  'hls-no-supported-video',
+]);
+
+async function getPlayerFallbackState(page) {
+  return page.evaluate(() => {
+    const stats = window.__player ? window.__player.getStats() : {};
+    return {
+      provider: stats.provider || window._playerProvider || '',
+      fallbackReason: stats.fallbackReason || '',
+      mode: stats.mode || '',
+      assetUri: stats.assetUri || '',
+      drmKeySystem: stats.drmKeySystem || '',
+    };
+  });
+}
+
+async function expectNativePlayback(page, expected = {}) {
+  const state = await getPlayerFallbackState(page);
+  expect(state.provider).not.toBe('shaka-fallback');
+  expect(state.fallbackReason).toBe('');
+  if (expected.provider) expect(state.provider).toBe(expected.provider);
+  if (expected.mode) expect(state.mode).toBe(expected.mode);
+  if (expected.drmKeySystem) expect(state.drmKeySystem).toBe(expected.drmKeySystem);
+  return state;
+}
+
+async function expectKnownFallback(page, reason) {
+  expect(KNOWN_FALLBACK_REASONS.has(reason)).toBe(true);
+  const state = await getPlayerFallbackState(page);
+  expect(state.provider).toBe('shaka-fallback');
+  expect(state.fallbackReason).toBe(reason);
+  return state;
+}
+
 test('watch page loads native player without eager-loading Shaka', async ({ request }) => {
   const login = await request.post('/auth/free', { maxRedirects: 0 });
   expect(login.status()).toBeGreaterThanOrEqual(300);
@@ -17,6 +56,8 @@ test('watch page loads native player without eager-loading Shaka', async ({ requ
 
   expect(html).toContain('/native-player-engine.js');
   expect(html).not.toContain('/vendor/shaka/shaka-player.compiled.js');
+  expect(html).toContain('var playerDrmServers = ');
+  expect(html).toContain('player.configure({ drm: { servers: playerDrmServers } });');
 });
 
 test('native engine lazy-loads Shaka only when fallback is requested', async ({ page }) => {
@@ -3302,6 +3343,7 @@ test('native DASH fixture plays through MSE without Shaka fallback', async ({ pa
   expect(state.currentTime).toBeGreaterThan(0);
   expect(state.bufferedEnd).toBeGreaterThan(0);
   expect(state.activeTrack.height).toBe(360);
+  await expectNativePlayback(page, { provider: 'native-dash', mode: 'dash' });
   expect(shakaRequests).toHaveLength(0);
   expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
 });
@@ -5593,12 +5635,14 @@ test('DRM DASH manifest falls back with explicit unconfigured Widevine reason', 
 
   const stats = await page.evaluate(() => {
     const engine = new window.PlayerEngine(document.getElementById('player'), { videoId: 'DRMTEST0001', streamToken: 'test-token' });
+    window.__player = engine.getPlayer();
     return engine.init().then(() => engine.load()).then(() => engine.getPlayer().getStats());
   });
 
   expect(shakaRequests).toHaveLength(1);
   expect(stats.provider).toBe('shaka-fallback');
   expect(stats.fallbackReason).toBe('dash-widevine-license-unconfigured');
+  await expectKnownFallback(page, 'dash-widevine-license-unconfigured');
 });
 
 test('native DASH retries a failed media range without Shaka fallback or reset', async ({ page }) => {
@@ -6592,6 +6636,7 @@ test('native HLS fixture plays through MSE without Shaka fallback', async ({ pag
   expect(stats.mediaFetchCompletedCount).toBeGreaterThan(0);
   expect(stats.mediaFetchCompletedCount).toBeLessThanOrEqual(2);
   expect(stats.schedulerDrainCount).toBe(stats.mediaFetchCompletedCount);
+  await expectNativePlayback(page, { provider: 'native-hls', mode: 'hls' });
   expect(shakaRequests).toHaveLength(0);
 });
 
@@ -7278,6 +7323,7 @@ test('unsupported HLS audio codec falls back with explicit reason', async ({ pag
   const stats = await page.evaluate(() => window.__player.getStats());
   expect(stats.provider).toBe('shaka-fallback');
   expect(stats.fallbackReason).toBe('hls-no-supported-audio');
+  await expectKnownFallback(page, 'hls-no-supported-audio');
   expect(shakaRequests.length).toBe(1);
 });
 
@@ -7332,6 +7378,7 @@ test('unsupported HLS video variants fall back with explicit reason', async ({ p
   const stats = await page.evaluate(() => window.__player.getStats());
   expect(stats.provider).toBe('shaka-fallback');
   expect(stats.fallbackReason).toBe('hls-no-supported-video');
+  await expectKnownFallback(page, 'hls-no-supported-video');
   expect(shakaRequests.length).toBe(1);
 });
 
@@ -7374,12 +7421,14 @@ test('unsupported encrypted HLS falls back with explicit reason', async ({ page 
     const video = document.getElementById('player');
     video.canPlayType = () => '';
     const engine = new window.PlayerEngine(video, { videoId: 'HLSUNSUP001', streamToken: 'test-token' });
+    window.__player = engine.getPlayer();
     return engine.init().then(() => engine.load()).then(() => engine.getPlayer().getStats());
   });
 
   expect(shakaRequests).toHaveLength(1);
   expect(stats.provider).toBe('shaka-fallback');
   expect(stats.fallbackReason).toBe('hls-sample-aes-unsupported');
+  await expectKnownFallback(page, 'hls-sample-aes-unsupported');
 });
 
 test('supported HLS uses native URL provider and live-like stats', async ({ page }) => {

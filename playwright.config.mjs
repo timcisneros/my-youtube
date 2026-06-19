@@ -14,7 +14,7 @@ export default defineConfig({
     launchOptions: executablePath ? { executablePath } : undefined,
   },
   webServer: process.env.PLAYWRIGHT_BASE_URL ? undefined : {
-    command: 'PORT=3011 PLAYER_FIXTURES=1 npm run start:single',
+    command: 'PORT=3011 PLAYER_FIXTURES=1 WIDEVINE_LICENSE_URL=/widevine-license npm run start:single',
     url: 'http://127.0.0.1:3011/auth/login',
     reuseExistingServer: true,
     timeout: 20_000,
