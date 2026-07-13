@@ -8,6 +8,7 @@ import * as extractionQueue from '../lib/extraction-queue.js';
 import * as storage from '../lib/storage.js';
 import * as segCache from '../lib/segment-cache.js';
 import * as wsStatus from '../lib/ws-status.js';
+import { stopChild } from './helpers/child-process.mjs';
 
 // ---------------------------------------------------------------------------
 // These tests verify the app doesn't crash when optional services fail
@@ -207,9 +208,7 @@ describe('Health endpoint with no Redis', () => {
     });
   });
 
-  after(() => {
-    if (child) child.kill('SIGTERM');
-  });
+  after(async () => stopChild(child));
 
   it('GET /health should return 200 with redis.status not_configured', async () => {
     const res = await httpGet(TEST_PORT, '/health');

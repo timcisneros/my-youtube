@@ -43,7 +43,7 @@ async function withYtSlot(fn) {
 }
 
 // Periodic cache sweep — prevents unbounded growth from one-time entries
-setInterval(() => {
+const cacheSweepTimer = setInterval(() => {
   const now = Date.now();
   for (const [key, entry] of cache.subscriptions) {
     if (now > entry.expires) cache.subscriptions.delete(key);
@@ -64,6 +64,7 @@ setInterval(() => {
     if (now > entry.expires) cache.rss.delete(key);
   }
 }, 10 * 60 * 1000);
+cacheSweepTimer.unref();
 
 export {
   cache, LRUMap, withYtSlot,

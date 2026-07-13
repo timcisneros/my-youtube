@@ -3,6 +3,7 @@ import assert from 'node:assert';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { stopChild } from './helpers/child-process.mjs';
 
 // Use a very short Creative Commons video for testing
 const TEST_VIDEO_ID = 'BaW_jenozKc'; // 1-second test video
@@ -87,15 +88,7 @@ describe('End-to-end playback path', { timeout: 120000 }, () => {
     });
   });
 
-  after(() => {
-    if (serverProcess) {
-      serverProcess.kill('SIGTERM');
-      // Force kill after 5s
-      setTimeout(() => {
-        try { serverProcess.kill('SIGKILL'); } catch {}
-      }, 5000);
-    }
-  });
+  after(async () => stopChild(serverProcess));
 
   it('POST /auth/free should create a session', async () => {
     const res = await httpReq(TEST_PORT, 'POST', '/auth/free');

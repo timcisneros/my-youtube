@@ -13,6 +13,7 @@ import { initStorage, isS3, putBuffer, getStream, stat, del } from '../lib/stora
 import { getSegment, putSegment } from '../lib/segment-cache.js';
 import { initQueue, enqueueExtraction, hasQueue } from '../lib/extraction-queue.js';
 import { attach, notify, isAvailable } from '../lib/ws-status.js';
+import { stopChild } from './helpers/child-process.mjs';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -515,9 +516,7 @@ describe('Rate limiter', () => {
     });
   });
 
-  after(() => {
-    if (child) child.kill('SIGTERM');
-  });
+  after(async () => stopChild(child));
 
   it('should allow initial requests and eventually return 429', async () => {
     // The rate limiter starts with 60 tokens (RATE_BURST)
@@ -703,9 +702,7 @@ describe('HTTP endpoint smoke tests', () => {
     });
   });
 
-  after(() => {
-    if (child) child.kill('SIGTERM');
-  });
+  after(async () => stopChild(child));
 
   it('GET /favicon.ico should return 204', async () => {
     const res = await httpGet(TEST_PORT, '/favicon.ico');
