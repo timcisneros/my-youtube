@@ -1,5 +1,10 @@
 # Self-Hosted YouTube
 
+> **Language note:** the application combines a TypeScript server and worker
+> layer with a substantial framework-free JavaScript playback engine in
+> `public/`. GitHub's language card reflects the byte size of that browser
+> engine; both parts are first-party source.
+
 A private, chronological subscription frontend whose server proxies streams,
 thumbnails, and metadata so the browser never contacts Google directly.
 
