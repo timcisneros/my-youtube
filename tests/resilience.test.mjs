@@ -257,6 +257,38 @@ describe('WebSocket fallback (no server)', () => {
   });
 });
 
+describe('WebSocket status server', () => {
+  after(() => {
+    wsStatus.closeAll();
+    wsStatus.setStatusProvider(null);
+  });
+
+  it('sends the current extraction step immediately on connect', async () => {
+    const server = http.createServer((_req, res) => res.end('ok'));
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      await wsStatus.attach(server);
+      wsStatus.setStatusProvider((videoId) => videoId === 'dQw4w9WgXcQ' ? { step: 'building' } : null);
+      const { WebSocket } = await import('ws');
+      const port = server.address().port;
+      const message = await new Promise((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/status?v=dQw4w9WgXcQ`);
+        const timer = setTimeout(() => reject(new Error('Timed out waiting for status message')), 3000);
+        ws.on('message', (data) => {
+          clearTimeout(timer);
+          ws.close();
+          resolve(JSON.parse(data.toString()));
+        });
+        ws.on('error', reject);
+      });
+      assert.deepStrictEqual(message, { step: 'building' });
+    } finally {
+      wsStatus.closeAll();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------

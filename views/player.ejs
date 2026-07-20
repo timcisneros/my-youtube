@@ -232,6 +232,74 @@
       var manifestBaseUrl = '/api/stream/<%= video.videoId %>/dash.mpd?token=' + streamToken;
       var manifestUrl = manifestBaseUrl + (retryCount > 0 ? '&refresh=1' : '');
       var wantsAutoplay = localStorage.getItem('autoplay') !== '0';
+      var isServerLive = <%= video.liveStatus === 'is_live' ? 'true' : 'false' %>;
+      var autoplayRetryAttached = false;
+      var autoplayAttemptedMuted = false;
+      var autoplaySettled = false;
+      var playlistPrevUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.prevUrl : '') %>;
+      var playlistNextUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.nextUrl : '') %>;
+
+      function isLivePlayback() {
+        if (isServerLive || engine.isLive) return true;
+        try { if (player.isLive && player.isLive()) return true; } catch {}
+        return !isFinite(video.duration) && video.duration > 0;
+      }
+
+      function scheduleAutoplayRetry() {
+        if (!wantsAutoplay || autoplaySettled || autoplayRetryAttached) return;
+        autoplayRetryAttached = true;
+        var retry = function () {
+          video.removeEventListener('loadedmetadata', retry);
+          video.removeEventListener('canplay', retry);
+          video.removeEventListener('loadeddata', retry);
+          video.removeEventListener('playing', retry);
+          autoplayRetryAttached = false;
+          requestAutoplay('media-ready');
+        };
+        video.addEventListener('loadedmetadata', retry, { once: true });
+        video.addEventListener('canplay', retry, { once: true });
+        video.addEventListener('loadeddata', retry, { once: true });
+        video.addEventListener('playing', retry, { once: true });
+        addPlayerCleanup(function () {
+          video.removeEventListener('loadedmetadata', retry);
+          video.removeEventListener('canplay', retry);
+          video.removeEventListener('loadeddata', retry);
+          video.removeEventListener('playing', retry);
+        });
+      }
+
+      function requestAutoplay(reason) {
+        if (!wantsAutoplay || autoplaySettled || !video.paused) return Promise.resolve();
+        try {
+          var playPromise = video.play();
+          return Promise.resolve(playPromise).then(function () {
+            if (!video.paused) autoplaySettled = true;
+            else scheduleAutoplayRetry();
+          }).catch(function (err) {
+            var blocked = err && (err.name === 'NotAllowedError' || err.name === 'AbortError');
+            if (blocked && !autoplayAttemptedMuted) {
+              autoplayAttemptedMuted = true;
+              video.muted = true;
+              video.defaultMuted = true;
+              video.setAttribute('muted', '');
+              try {
+                return Promise.resolve(video.play()).then(function () {
+                  autoplaySettled = true;
+                }).catch(function () {
+                  scheduleAutoplayRetry();
+                });
+              } catch {
+                scheduleAutoplayRetry();
+                return Promise.resolve();
+              }
+            }
+            if (reason !== 'media-ready') scheduleAutoplayRetry();
+          });
+        } catch {
+          scheduleAutoplayRetry();
+          return Promise.resolve();
+        }
+      }
 
       // --- Download button ---
       var dlBtn = document.getElementById('download-btn');
@@ -305,6 +373,8 @@
 
       if (wantsAutoplay) {
         video.autoplay = true;
+        video.playsInline = true;
+        video.setAttribute('playsinline', '');
       }
 
       // --- Media Session API (OS-level controls: lock screen, notification center, PiP) ---
@@ -322,8 +392,8 @@
         navigator.mediaSession.setActionHandler('seekbackward', function () { playerSeekTo(Math.max(0, video.currentTime - 10)); });
         navigator.mediaSession.setActionHandler('seekforward', function () { playerSeekTo(Math.min(video.duration || Infinity, video.currentTime + 10)); });
         navigator.mediaSession.setActionHandler('seekto', function (d) { if (d.seekTime != null) playerSeekTo(d.seekTime); });
-        try { navigator.mediaSession.setActionHandler('previoustrack', null); } catch (e) {}
-        try { navigator.mediaSession.setActionHandler('nexttrack', null); } catch (e) {}
+        try { navigator.mediaSession.setActionHandler('previoustrack', playlistPrevUrl ? function () { window.location.href = playlistPrevUrl; } : null); } catch (e) {}
+        try { navigator.mediaSession.setActionHandler('nexttrack', playlistNextUrl ? function () { window.location.href = playlistNextUrl; } : null); } catch (e) {}
       }
 
       // Resume playback when restored from browser bfcache (back from external site)
@@ -533,6 +603,9 @@
       // Extraction status -- WebSocket preferred, SSE fallback
       var statusSource = null;
       var statusWs = null;
+      var statusFallbackStarted = false;
+      var statusStopped = true;
+      var statusTimeout = 0;
       var stepProgress = { 'queue': 5, 'yt-dlp': 15, 'yt-dlp-alt': 35, 'innertube': 55, 'invidious': 75, 'building': 90 };
       var stepLabels = {
         'queue': 'queued...',
@@ -544,13 +617,25 @@
       };
       var _extractionDone = false;
       var _extractionDoneListeners = [];
-      function _onExtractionDone(fn) { _extractionDoneListeners.push(fn); }
+      function _onExtractionDone(fn) {
+        if (_extractionDone) { fn(); return; }
+        _extractionDoneListeners.push(fn);
+      }
       function _fireExtractionDone() {
         _extractionDone = true;
         var cbs = _extractionDoneListeners.splice(0);
         for (var i = 0; i < cbs.length; i++) cbs[i]();
       }
+      function armStatusTimeout() {
+        if (statusTimeout) clearPlayerTimeout(statusTimeout);
+        statusTimeout = setPlayerTimeout(function () {
+          statusTimeout = 0;
+          stopStatusPoll();
+          _fireExtractionDone();
+        }, 30000);
+      }
       function handleStatusMsg(d) {
+        armStatusTimeout();
         if (d.done) {
           if (window._setLoadBarProgress) window._setLoadBarProgress(90);
           stopStatusPoll();
@@ -575,14 +660,23 @@
           statusWs.onerror = function () {
             // WebSocket failed -- fall back to SSE
             statusWs = null;
+            if (statusStopped) return;
+            statusFallbackStarted = true;
             startStatusSSE();
           };
-          statusWs.onclose = function () { statusWs = null; };
+          statusWs.onclose = function () {
+            statusWs = null;
+            if (!statusStopped && !_extractionDone && !statusSource && !statusFallbackStarted) {
+              statusFallbackStarted = true;
+              startStatusSSE();
+            }
+          };
         } catch {
           startStatusSSE();
         }
       }
       function startStatusSSE() {
+        if (statusStopped) return;
         if (statusSource) return;
         statusSource = new EventSource('/api/stream/<%= video.videoId %>/status');
         statusSource.addEventListener('message', function (e) {
@@ -591,15 +685,24 @@
         statusSource.addEventListener('done', function () {
           if (window._setLoadBarProgress) window._setLoadBarProgress(90);
           stopStatusPoll();
+          _fireExtractionDone();
         });
-        statusSource.addEventListener('error', function () { stopStatusPoll(); });
+        statusSource.addEventListener('error', function () {
+          stopStatusPoll();
+          _fireExtractionDone();
+        });
       }
       function startStatusPoll() {
         if (statusSource || statusWs) return;
+        statusStopped = false;
+        statusFallbackStarted = false;
         setStreamVia('extracting...');
+        armStatusTimeout();
         startStatusWs();
       }
       function stopStatusPoll() {
+        statusStopped = true;
+        if (statusTimeout) { clearPlayerTimeout(statusTimeout); statusTimeout = 0; }
         if (statusSource) { statusSource.close(); statusSource = null; }
         if (statusWs) { statusWs.close(); statusWs = null; }
       }
@@ -640,7 +743,7 @@
                   finalVia = (data.via || 'yt-dlp') + '/progressive';
                   setStreamVia('buffering...');
                   video.src = data.progressive;
-                  return video.play().catch(function () {});
+                  return requestAutoplay('progressive-fallback');
                 }
                 stopStatusPoll();
                 var err = new Error(data.error || 'No suitable formats found');
@@ -655,7 +758,7 @@
           });
         }).catch(function (err) {
           if (err.permanent) throw err;
-          // Only retry Shaka load failures (not server extraction errors)
+          // Only retry player load failures (not server extraction errors)
           if (retries < 2 && !err.serverError) {
             // If extraction is still in progress, wait for it to finish before retrying
             if (!_extractionDone) {
@@ -689,10 +792,15 @@
         if (engine.isRecovering()) return;
         var realDur = expectedDuration || video.duration;
         console.log('[player] ended at ' + video.currentTime.toFixed(1) + 's, video.duration=' + video.duration + ', expected=' + expectedDuration);
-        if (!realDur || !isFinite(realDur)) return;
+        if (!realDur || !isFinite(realDur)) {
+          if (wantsAutoplay && playlistNextUrl && !isLivePlayback()) window.location.href = playlistNextUrl;
+          return;
+        }
         if (video.currentTime < realDur - 5) {
           engine.reportStall();
+          return;
         }
+        if (wantsAutoplay && playlistNextUrl && !isLivePlayback()) window.location.href = playlistNextUrl;
       });
 
       // Stall watchdog
@@ -723,6 +831,8 @@
         }, 3000);
       }
       video.addEventListener('playing', function () {
+        autoplaySettled = true;
+        autoplayRetryAttached = false;
         startStallWatch();
         if (window._stallTimer && window._stallTimer !== stallTimer) clearInterval(window._stallTimer);
         window._stallTimer = stallTimer;
@@ -755,7 +865,7 @@
           if (window._finishLoadingBar) window._finishLoadingBar();
           var idleCb = window.requestIdleCallback || function (fn) { setPlayerTimeout(fn, 100); };
           idleCb(function () { if (window._loadStoryboard) window._loadStoryboard(); });
-          if (!isLive) {
+          if (!isLivePlayback()) {
             idleCb(function () { if (window._loadChapters) window._loadChapters(); });
             if (window._loadSubtitles) window._loadSubtitles();
           }
@@ -787,9 +897,7 @@
           };
           window.addEventListener('beforeunload', saveWatchTimeBeforeUnload);
           addPlayerCleanup(function () { window.removeEventListener('beforeunload', saveWatchTimeBeforeUnload); });
-          if (wantsAutoplay && video.paused) {
-            video.play().catch(function () {});
-          }
+          requestAutoplay('reveal');
         }
         if (video.readyState >= 2) {
           reveal();
@@ -805,7 +913,6 @@
         if (window._stopLoadTimer) window._stopLoadTimer();
         if (window._finishLoadingBar) {
           window._finishLoadingBar();
-          window._finishLoadingBar = null;
         }
         container.classList.add('player-fallback');
         // Upcoming live event / premiere — show poster with countdown

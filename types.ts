@@ -9,6 +9,27 @@ export interface Subscription {
   description: string;
 }
 
+export interface SavedPlaylist {
+  playlist_id: string;
+  playlist_type: 'youtube' | 'local';
+  title: string;
+  channel_title: string;
+  channel_id: string;
+  thumbnail_video_id: string;
+  item_count_text: string;
+  updated_at: string;
+}
+
+export interface LocalPlaylistItem {
+  playlist_id: string;
+  video_id: string;
+  title: string;
+  channel_title: string;
+  channel_id: string;
+  position: number;
+  created_at: string;
+}
+
 export interface Download {
   video_id: string;
   title: string;
@@ -83,6 +104,15 @@ export interface DatabaseAPI {
   unqueueVideo(userId: string, videoId: string): MaybePromise<void>;
   getQueuedVideos(userId: string): MaybePromise<Array<{ video_id: string; title: string; channel_title: string; channel_id: string; created_at: string }>>;
   getQueuedVideoIds(userId: string): MaybePromise<string[]>;
+  savePlaylist(userId: string, playlistId: string, title: string, channelTitle: string, channelId: string, thumbnailVideoId: string, itemCountText: string, playlistType?: 'youtube' | 'local'): MaybePromise<void>;
+  unsavePlaylist(userId: string, playlistId: string): MaybePromise<void>;
+  getSavedPlaylists(userId: string): MaybePromise<SavedPlaylist[]>;
+  getSavedPlaylist(userId: string, playlistId: string): MaybePromise<SavedPlaylist | null>;
+  isPlaylistSaved(userId: string, playlistId: string): MaybePromise<boolean>;
+  addLocalPlaylistItem(userId: string, playlistId: string, videoId: string, title: string, channelTitle: string, channelId: string): MaybePromise<void>;
+  removeLocalPlaylistItem(userId: string, playlistId: string, videoId: string): MaybePromise<void>;
+  moveLocalPlaylistItem(userId: string, playlistId: string, videoId: string, direction: 'up' | 'down'): MaybePromise<void>;
+  getLocalPlaylistItems(userId: string, playlistId: string): MaybePromise<LocalPlaylistItem[]>;
   muteChannel(userId: string, channelId: string): MaybePromise<void>;
   unmuteChannel(userId: string, channelId: string): MaybePromise<void>;
   getMutedChannelIds(userId: string): MaybePromise<string[]>;

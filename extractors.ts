@@ -364,13 +364,13 @@ async function fetchLiveStoryboardSpec(videoId) {
 
   // Strategy 2: yt-dlp with browser cookies fetches the watch page,
   // which contains the storyboard spec in ytInitialPlayerResponse
-  const { ytdlpBrowserArgs } = await import('./ytdlp.js');
+  const { YTDLP_BIN, ytdlpBrowserArgs } = await import('./ytdlp.js');
   const browserArgs = ytdlpBrowserArgs();
   if (!browserArgs) return null;
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sb-'));
   try {
-    await execFileAsync('yt-dlp', [
+    await execFileAsync(YTDLP_BIN, [
       ...browserArgs, '--write-pages', '--skip-download', '--no-warnings',
       '-o', path.join(tmpDir, '%(id)s'), '--', videoId
     ], { timeout: 20000 });

@@ -23,14 +23,14 @@ const TEST_USER = 'test-user-integration';
 const TEST_VIDEO = 'dQw4w9WgXcQ';
 const TEST_CHANNEL = 'UCuAXFkgsw1L7xaCfnd5JJOw'; // valid-looking channel ID
 
-function httpRequest(port, method, urlPath, body) {
+function httpRequest(port, method, urlPath, body, headers = {}) {
   return new Promise((resolve, reject) => {
     const options = {
       hostname: 'localhost',
       port,
       path: urlPath,
       method,
-      headers: {},
+      headers: { ...headers },
     };
     if (body) {
       const data = typeof body === 'string' ? body : JSON.stringify(body);
@@ -51,9 +51,54 @@ function httpRequest(port, method, urlPath, body) {
 }
 
 // Follow redirects manually (one level)
-async function httpGet(port, urlPath) {
-  const res = await httpRequest(port, 'GET', urlPath);
+async function httpGet(port, urlPath, headers) {
+  const res = await httpRequest(port, 'GET', urlPath, undefined, headers);
   return res;
+}
+
+function httpGetUntil(port, urlPath, predicate, headers = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(new Error(`Timed out waiting for streamed response marker: ${urlPath}`));
+    }, 10000);
+    const req = http.request({
+      hostname: 'localhost',
+      port,
+      path: urlPath,
+      method: 'GET',
+      headers,
+    }, (res) => {
+      let chunks = '';
+      res.on('data', (d) => {
+        if (settled) return;
+        chunks += d;
+        if (predicate(chunks)) {
+          settled = true;
+          clearTimeout(timeout);
+          resolve({ status: res.statusCode, body: chunks, headers: res.headers });
+          req.destroy();
+        }
+      });
+      res.on('end', () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve({ status: res.statusCode, body: chunks, headers: res.headers });
+      });
+    });
+    req.on('error', (err) => {
+      if (err.code === 'ECONNRESET') return;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(err);
+    });
+    req.end();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +785,27 @@ describe('HTTP endpoint smoke tests', () => {
     );
   });
 
+  it('GET /watch shell should default to native player without eager Shaka', async () => {
+    const login = await httpRequest(TEST_PORT, 'POST', '/auth/free');
+    const cookie = Array.isArray(login.headers['set-cookie'])
+      ? login.headers['set-cookie'].map((value) => value.split(';')[0]).join('; ')
+      : '';
+    assert.ok(cookie, 'Expected auth cookie from /auth/free');
+
+    const res = await httpGetUntil(
+      TEST_PORT,
+      `/watch?v=${TEST_VIDEO}`,
+      (body) => body.includes('/native-player-engine.js'),
+      { Cookie: cookie }
+    );
+
+    assert.strictEqual(res.status, 200);
+    assert.match(res.body, /<main[^>]*class="[^"]*player-page/);
+    assert.ok(res.body.includes('/native-player-engine.js'), 'Should load the native player engine in the shell');
+    assert.ok(!res.body.includes('/vendor/shaka/shaka-player.compiled.js'), 'Should not eager-load Shaka in the watch shell');
+    assert.ok(!res.body.includes('/player-engine.js'), 'Should not load the legacy Shaka-primary engine in the watch shell');
+  });
+
   it('POST /api/watch-time/dQw4w9WgXcQ without session should return 401', async () => {
     const res = await httpRequest(TEST_PORT, 'POST', '/api/watch-time/dQw4w9WgXcQ', {
       position: 10,
@@ -755,6 +821,8 @@ describe('HTTP endpoint smoke tests', () => {
         videoId: 'dQw4w9WgXcQ',
         provider: 'native-dash',
         mode: 'dash',
+        transmuxerProvider: 'first-party-ts',
+        transmuxedSegmentCount: 2,
         activeHeight: 720,
         bufferAhead: 12,
       }],

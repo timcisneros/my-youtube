@@ -3,6 +3,7 @@ import * as wsStatus from '../../lib/ws-status.js';
 
 // SSE: push extraction progress to the client as backends are tried
 const extractionListeners = new Map(); // videoId -> Set<res>
+wsStatus.setStatusProvider((videoId) => extractionStatus.get(videoId));
 
 function notifyExtractionStep(videoId, step) {
   extractionStatus.set(videoId, { step, ts: Date.now() });

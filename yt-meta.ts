@@ -12,7 +12,7 @@
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 const execFileAsync = promisify(execFile);
-import { ytdlpArgs } from './ytdlp.js';
+import { YTDLP_BIN, ytdlpArgs } from './ytdlp.js';
 import { createCircuitBreaker, refreshClientVersion, getClientVersion, USER_AGENT } from './extractors.js';
 
 const breakers = {
@@ -82,7 +82,7 @@ async function fetchViaScrape(videoId, timeoutMs) {
 // Strategy 3: yt-dlp (single video, subprocess)
 // ---------------------------------------------------------------------------
 async function fetchViaYtdlp(videoId, timeoutMs) {
-  const { stdout } = await execFileAsync('yt-dlp', [
+  const { stdout } = await execFileAsync(YTDLP_BIN, [
     ...ytdlpArgs(),
     '--print', '%(duration)s %(live_status)s',
     '--', videoId,

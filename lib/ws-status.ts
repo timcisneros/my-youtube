@@ -6,6 +6,7 @@
  */
 let wss = null;
 const listeners = new Map(); // videoId → Set<ws>
+let getCurrentStatus: ((videoId: string) => { step?: string } | null | undefined) | null = null;
 
 async function attach(server) {
   try {
@@ -22,6 +23,10 @@ async function attach(server) {
 
       if (!listeners.has(videoId)) listeners.set(videoId, new Set());
       listeners.get(videoId).add(ws);
+      const current = getCurrentStatus ? getCurrentStatus(videoId) : null;
+      if (current) {
+        try { ws.send(JSON.stringify({ step: current.step })); } catch {}
+      }
 
       ws.on('close', () => {
         const set = listeners.get(videoId);
@@ -61,12 +66,18 @@ function notify(videoId, data) {
 
 function isAvailable() { return wss !== null; }
 
+function setStatusProvider(fn: ((videoId: string) => { step?: string } | null | undefined) | null) {
+  getCurrentStatus = typeof fn === 'function' ? fn : null;
+}
+
 function closeAll() {
   if (!wss) return;
   for (const client of wss.clients) {
     try { client.close(1001, 'Server shutting down'); } catch {}
   }
   wss.close();
+  wss = null;
+  listeners.clear();
 }
 
-export { attach, notify, isAvailable, closeAll };
+export { attach, notify, isAvailable, closeAll, setStatusProvider };

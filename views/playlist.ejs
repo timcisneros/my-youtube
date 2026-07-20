@@ -1,0 +1,150 @@
+    <div class="playlist-header">
+      <div>
+        <h1><%= playlist.title %></h1>
+        <div class="playlist-meta">
+          <% if (playlist.channelId && playlist.channelTitle) { %>
+            <a href="/channel/<%= playlist.channelId %>"><%= playlist.channelTitle %></a>
+          <% } else if (playlist.channelTitle) { %>
+            <span><%= playlist.channelTitle %></span>
+          <% } %>
+          <% if (playlist.itemCountText) { %><span><%= playlist.itemCountText %></span><% } %>
+        </div>
+      </div>
+      <div class="playlist-actions">
+        <% if (saved) { %>
+          <button class="playlist-save-toggle saved" data-playlist-id="<%= playlist.playlistId %>">Saved</button>
+        <% } else { %>
+          <button class="playlist-save-toggle" data-playlist-id="<%= playlist.playlistId %>">Save</button>
+        <% } %>
+        <% const firstPlayable = playlist.items.find((item) => item.available && item.videoId); %>
+        <% if (firstPlayable) { %>
+          <a class="playlist-play-all" href="/watch?v=<%= firstPlayable.videoId %>&list=<%= playlist.playlistId %>&index=<%= firstPlayable.index %>">Play all</a>
+        <% } %>
+      </div>
+    </div>
+
+    <% if (pageToken) { %>
+      <div class="playlist-page-note">
+        Showing videos starting at <%= playlist.items[0] ? playlist.items[0].index : 1 %>. <a href="/playlist?list=<%= playlist.playlistId %>">Back to start</a>
+      </div>
+    <% } %>
+
+    <form class="playlist-url-form" action="/playlist" method="get">
+      <input type="text" class="sub-search" name="url" placeholder="Open a playlist URL or ID" autocomplete="off">
+      <button class="import-btn" type="submit">Open</button>
+    </form>
+
+    <% if (isLocal) { %>
+      <form class="playlist-url-form local-playlist-add-form" data-playlist-id="<%= playlist.playlistId %>">
+        <input type="text" class="sub-search" name="video" placeholder="Add a video URL or ID" autocomplete="off">
+        <input type="text" class="sub-search" name="title" placeholder="Optional title" autocomplete="off" maxlength="200">
+        <button class="import-btn" type="submit">Add</button>
+        <span class="import-status"></span>
+      </form>
+    <% } else if (playlist.nextPageToken && !expanded && !pageToken) { %>
+      <div class="playlist-page-note"><a href="/playlist?list=<%= playlist.playlistId %>&all=1">Load all available pages</a></div>
+    <% } %>
+
+    <script>
+    (function() {
+      var btn = document.querySelector('.playlist-save-toggle');
+      if (btn) {
+        btn.addEventListener('click', function() {
+          var saved = btn.classList.contains('saved');
+          btn.disabled = true;
+          fetch('/playlists', {
+            method: saved ? 'DELETE' : 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ list: btn.dataset.playlistId })
+          }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.error) return;
+            btn.classList.toggle('saved', !saved);
+            btn.textContent = saved ? 'Save' : 'Saved';
+          }).finally(function() { btn.disabled = false; }).catch(function() { btn.disabled = false; });
+        });
+      }
+      var addForm = document.querySelector('.local-playlist-add-form');
+      if (addForm) {
+        addForm.addEventListener('submit', function(e) {
+          e.preventDefault();
+          var videoInput = addForm.querySelector('input[name="video"]');
+          var titleInput = addForm.querySelector('input[name="title"]');
+          var status = addForm.querySelector('.import-status');
+          var video = videoInput ? videoInput.value.trim() : '';
+          if (!video) return;
+          status.innerHTML = '<span class="import-spinner"></span>Adding...';
+          fetch('/playlists/' + addForm.dataset.playlistId + '/items', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ video: video, title: titleInput ? titleInput.value.trim() : '' })
+          }).then(function(r) { return r.json(); }).then(function(data) {
+            if (data.error) { status.textContent = data.error; return; }
+            location.reload();
+          }).catch(function() { status.textContent = 'Add failed'; });
+        });
+      }
+      document.querySelectorAll('.local-playlist-item-btn').forEach(function(itemBtn) {
+        itemBtn.addEventListener('click', function(e) {
+          e.preventDefault();
+          e.stopPropagation();
+          var method = itemBtn.dataset.action === 'remove' ? 'DELETE' : 'PATCH';
+          fetch('/playlists/' + itemBtn.dataset.playlistId + '/items', {
+            method: method,
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ videoId: itemBtn.dataset.videoId, direction: itemBtn.dataset.action })
+          }).then(function() { location.reload(); }).catch(function() {});
+        });
+      });
+    })();
+    </script>
+
+    <% if (playlist.items.length === 0) { %>
+      <p class="empty">No videos found for this playlist.</p>
+    <% } else { %>
+      <div class="playlist-list">
+        <% for (const v of playlist.items) { %>
+          <% if (v.available && v.videoId && !isLocal) { %>
+            <a href="/watch?v=<%= v.videoId %>&list=<%= playlist.playlistId %>&index=<%= v.index %>" class="playlist-row">
+          <% } else { %>
+            <div class="playlist-row<%= v.available ? '' : ' playlist-row-unavailable' %><%= isLocal ? ' playlist-row-local' : '' %>">
+          <% } %>
+              <span class="playlist-row-index"><%= v.index %></span>
+              <div class="playlist-row-thumb">
+                <% if (v.videoId) { %>
+                  <img data-src="/api/stream/<%= v.videoId %>/thumb" alt="" class="video-thumb lazy-thumb" width="160" height="90">
+                <% } %>
+                <% if (v.videoId && typeof liveStatuses !== 'undefined' && liveStatuses[v.videoId] === 'is_live') { %><span class="video-badge live" data-video-id="<%= v.videoId %>">LIVE</span><% } else if (v.videoId && typeof liveStatuses !== 'undefined' && liveStatuses[v.videoId] === 'is_upcoming') { %><span class="video-badge upcoming" data-video-id="<%= v.videoId %>">UPCOMING</span><% } else if (v.lengthText) { %><span class="video-duration"><%= v.lengthText %></span><% } else if (v.videoId && typeof durations !== 'undefined' && durations[v.videoId]) { %><span class="video-duration" data-video-id="<%= v.videoId %>"><%= durations[v.videoId] %></span><% } else if (v.videoId) { %><span class="video-duration" data-video-id="<%= v.videoId %>"></span><% } %>
+                <% if (v.videoId) { %><div class="watch-progress" data-progress-id="<%= v.videoId %>"></div><% } %>
+              </div>
+              <div class="playlist-row-info">
+                <div class="video-title">
+                  <% if (isLocal && v.available && v.videoId) { %>
+                    <a href="/watch?v=<%= v.videoId %>&list=<%= playlist.playlistId %>&index=<%= v.index %>"><%= v.title %></a>
+                  <% } else { %>
+                    <%= v.title %>
+                  <% } %>
+                </div>
+                <% if (v.channelTitle) { %><div class="video-channel"><%= v.channelTitle %></div><% } %>
+                <% if (!v.available) { %><div class="video-time"><%= v.unavailableReason || 'Unavailable' %></div><% } %>
+              </div>
+              <% if (isLocal && v.videoId) { %>
+                <div class="playlist-row-controls">
+                  <button class="local-playlist-item-btn" data-action="up" data-playlist-id="<%= playlist.playlistId %>" data-video-id="<%= v.videoId %>" title="Move up">↑</button>
+                  <button class="local-playlist-item-btn" data-action="down" data-playlist-id="<%= playlist.playlistId %>" data-video-id="<%= v.videoId %>" title="Move down">↓</button>
+                  <button class="local-playlist-item-btn" data-action="remove" data-playlist-id="<%= playlist.playlistId %>" data-video-id="<%= v.videoId %>" title="Remove">&times;</button>
+                </div>
+              <% } %>
+          <% if (v.available && v.videoId && !isLocal) { %>
+            </a>
+          <% } else { %>
+            </div>
+          <% } %>
+        <% } %>
+      </div>
+      <% if (playlist.nextPageToken) { %>
+        <div class="pagination">
+          <a href="/playlist?list=<%= playlist.playlistId %>&pageToken=<%= encodeURIComponent(playlist.nextPageToken) %>&start=<%= nextStart %>">Next page &rarr;</a>
+        </div>
+      <% } %>
+    <% } %>
+  </main>

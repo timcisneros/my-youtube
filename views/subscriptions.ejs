@@ -58,6 +58,7 @@
             return list;
           });
         }
+        getServerBrowsers().catch(function() {});
 
         if (fetchBtn) {
           fetchBtn.addEventListener('click', function() {
@@ -65,12 +66,11 @@
             showLoading(fetchStatus, 'Detecting browser...');
             getServerBrowsers().then(function(available) {
               if (!available.length) { fetchStatus.textContent = 'No browser cookies found'; fetchBtn.disabled = false; return; }
-              var browser = available[0];
-              showLoading(fetchStatus, 'Fetching subscriptions via ' + browser + '...');
+              showLoading(fetchStatus, 'Fetching subscriptions from this browser...');
               return fetch('/api/subscriptions/fetch', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ browser: browser })
+                body: JSON.stringify({})
               })
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
@@ -108,17 +108,16 @@
             showLoading(cookieRefreshStatus, 'Detecting browser...');
             getServerBrowsers().then(function(available) {
               if (!available.length) { cookieRefreshStatus.textContent = 'No browser cookies found'; cookieRefreshBtn.disabled = false; return; }
-              var browser = available[0];
-              showLoading(cookieRefreshStatus, 'Refreshing cookies via ' + browser + '...');
+              showLoading(cookieRefreshStatus, 'Refreshing cookies from this browser...');
               return fetch('/api/cookies/refresh', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ browser: browser })
+                body: JSON.stringify({})
               })
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
                   if (data.error) { cookieRefreshStatus.textContent = data.error; cookieRefreshBtn.disabled = false; return; }
-                  cookieRefreshStatus.textContent = 'Cookies refreshed via ' + browser + '!';
+                  cookieRefreshStatus.textContent = 'Cookies refreshed!';
                   cookieRefreshBtn.disabled = false;
                 });
             }).catch(function() { cookieRefreshStatus.textContent = 'Refresh failed'; cookieRefreshBtn.disabled = false; });

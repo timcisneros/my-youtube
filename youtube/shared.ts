@@ -14,6 +14,7 @@ const cache = {
   exploreVideos: new SharedLRUMap(100, 'explore'), // userId -> { data, expires } (shared across workers)
   channelInfo: new SharedLRUMap(500, 'ch'),   // channelId -> { data, expires }
   videoDetails: new SharedLRUMap(2000, 'vid'), // videoId -> { data, expires }
+  playlists: new SharedLRUMap(300, 'pl'),      // playlistId -> { data, expires }
   rss: new SharedLRUMap(1000, 'rss'),          // channelId -> { data, expires }
 };
 
@@ -22,6 +23,7 @@ const TODAY_TTL = 30 * 60 * 1000;         // 30 minutes
 const EXPLORE_TTL = 15 * 60 * 1000;       // 15 minutes
 const CHANNEL_TTL = 60 * 60 * 1000;       // 1 hour
 const VIDEO_DETAILS_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const PLAYLIST_TTL = 30 * 60 * 1000;      // 30 minutes
 const RSS_TTL = 15 * 60 * 1000;          // 15 minutes
 
 // Global semaphore — caps concurrent outbound YouTube HTTP requests to prevent IP bans
@@ -60,13 +62,16 @@ const cacheSweepTimer = setInterval(() => {
   for (const [key, entry] of cache.videoDetails) {
     if (now > entry.expires) cache.videoDetails.delete(key);
   }
+  for (const [key, entry] of cache.playlists) {
+    if (now > entry.expires) cache.playlists.delete(key);
+  }
   for (const [key, entry] of cache.rss) {
     if (now > entry.expires) cache.rss.delete(key);
   }
 }, 10 * 60 * 1000);
-cacheSweepTimer.unref();
+if (typeof cacheSweepTimer.unref === 'function') cacheSweepTimer.unref();
 
 export {
   cache, LRUMap, withYtSlot,
-  SUB_TTL, TODAY_TTL, EXPLORE_TTL, CHANNEL_TTL, VIDEO_DETAILS_TTL, RSS_TTL,
+  SUB_TTL, TODAY_TTL, EXPLORE_TTL, CHANNEL_TTL, VIDEO_DETAILS_TTL, PLAYLIST_TTL, RSS_TTL,
 };

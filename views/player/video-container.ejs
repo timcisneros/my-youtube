@@ -58,6 +58,36 @@
       </div>
     </div>
 
+    <% if (typeof playlist !== 'undefined' && playlist && playlist.items && playlist.items.length) { %>
+      <div class="player-playlist-panel">
+        <div class="player-playlist-header">
+          <a href="/playlist?list=<%= playlist.playlistId %>"><%= playlist.title %></a>
+          <span><%= playlist.currentIndex %> / <%= playlist.items.length %></span>
+        </div>
+        <div class="player-playlist-actions">
+          <% if (playlist.prevUrl) { %><a href="<%= playlist.prevUrl %>">Previous</a><% } %>
+          <% if (playlist.nextUrl) { %><a href="<%= playlist.nextUrl %>">Next</a><% } %>
+        </div>
+        <div class="player-playlist-items">
+          <% for (const item of playlist.items) { %>
+            <% if (item.available && item.videoId) { %>
+              <a href="/watch?v=<%= item.videoId %>&list=<%= playlist.playlistId %>&index=<%= item.index %>" class="player-playlist-item<%= item.videoId === video.videoId ? ' active' : '' %>">
+                <span class="player-playlist-index"><%= item.index %></span>
+                <img data-src="/api/stream/<%= item.videoId %>/thumb" alt="" class="player-playlist-thumb lazy-thumb" width="96" height="54">
+                <span class="player-playlist-title"><%= item.title %></span>
+              </a>
+            <% } else { %>
+              <span class="player-playlist-item player-playlist-item-unavailable">
+                <span class="player-playlist-index"><%= item.index %></span>
+                <span class="player-playlist-thumb"></span>
+                <span class="player-playlist-title"><%= item.title %></span>
+              </span>
+            <% } %>
+          <% } %>
+        </div>
+      </div>
+    <% } %>
+
     <div class="player-supplemental">
       <details class="player-description" id="player-description">
         <summary>Description</summary>

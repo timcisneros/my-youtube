@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import { promisify } from 'util';
 import { execFile } from 'child_process';
-import { ytdlpArgs } from '../../ytdlp.js';
+import { YTDLP_BIN, ytdlpArgs } from '../../ytdlp.js';
 import {
   withYtdlpSlot,
   isClientGone,
@@ -33,7 +33,7 @@ async function fetchVttViaDlp(videoId, lang, isAuto) {
 
   try {
     return await withYtdlpSlot(async () => {
-      await execFileAsync('yt-dlp', subArgs, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
+      await execFileAsync(YTDLP_BIN, subArgs, { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
       const vttPath = `${tmpBase}.${lang}.vtt`;
       if (!fs.existsSync(vttPath)) return null;
       const vtt = fs.readFileSync(vttPath, 'utf-8');

@@ -129,6 +129,33 @@ const initSQL = `
     PRIMARY KEY(user_id, video_id)
   );
 
+  CREATE TABLE IF NOT EXISTS saved_playlists (
+    user_id TEXT NOT NULL,
+    playlist_id TEXT NOT NULL,
+    playlist_type TEXT NOT NULL DEFAULT 'youtube',
+    title TEXT NOT NULL DEFAULT '',
+    channel_title TEXT NOT NULL DEFAULT '',
+    channel_id TEXT NOT NULL DEFAULT '',
+    thumbnail_video_id TEXT NOT NULL DEFAULT '',
+    item_count_text TEXT NOT NULL DEFAULT '',
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY(user_id, playlist_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_saved_playlists_user ON saved_playlists(user_id, updated_at DESC);
+
+  CREATE TABLE IF NOT EXISTS local_playlist_items (
+    user_id TEXT NOT NULL,
+    playlist_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    channel_title TEXT NOT NULL DEFAULT '',
+    channel_id TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY(user_id, playlist_id, video_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_local_playlist_items ON local_playlist_items(user_id, playlist_id, position);
+
   CREATE TABLE IF NOT EXISTS channel_mutes (
     user_id TEXT NOT NULL,
     channel_id TEXT NOT NULL,
@@ -167,6 +194,7 @@ const initSQL = `
 const _ready = pool.query(initSQL).then(async () => {
   // Migrate: add position column to explore_events if missing
   await pool.query('ALTER TABLE explore_events ADD COLUMN IF NOT EXISTS position INTEGER NOT NULL DEFAULT 0').catch(() => {});
+  await pool.query("ALTER TABLE saved_playlists ADD COLUMN IF NOT EXISTS playlist_type TEXT NOT NULL DEFAULT 'youtube'").catch(() => {});
   // Create explore_sessions table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS explore_sessions (
@@ -634,6 +662,90 @@ const api: DatabaseAPI = {
   async getQueuedVideoIds(userId) {
     const { rows } = await q('SELECT video_id FROM watch_queue WHERE user_id = $1', [userId]);
     return rows.map(r => r.video_id);
+  },
+
+  async savePlaylist(userId, playlistId, title, channelTitle, channelId, thumbnailVideoId, itemCountText, playlistType) {
+    await q(
+      `INSERT INTO saved_playlists (user_id, playlist_id, playlist_type, title, channel_title, channel_id, thumbnail_video_id, item_count_text, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT (user_id, playlist_id) DO UPDATE SET
+         playlist_type = EXCLUDED.playlist_type,
+         title = EXCLUDED.title,
+         channel_title = EXCLUDED.channel_title,
+         channel_id = EXCLUDED.channel_id,
+         thumbnail_video_id = EXCLUDED.thumbnail_video_id,
+         item_count_text = EXCLUDED.item_count_text,
+         updated_at = NOW()`,
+      [userId, playlistId, playlistType || 'youtube', title || '', channelTitle || '', channelId || '', thumbnailVideoId || '', itemCountText || '']
+    );
+  },
+
+  async unsavePlaylist(userId, playlistId) {
+    await q('DELETE FROM saved_playlists WHERE user_id = $1 AND playlist_id = $2', [userId, playlistId]);
+    await q('DELETE FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2', [userId, playlistId]);
+  },
+
+  async getSavedPlaylists(userId) {
+    const { rows } = await q(
+      'SELECT playlist_id, playlist_type, title, channel_title, channel_id, thumbnail_video_id, item_count_text, updated_at FROM saved_playlists WHERE user_id = $1 ORDER BY updated_at DESC',
+      [userId]
+    );
+    return rows;
+  },
+
+  async getSavedPlaylist(userId, playlistId) {
+    const { rows } = await q(
+      'SELECT playlist_id, playlist_type, title, channel_title, channel_id, thumbnail_video_id, item_count_text, updated_at FROM saved_playlists WHERE user_id = $1 AND playlist_id = $2',
+      [userId, playlistId]
+    );
+    return rows[0] || null;
+  },
+
+  async isPlaylistSaved(userId, playlistId) {
+    const { rows } = await q('SELECT 1 FROM saved_playlists WHERE user_id = $1 AND playlist_id = $2', [userId, playlistId]);
+    return rows.length > 0;
+  },
+
+  async addLocalPlaylistItem(userId, playlistId, videoId, title, channelTitle, channelId) {
+    const { rows } = await q(
+      'SELECT COALESCE(MAX(position), 0) + 1 AS pos FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2',
+      [userId, playlistId]
+    );
+    await q(
+      `INSERT INTO local_playlist_items (user_id, playlist_id, video_id, title, channel_title, channel_id, position)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (user_id, playlist_id, video_id) DO UPDATE SET
+         title = EXCLUDED.title,
+         channel_title = EXCLUDED.channel_title,
+         channel_id = EXCLUDED.channel_id`,
+      [userId, playlistId, videoId, title || '', channelTitle || '', channelId || '', rows[0]?.pos || 1]
+    );
+  },
+
+  async removeLocalPlaylistItem(userId, playlistId, videoId) {
+    await q('DELETE FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2 AND video_id = $3', [userId, playlistId, videoId]);
+  },
+
+  async moveLocalPlaylistItem(userId, playlistId, videoId, direction) {
+    const { rows } = await q('SELECT video_id, position FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2 AND video_id = $3', [userId, playlistId, videoId]);
+    const current = rows[0];
+    if (!current) return;
+    const adjacentQuery = direction === 'up'
+      ? 'SELECT video_id, position FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2 AND position < $3 ORDER BY position DESC LIMIT 1'
+      : 'SELECT video_id, position FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2 AND position > $3 ORDER BY position ASC LIMIT 1';
+    const adjacentRows = await q(adjacentQuery, [userId, playlistId, current.position]);
+    const adjacent = adjacentRows.rows[0];
+    if (!adjacent) return;
+    await q('UPDATE local_playlist_items SET position = $1 WHERE user_id = $2 AND playlist_id = $3 AND video_id = $4', [adjacent.position, userId, playlistId, current.video_id]);
+    await q('UPDATE local_playlist_items SET position = $1 WHERE user_id = $2 AND playlist_id = $3 AND video_id = $4', [current.position, userId, playlistId, adjacent.video_id]);
+  },
+
+  async getLocalPlaylistItems(userId, playlistId) {
+    const { rows } = await q(
+      'SELECT playlist_id, video_id, title, channel_title, channel_id, position, created_at FROM local_playlist_items WHERE user_id = $1 AND playlist_id = $2 ORDER BY position ASC, created_at ASC',
+      [userId, playlistId]
+    );
+    return rows;
   },
 
   async muteChannel(userId, channelId) {

@@ -120,6 +120,33 @@ db.exec(`
     PRIMARY KEY(user_id, video_id)
   );
 
+  CREATE TABLE IF NOT EXISTS saved_playlists (
+    user_id TEXT NOT NULL,
+    playlist_id TEXT NOT NULL,
+    playlist_type TEXT NOT NULL DEFAULT 'youtube',
+    title TEXT NOT NULL DEFAULT '',
+    channel_title TEXT NOT NULL DEFAULT '',
+    channel_id TEXT NOT NULL DEFAULT '',
+    thumbnail_video_id TEXT NOT NULL DEFAULT '',
+    item_count_text TEXT NOT NULL DEFAULT '',
+    updated_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY(user_id, playlist_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_saved_playlists_user ON saved_playlists(user_id, updated_at DESC);
+
+  CREATE TABLE IF NOT EXISTS local_playlist_items (
+    user_id TEXT NOT NULL,
+    playlist_id TEXT NOT NULL,
+    video_id TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    channel_title TEXT NOT NULL DEFAULT '',
+    channel_id TEXT NOT NULL DEFAULT '',
+    position INTEGER NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY(user_id, playlist_id, video_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_local_playlist_items ON local_playlist_items(user_id, playlist_id, position);
+
   CREATE TABLE IF NOT EXISTS channel_mutes (
     user_id TEXT NOT NULL,
     channel_id TEXT NOT NULL,
@@ -165,6 +192,13 @@ try {
   db.prepare("SELECT description FROM video_durations LIMIT 1").get();
 } catch {
   db.exec("ALTER TABLE video_durations ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+}
+
+// Migrate: add playlist_type column if missing (existing DBs)
+try {
+  db.prepare("SELECT playlist_type FROM saved_playlists LIMIT 1").get();
+} catch {
+  db.exec("ALTER TABLE saved_playlists ADD COLUMN playlist_type TEXT NOT NULL DEFAULT 'youtube'");
 }
 
 // Migrate: add position column to explore_events if missing
@@ -289,6 +323,23 @@ const stmts = {
   unqueueVideo: db.prepare('DELETE FROM watch_queue WHERE user_id = ? AND video_id = ?'),
   getQueuedVideos: db.prepare('SELECT video_id, title, channel_title, channel_id, created_at FROM watch_queue WHERE user_id = ? ORDER BY created_at DESC'),
   getQueuedVideoIds: db.prepare('SELECT video_id FROM watch_queue WHERE user_id = ?'),
+  savePlaylist: db.prepare(`INSERT INTO saved_playlists (user_id, playlist_id, playlist_type, title, channel_title, channel_id, thumbnail_video_id, item_count_text, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(user_id, playlist_id) DO UPDATE SET playlist_type=excluded.playlist_type, title=excluded.title, channel_title=excluded.channel_title, channel_id=excluded.channel_id, thumbnail_video_id=excluded.thumbnail_video_id, item_count_text=excluded.item_count_text, updated_at=datetime('now')`),
+  unsavePlaylist: db.prepare('DELETE FROM saved_playlists WHERE user_id = ? AND playlist_id = ?'),
+  deleteLocalPlaylistItems: db.prepare('DELETE FROM local_playlist_items WHERE user_id = ? AND playlist_id = ?'),
+  getSavedPlaylists: db.prepare('SELECT playlist_id, playlist_type, title, channel_title, channel_id, thumbnail_video_id, item_count_text, updated_at FROM saved_playlists WHERE user_id = ? ORDER BY updated_at DESC'),
+  getSavedPlaylist: db.prepare('SELECT playlist_id, playlist_type, title, channel_title, channel_id, thumbnail_video_id, item_count_text, updated_at FROM saved_playlists WHERE user_id = ? AND playlist_id = ?'),
+  getLocalPlaylistNextPosition: db.prepare('SELECT COALESCE(MAX(position), 0) + 1 AS pos FROM local_playlist_items WHERE user_id = ? AND playlist_id = ?'),
+  addLocalPlaylistItem: db.prepare(`INSERT INTO local_playlist_items (user_id, playlist_id, video_id, title, channel_title, channel_id, position)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, playlist_id, video_id) DO UPDATE SET title=excluded.title, channel_title=excluded.channel_title, channel_id=excluded.channel_id`),
+  removeLocalPlaylistItem: db.prepare('DELETE FROM local_playlist_items WHERE user_id = ? AND playlist_id = ? AND video_id = ?'),
+  getLocalPlaylistItems: db.prepare('SELECT playlist_id, video_id, title, channel_title, channel_id, position, created_at FROM local_playlist_items WHERE user_id = ? AND playlist_id = ? ORDER BY position ASC, created_at ASC'),
+  getLocalPlaylistItem: db.prepare('SELECT video_id, position FROM local_playlist_items WHERE user_id = ? AND playlist_id = ? AND video_id = ?'),
+  getAdjacentLocalPlaylistItemUp: db.prepare('SELECT video_id, position FROM local_playlist_items WHERE user_id = ? AND playlist_id = ? AND position < ? ORDER BY position DESC LIMIT 1'),
+  getAdjacentLocalPlaylistItemDown: db.prepare('SELECT video_id, position FROM local_playlist_items WHERE user_id = ? AND playlist_id = ? AND position > ? ORDER BY position ASC LIMIT 1'),
+  setLocalPlaylistItemPosition: db.prepare('UPDATE local_playlist_items SET position = ? WHERE user_id = ? AND playlist_id = ? AND video_id = ?'),
   muteChannel: db.prepare('INSERT OR IGNORE INTO channel_mutes (user_id, channel_id) VALUES (?, ?)'),
   unmuteChannel: db.prepare('DELETE FROM channel_mutes WHERE user_id = ? AND channel_id = ?'),
   getMutedChannelIds: db.prepare('SELECT channel_id FROM channel_mutes WHERE user_id = ?'),
@@ -584,6 +635,51 @@ api = {
   getQueuedVideoIds(userId) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
     return (stmts.getQueuedVideoIds.all(userId) as any[]).map((r: any) => r.video_id);
+  },
+  savePlaylist(userId, playlistId, title, channelTitle, channelId, thumbnailVideoId, itemCountText, playlistType) {
+    stmts.savePlaylist.run(userId, playlistId, playlistType || 'youtube', title || '', channelTitle || '', channelId || '', thumbnailVideoId || '', itemCountText || '');
+  },
+  unsavePlaylist(userId, playlistId) {
+    const run = db.transaction(() => {
+      stmts.unsavePlaylist.run(userId, playlistId);
+      stmts.deleteLocalPlaylistItems.run(userId, playlistId);
+    });
+    run();
+  },
+  getSavedPlaylists(userId) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
+    return stmts.getSavedPlaylists.all(userId) as any[];
+  },
+  getSavedPlaylist(userId, playlistId) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
+    return (stmts.getSavedPlaylist.get(userId, playlistId) as any) || null;
+  },
+  isPlaylistSaved(userId, playlistId) {
+    return Boolean(stmts.getSavedPlaylist.get(userId, playlistId));
+  },
+  addLocalPlaylistItem(userId, playlistId, videoId, title, channelTitle, channelId) {
+    const row = stmts.getLocalPlaylistNextPosition.get(userId, playlistId) as { pos?: number } | undefined;
+    stmts.addLocalPlaylistItem.run(userId, playlistId, videoId, title || '', channelTitle || '', channelId || '', row?.pos || 1);
+  },
+  removeLocalPlaylistItem(userId, playlistId, videoId) {
+    stmts.removeLocalPlaylistItem.run(userId, playlistId, videoId);
+  },
+  moveLocalPlaylistItem(userId, playlistId, videoId, direction) {
+    const run = db.transaction(() => {
+      const current = stmts.getLocalPlaylistItem.get(userId, playlistId, videoId) as { video_id: string; position: number } | undefined;
+      if (!current) return;
+      const adjacent = (direction === 'up'
+        ? stmts.getAdjacentLocalPlaylistItemUp.get(userId, playlistId, current.position)
+        : stmts.getAdjacentLocalPlaylistItemDown.get(userId, playlistId, current.position)) as { video_id: string; position: number } | undefined;
+      if (!adjacent) return;
+      stmts.setLocalPlaylistItemPosition.run(adjacent.position, userId, playlistId, current.video_id);
+      stmts.setLocalPlaylistItemPosition.run(current.position, userId, playlistId, adjacent.video_id);
+    });
+    run();
+  },
+  getLocalPlaylistItems(userId, playlistId) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- better-sqlite3 returns unknown
+    return stmts.getLocalPlaylistItems.all(userId, playlistId) as any[];
   },
   muteChannel(userId, channelId) {
     stmts.muteChannel.run(userId, channelId);

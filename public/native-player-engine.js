@@ -1,7 +1,7 @@
 /**
- * PlayerEngine — native-first playback engine with explicit Shaka fallback.
+ * PlayerEngine — native-first playback engine.
  *
- * The public API intentionally matches the old Shaka-backed engine so the
+ * The public API intentionally preserves the old player adapter shape so the
  * player UI can migrate without a redesign.
  */
 (function () {
@@ -15,10 +15,17 @@
   var ABR_DOWNGRADE_BUFFER = 4;
   var LIVE_TARGET_LATENCY = 6;
   var LIVE_MAX_LATENCY = 18;
+  var LIVE_STABLE_START_LATENCY = 60;
+  var LIVE_BUFFER_AHEAD = 36;
+  var LIVE_STARTUP_ABR_FACTOR = 0.35;
+  var LIVE_STABLE_ABR_FACTOR = 0.55;
+  var LIVE_STARTUP_MAX_HEIGHT = 480;
+  var LIVE_UPGRADE_HOLDOFF_MS = 180000;
   var MAX_GAP_JUMP = 0.75;
   var STARTUP_BUFFER_GOAL = 4;
   var MAX_CONCURRENT_MEDIA_REQUESTS = 3;
-  var SHAKA_URL = '/vendor/shaka/shaka-player.compiled.js';
+  var SOURCEBUFFER_WATCHDOG_MS = 1200;
+  var SEGMENT_BUSY_WATCHDOG_MS = 2500;
 
   function PlayerEngine(videoElement, opts) {
     this.video = videoElement;
@@ -42,6 +49,7 @@
     this._finalVia = '';
     this._state = 'idle';
     this._fallbackReason = '';
+    this._nativeTerminalReason = '';
     this._loadStartedAt = 0;
     this._offlinePlayback = false;
     this._manifestFromServiceWorker = false;
@@ -127,8 +135,8 @@
         }).catch(function () {
           if (self.destroyed) return;
           self._setRecovering(false);
-          self._fallbackToShaka('video-error-' + e.code, self.lastGoodTime || self.video.currentTime || 0).catch(function (fallbackErr) {
-            console.error('[player-engine] fallback failed:', fallbackErr);
+          self._completeNativeTerminalError(nativeTerminalError(self._provider, 'video-error-' + e.code)).catch(function (terminalErr) {
+            console.error('[player-engine] native terminal failed:', terminalErr);
           });
         });
       }
@@ -149,14 +157,19 @@
     this._pendingLoadStartTime = isFinite(Number(startTime)) && Number(startTime) >= 0 ? Number(startTime) : null;
     this.setLive(false);
     this._loadStartedAt = performance.now();
+    this._nativeTerminalReason = '';
     this._telemetry.record('load-start');
     this._setState('loading');
-    return this._loadNative(url, mimeType).then(function () {
+    return Promise.resolve().then(function () {
+      return self._loadNative(url, mimeType);
+    }).then(function () {
       return seekToStartTime(self, startTime);
     }).catch(function (err) {
       if (err && err.serverError) throw err;
       if (self._shouldKeepNativeOffline(err)) throw err;
-      return self._fallbackToShaka(err && err.message ? err.message : 'native-load-failed', startTime, url);
+      if (isNativeTerminalError(err)) return self._completeNativeTerminalError(err);
+      if (isNativeLoadTerminalError(err)) return self._completeNativeTerminalError(nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed'));
+      return self._completeNativeTerminalError(nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed'));
     }).then(function (value) {
       self._pendingLoadStartTime = null;
       return value;
@@ -167,9 +180,16 @@
     var self = this;
     this._destroyProvider();
     if (isLikelyNativeUrl(url) || isHlsMimeType(mimeType)) {
+      if ((/\.m3u8(\?|$)/i.test(url) || isHlsMimeType(mimeType)) && shouldUseFirstPartyHls(url)) {
+        this._provider = new NativeHlsProvider(this, stampUri(this, url));
+        this._providerName = this._provider.name;
+        window._playerProvider = this._providerName;
+        console.log('[player-engine] provider=' + this._providerName + ' mode=hls');
+        return this._provider.load();
+      }
       if ((/\.m3u8(\?|$)/i.test(url) || isHlsMimeType(mimeType)) && !canPlayNativeHls(this.video)) {
         if (!window.MediaSource) throw new Error('mse-unavailable');
-        this._provider = new NativeHlsProvider(this, url);
+        this._provider = new NativeHlsProvider(this, stampUri(this, url));
         this._providerName = this._provider.name;
         window._playerProvider = this._providerName;
         console.log('[player-engine] provider=' + this._providerName + ' mode=hls');
@@ -187,29 +207,41 @@
       if (manifest.via) self.emit('via', manifest.via);
       if (manifest.downloadedHeight) self.emit('downloaded-height', manifest.downloadedHeight);
         if (manifest.json) {
-        if (manifest.json.hls && canPlayNativeHls(self.video)) {
-          self._finalVia = (manifest.json.via || 'yt-dlp') + '/hls';
-          self.emit('via', self._finalVia);
-          self._provider = new NativeUrlProvider(self, manifest.json.hls, 'hls');
-          self._providerName = self._provider.name;
-          window._playerProvider = self._providerName;
-          console.log('[player-engine] provider=' + self._providerName + ' mode=hls');
-          return self._provider.load();
-        }
-        if (manifest.json.hls && !manifest.json.progressive) {
+        var hlsUrl = manifest.json.hls ? stampUri(self, manifest.json.hls) : '';
+        var progressiveUrl = manifest.json.progressive ? stampUri(self, manifest.json.progressive) : '';
+        if (hlsUrl && shouldUseFirstPartyHls(hlsUrl)) {
           if (!window.MediaSource) throw new Error('mse-unavailable');
           self._finalVia = (manifest.json.via || 'yt-dlp') + '/hls';
           self.emit('via', self._finalVia);
-          self._provider = new NativeHlsProvider(self, manifest.json.hls);
+          self._provider = new NativeHlsProvider(self, hlsUrl);
           self._providerName = self._provider.name;
           window._playerProvider = self._providerName;
           console.log('[player-engine] provider=' + self._providerName + ' mode=hls');
           return self._provider.load();
         }
-        if (manifest.json.progressive) {
+        if (hlsUrl && canPlayNativeHls(self.video)) {
+          self._finalVia = (manifest.json.via || 'yt-dlp') + '/hls';
+          self.emit('via', self._finalVia);
+          self._provider = new NativeUrlProvider(self, hlsUrl, 'hls');
+          self._providerName = self._provider.name;
+          window._playerProvider = self._providerName;
+          console.log('[player-engine] provider=' + self._providerName + ' mode=hls');
+          return self._provider.load();
+        }
+        if (hlsUrl && !progressiveUrl) {
+          if (!window.MediaSource) throw new Error('mse-unavailable');
+          self._finalVia = (manifest.json.via || 'yt-dlp') + '/hls';
+          self.emit('via', self._finalVia);
+          self._provider = new NativeHlsProvider(self, hlsUrl);
+          self._providerName = self._provider.name;
+          window._playerProvider = self._providerName;
+          console.log('[player-engine] provider=' + self._providerName + ' mode=hls');
+          return self._provider.load();
+        }
+        if (progressiveUrl) {
           self._finalVia = (manifest.json.via || 'yt-dlp') + '/progressive';
           self.emit('via', self._finalVia);
-          self._provider = new NativeUrlProvider(self, manifest.json.progressive, 'progressive');
+          self._provider = new NativeUrlProvider(self, progressiveUrl, 'progressive');
           self._providerName = self._provider.name;
           window._playerProvider = self._providerName;
           console.log('[player-engine] provider=' + self._providerName + ' mode=progressive');
@@ -230,26 +262,24 @@
     });
   };
 
-  PlayerEngine.prototype._fallbackToShaka = function (reason, startTime, url) {
-    var self = this;
-    if (this._shouldKeepNativeOffline(new Error(reason || 'native-load-failed'))) {
-      return Promise.reject(new Error(this._lastOfflineError || reason || 'offline-native-playback-error'));
+  PlayerEngine.prototype._completeNativeTerminalError = function (err) {
+    var reason = err && err.message ? err.message : 'native-unsupported';
+    this._nativeTerminalReason = reason;
+    if (this._provider) {
+      this._provider.lastError = reason;
+      this._provider.fatalError = reason;
+      this._provider.nativeUnsupportedReason = reason;
+    } else {
+      this._providerName = this._providerName || 'native-terminal';
+      window._playerProvider = this._providerName;
     }
-    this._setState('fallback');
-    return loadShaka().then(function () {
-      if (!window.shaka || !window.shaka.Player) {
-        throw new Error('shaka-unavailable after ' + reason);
-      }
-      self._destroyProvider();
-      self._provider = new ShakaFallbackProvider(self, reason);
-      self._providerName = self._provider.name;
-      window._playerProvider = self._providerName;
-      window._shakaPlayer = self._provider.player;
-      self._fallbackReason = reason;
-      console.warn('[player-engine] falling back to shaka: reason=' + reason);
-      self._telemetry.record('fallback', { fallbackReason: reason });
-      return self._provider.load(url || self.manifestUrl, startTime);
+    this._setState('error');
+    this._telemetry.record('native-unsupported', {
+      lastError: reason,
+      hlsEncryptionMethod: err && err.hlsEncryptionMethod ? err.hlsEncryptionMethod : '',
+      hlsKeyFormat: err && err.hlsKeyFormat ? err.hlsKeyFormat : ''
     });
+    return Promise.resolve();
   };
 
   PlayerEngine.prototype._recordManifestSource = function (manifest) {
@@ -282,7 +312,7 @@
     if (this._state === state) return;
     this._state = state;
     this.recovering = state === 'recovering';
-    this.recoveryTransition = state === 'recovering' || state === 'seeking' || state === 'fallback';
+    this.recoveryTransition = state === 'recovering' || state === 'seeking';
     this.networkTrouble = this._serverDown;
     console.debug('[player-engine] state=' + state + ' provider=' + (this._providerName || 'none'));
   };
@@ -520,6 +550,8 @@
       provider: stats.provider || engine._providerName || '',
       mode: stats.mode || '',
       fallbackReason: stats.fallbackReason || engine._fallbackReason || '',
+      transmuxerProvider: stats.transmuxerProvider || '',
+      transmuxedSegmentCount: stats.transmuxedSegmentCount || 0,
       lastError: stats.lastError || '',
       lastHttpStatus: stats.lastHttpStatus || 0,
       activeHeight: active.height || 0,
@@ -767,6 +799,14 @@
     var stats = this.engine._provider && this.engine._provider.getStats
       ? this.engine._provider.getStats()
       : {};
+    if (!this.engine._provider && this.engine._nativeTerminalReason) {
+      stats.provider = this.engine._providerName || 'native-terminal';
+      stats.mode = 'native-terminal';
+      stats.fallbackReason = '';
+      stats.lastError = this.engine._nativeTerminalReason;
+      stats.fatalError = this.engine._nativeTerminalReason;
+      stats.nativeUnsupportedReason = this.engine._nativeTerminalReason;
+    }
     stats = mergeNetworkStats(this.engine, stats || {});
     stats.playbackRate = this.getPlaybackRate();
     stats.playbackRateChangeCount = this.playbackRateChangeCount || 0;
@@ -1085,6 +1125,7 @@
     this.rebufferDuration = 0;
     this.lastError = '';
     this.fatalError = '';
+    this.nativeUnsupportedReason = '';
     this.assetUri = '';
   }
 
@@ -1124,8 +1165,9 @@
           return;
         }
         cleanup();
+        self.lastError = 'native-url-error';
         self.fatalError = 'native-url-error';
-        reject(new Error('native-url-error'));
+        reject(nativeTerminalError(self, 'native-url-error'));
       }
       self.video.addEventListener('loadedmetadata', onLoaded);
       self.video.addEventListener('error', onError);
@@ -1194,6 +1236,7 @@
       segmentCacheHitCount: 0,
       segmentCacheMissCount: 0,
       lastOfflineError: this.engine ? (this.engine._lastOfflineError || '') : '',
+      nativeUnsupportedReason: this.nativeUnsupportedReason || '',
       fatalError: this.fatalError
     };
   };
@@ -1231,8 +1274,10 @@
       return;
     }
     this.fatalError = 'native-url-error';
-    this.engine._telemetry.record('fallback', { fallbackReason: 'native-url-error', lastError: this.fatalError });
-    this.engine._fallbackToShaka('native-url-error', this.video.currentTime || this.engine.lastGoodTime || 0);
+    this.lastError = 'native-url-error';
+    if (this.engine && this.engine._completeNativeTerminalError) {
+      this.engine._completeNativeTerminalError(nativeTerminalError(this, 'native-url-error'));
+    }
   };
 
   function NativeHlsProvider(engine, playlistUrl) {
@@ -1280,6 +1325,9 @@
     this.lastError = '';
     this.lastHttpStatus = 0;
     this.playlistRefreshCount = 0;
+    this.liveLowBufferRefreshCount = 0;
+    this.liveRefreshInFlight = false;
+    this.lastLiveRefreshStartedAt = 0;
     this.mediaFetchCompletedCount = 0;
     this.mediaFetchRetryCount = 0;
     this.mediaFetchTotalMs = 0;
@@ -1290,6 +1338,7 @@
     this.lastServiceWorkerSource = '';
     this.schedulerDrainCount = 0;
     this.schedulerBackpressureCount = 0;
+    this.sourceBufferAbortCount = 0;
     this.startupBufferComplete = false;
     this.startupBufferStartedAt = 0;
     this.startupBufferMs = 0;
@@ -1307,6 +1356,11 @@
     this.liveWindow = null;
     this.liveLatency = 0;
     this.atLiveEdge = false;
+    this.startupLiveTarget = null;
+    this.liveStartupCandidate = false;
+    this.liveStableSince = 0;
+    this.liveWindowDriftRecoveryCount = 0;
+    this.vodEndOfStreamCount = 0;
     this.mediaSequence = 0;
     this.discontinuitySequence = 0;
     this.discontinuityCount = 0;
@@ -1315,6 +1369,7 @@
     this.tsTransmuxer = null;
     this.tsVideoTransmuxer = null;
     this.tsAudioTransmuxer = null;
+    this.tsTransmuxers = { video: null, audio: null };
     this.tsTransmuxerProvider = '';
     this.tsTransmuxerLoadMs = 0;
     this.transmuxedSegmentCount = 0;
@@ -1327,6 +1382,10 @@
     this.keyFetchCount = 0;
     this.keyCacheHitCount = 0;
     this.lastDecryptionError = '';
+    this.hlsEncryptionMethod = '';
+    this.hlsKeyFormat = '';
+    this.nativeUnsupportedReason = '';
+    this.fatalError = '';
     this.nativeRecoveryAttemptCount = 0;
     this.nativeRecoverySuccessCount = 0;
     this.lastNativeRecoveryReason = '';
@@ -1340,6 +1399,10 @@
     this.timelineRegions = [];
     this.timelineRegionKeys = {};
     this.lastTimelineRegion = null;
+    this.sessionData = [];
+    this.sessionDataCount = 0;
+    this.hlsChapterCount = 0;
+    this.lastHlsChapterError = '';
     this.manifestStartTime = null;
     this.lowLatencyPlaylist = false;
     this.partialSegmentCount = 0;
@@ -1355,6 +1418,12 @@
     this.iframePlaylistRequestCount = 0;
     this.iframeSegmentCount = 0;
     this.lastIFramePlaylistError = '';
+    this.imageVariants = [];
+    this.imageVariantCount = 0;
+    this.imagePlaylists = {};
+    this.imagePlaylistRequestCount = 0;
+    this.imageSegmentCount = 0;
+    this.lastImagePlaylistError = '';
     this.contentSteeringUri = '';
     this.contentSteeringReloadUri = '';
     this.contentSteeringPathwayId = '';
@@ -1368,17 +1437,24 @@
 
   NativeHlsProvider.prototype.load = function () {
     var self = this;
+    this.engine._assetUri = this.playlistUrl;
     return this._fetchPlaylistText(this.playlistUrl).then(function (text) {
       var parsed = parseHlsPlaylist(text, self.playlistUrl);
-      if (parsed.unsupportedEncryption) throw new Error(parsed.unsupportedEncryptionReason || 'hls-encrypted-unsupported');
+      if (parsed.unsupportedEncryption) throw hlsUnsupportedEncryptionError(self, parsed);
       self.iframeVariants = parsed.iframeVariants || [];
       self.iframeVariantCount = self.iframeVariants.length;
+      self.imageVariants = parsed.imageVariants || [];
+      self.imageVariantCount = self.imageVariants.length;
+      self.sessionData = parsed.sessionData || [];
+      self.sessionDataCount = self.sessionData.length;
       self.contentSteeringUri = parsed.contentSteeringUri || '';
       self.contentSteeringPathwayId = parsed.contentSteeringPathwayId || '';
       self.manifestCompatibilityWarnings = mergeUnique(self.manifestCompatibilityWarnings, parsed.warnings || []);
+      var chapterPromise = self._loadHlsChapters(parsed);
       if (parsed.variants.length) {
+        self.liveStartupCandidate = true;
         self.audioRenditions = parsed.audioRenditions;
-        self.subtitleRenditions = parsed.subtitleRenditions;
+        self.subtitleRenditions = parsed.subtitleRenditions.concat(parsed.closedCaptionRenditions || []);
         self.variants = parsed.variants.map(function (variant) {
           var rawCodecs = variant.codecs || '';
           variant.kind = 'video';
@@ -1396,24 +1472,19 @@
           rendition.codecs = audioCodecsOnly(rawCodecs) || rawCodecs || 'mp4a.40.2';
           rendition.asr = 44100;
         });
-        return self._probeCapabilities(self.variants.concat(self.audioRenditions)).then(function () {
+        return chapterPromise.then(function () {
+          return self._probeCapabilities(self.variants.concat(self.audioRenditions));
+        }).then(function () {
           self.unsupportedVideoCount = self.variants.filter(function (variant) { return !MediaSource.isTypeSupported(mime(variant)); }).length;
           self.unsupportedAudioCount = self.audioRenditions.filter(function (rendition) { return !MediaSource.isTypeSupported(mime(rendition)); }).length;
           self.unsupportedCapabilityCount = self.variants.concat(self.audioRenditions).filter(function (rep) { return !capabilityAllowed(self, rep); }).length;
           return self._refreshContentSteering('initial');
         }).then(function () {
           self.activeVariant = self.chooseVariant();
-          if (!self.activeVariant) throw new Error('hls-no-supported-video');
+          if (!self.activeVariant) throw nativeTerminalError(self, 'hls-no-supported-video');
           self.activeAudio = self._chooseAudioRendition(self.activeVariant);
-          if (self.activeVariant.audioGroup && !self.activeAudio) throw new Error('hls-no-supported-audio');
-          return self._fetchPlaylistText(self.activeVariant.url).then(function (mediaText) {
-            return self._loadMediaPlaylist(mediaText, self.activeVariant.url);
-          }).then(function () {
-            if (!self.activeAudio || !self.activeAudio.url) return;
-            return self._fetchPlaylistText(self.activeAudio.url).then(function (audioText) {
-              return self._loadAudioPlaylist(audioText, self.activeAudio.url);
-            });
-          });
+          if (self.activeVariant.audioGroup && !self.activeAudio) throw nativeTerminalError(self, 'hls-no-supported-audio');
+          return self._loadStartupMediaPlaylists();
         });
       }
       self.variants = [{ id: 'hls', url: self.playlistUrl, bandwidth: 0, height: 0, codecs: parsed.codecs || 'avc1.42c01f,mp4a.40.2', active: true }];
@@ -1423,7 +1494,10 @@
       self.variants[0].audioCodecs = audioCodecsOnly(self.variants[0].rawCodecs);
       self.variants[0].codecs = videoCodecsOnly(self.variants[0].rawCodecs) || self.variants[0].codecs;
       self.activeVariant = self.variants[0];
-      return self._loadMediaPlaylist(text, self.playlistUrl);
+      self.subtitleRenditions = (parsed.subtitleRenditions || []).concat(parsed.closedCaptionRenditions || []);
+      return chapterPromise.then(function () {
+        return self._loadMediaPlaylist(text, self.playlistUrl);
+      });
     }).then(function () {
       return new Promise(function (resolve, reject) {
         self.mediaSource = new MediaSource();
@@ -1438,7 +1512,7 @@
 
   NativeHlsProvider.prototype._loadMediaPlaylist = function (text, url) {
     var parsed = parseHlsPlaylist(text, url);
-    if (parsed.unsupportedEncryption) throw new Error(parsed.unsupportedEncryptionReason || 'hls-encrypted-unsupported');
+    if (parsed.unsupportedEncryption) throw hlsUnsupportedEncryptionError(this, parsed);
     var isTs = hasMpegTsSegments(parsed.segments);
     if (!parsed.map && !isTs) throw new Error('hls-playlist-unsupported');
     if (!parsed.segments.length) throw new Error('hls-playlist-unsupported');
@@ -1456,6 +1530,7 @@
     this.manifestCompatibilityWarnings = mergeUnique(this.manifestCompatibilityWarnings, parsed.warnings || []);
     this.duration = parsed.duration;
     this.live = !parsed.endList;
+    this.liveStartupCandidate = this.live && !this.startupBufferComplete;
     this.manifestStartTime = manifestStartTimeFor(parsed.start, this.liveWindow || (parsed.segments.length ? { start: parsed.segments[0].start, end: parsed.segments[parsed.segments.length - 1].end } : null), parsed.duration);
     this.mediaSequence = parsed.mediaSequence || 0;
     this.discontinuitySequence = parsed.discontinuitySequence || 0;
@@ -1489,7 +1564,7 @@
 
   NativeHlsProvider.prototype._loadAudioPlaylist = function (text, url) {
     var parsed = parseHlsPlaylist(text, url);
-    if (parsed.unsupportedEncryption) throw new Error(parsed.unsupportedEncryptionReason || 'hls-encrypted-unsupported');
+    if (parsed.unsupportedEncryption) throw hlsUnsupportedEncryptionError(this, parsed);
     var isTs = hasMpegTsSegments(parsed.segments);
     if ((!parsed.map && !isTs) || !parsed.segments.length) throw new Error(isTs ? 'hls-mpegts-unsupported' : 'hls-audio-playlist-unsupported');
     if (!this.activeAudio) throw new Error('hls-audio-unavailable');
@@ -1518,6 +1593,92 @@
     if (isTs) return this._ensureTsTransmuxer('audio', codecs);
   };
 
+  NativeHlsProvider.prototype._loadStartupMediaPlaylists = function () {
+    var self = this;
+    var attempts = 0;
+    var maxAttempts = Math.max(1, (this.variants || []).length);
+    function attempt() {
+      if (!self.activeVariant) throw nativeTerminalError(self, 'hls-no-supported-video');
+      attempts++;
+      return self._fetchPlaylistText(self.activeVariant.url).then(function (mediaText) {
+        return self._loadMediaPlaylist(mediaText, self.activeVariant.url);
+      }).then(function () {
+        if (!self.activeAudio || !self.activeAudio.url) return;
+        return self._fetchPlaylistText(self.activeAudio.url).then(function (audioText) {
+          return self._loadAudioPlaylist(audioText, self.activeAudio.url);
+        });
+      }).catch(function (err) {
+        if (!isRefreshableRequestError(err)) throw err;
+        if (attempts >= maxAttempts) {
+          if (self.startupMasterReloaded) throw err;
+          self.startupMasterReloaded = true;
+          return self._reloadMasterPlaylist().then(function () {
+            attempts = 0;
+            maxAttempts = Math.max(1, (self.variants || []).length);
+            self.activeVariant = self.chooseVariant();
+            if (!self.activeVariant) throw err;
+            self.activeAudio = self._chooseAudioRendition(self.activeVariant);
+            self.lastSwitchReason = 'startup-master-refresh';
+            return attempt();
+          });
+        }
+        if (self.activeVariant) self.blacklisted[self.activeVariant.id] = true;
+        self.lastError = err && err.message ? err.message : 'hls-startup-playlist-failed';
+        self.lastSwitchReason = 'startup-playlist-fallback';
+        self.activeVariant = self.chooseVariant();
+        if (!self.activeVariant) throw err;
+        self.activeAudio = self._chooseAudioRendition(self.activeVariant);
+        if (self.activeVariant.audioGroup && !self.activeAudio) throw nativeTerminalError(self, 'hls-no-supported-audio');
+        return attempt();
+      });
+    }
+    return attempt();
+  };
+
+  NativeHlsProvider.prototype._reloadMasterPlaylist = function () {
+    var self = this;
+    return this._fetchPlaylistText(this.playlistUrl).then(function (text) {
+      var parsed = parseHlsPlaylist(text, self.playlistUrl);
+      if (parsed.unsupportedEncryption) throw hlsUnsupportedEncryptionError(self, parsed);
+      if (!parsed.variants.length) throw new Error('hls-master-refresh-no-variants');
+      self.iframeVariants = parsed.iframeVariants || [];
+      self.iframeVariantCount = self.iframeVariants.length;
+      self.imageVariants = parsed.imageVariants || [];
+      self.imageVariantCount = self.imageVariants.length;
+      self.sessionData = parsed.sessionData || [];
+      self.sessionDataCount = self.sessionData.length;
+      self.contentSteeringUri = parsed.contentSteeringUri || '';
+      self.contentSteeringPathwayId = parsed.contentSteeringPathwayId || '';
+      self.manifestCompatibilityWarnings = mergeUnique(self.manifestCompatibilityWarnings, parsed.warnings || []);
+      self.audioRenditions = parsed.audioRenditions;
+      self.subtitleRenditions = parsed.subtitleRenditions.concat(parsed.closedCaptionRenditions || []);
+      self.variants = parsed.variants.map(function (variant) {
+        var rawCodecs = variant.codecs || '';
+        variant.kind = 'video';
+        variant.mimeType = 'video/mp4';
+        variant.rawCodecs = rawCodecs;
+        variant.audioCodecs = audioCodecsOnly(rawCodecs);
+        variant.codecs = videoCodecsOnly(rawCodecs) || rawCodecs;
+        return variant;
+      }).sort(compareVideoReps);
+      self.audioRenditions.forEach(function (rendition) {
+        var rawCodecs = rendition.codecs || parsed.codecs || '';
+        rendition.kind = 'audio';
+        rendition.mimeType = 'audio/mp4';
+        rendition.rawCodecs = rawCodecs;
+        rendition.codecs = audioCodecsOnly(rawCodecs) || rawCodecs || 'mp4a.40.2';
+        rendition.asr = 44100;
+      });
+      self.blacklisted = {};
+      return self._probeCapabilities(self.variants.concat(self.audioRenditions)).then(function () {
+        self.unsupportedVideoCount = self.variants.filter(function (variant) { return !MediaSource.isTypeSupported(mime(variant)); }).length;
+        self.unsupportedAudioCount = self.audioRenditions.filter(function (rendition) { return !MediaSource.isTypeSupported(mime(rendition)); }).length;
+        self.unsupportedCapabilityCount = self.variants.concat(self.audioRenditions).filter(function (rep) { return !capabilityAllowed(self, rep); }).length;
+        return self._refreshContentSteering('master-refresh');
+      });
+    });
+  };
+
   NativeHlsProvider.prototype._open = function () {
     var self = this;
     this.mediaSource.duration = this.live ? Infinity : (this.duration || NaN);
@@ -1544,8 +1705,11 @@
         return appendBuffer(self.audioSb, initData);
       });
     }).then(function () {
-      if (self.live && self.liveWindow && self.video.currentTime < self.liveWindow.start) {
-        self.video.currentTime = Math.max(self.liveWindow.start, self.liveWindow.end - LIVE_TARGET_LATENCY);
+      if (self.live && self.liveWindow) {
+        self.startupLiveTarget = self._defaultLiveStartTime();
+        if (self.video.currentTime < self.liveWindow.start || self.video.currentTime < self.startupLiveTarget - 0.5) {
+          try { self.video.currentTime = self.startupLiveTarget; } catch (e) {}
+        }
       }
       if (self.engine._pendingLoadStartTime == null && isFinite(self.manifestStartTime)) {
         try { self.video.currentTime = self.manifestStartTime; } catch (e) {}
@@ -1564,6 +1728,8 @@
     this._updateLivePositionStats();
     this._jumpSmallGap();
     var ahead = getBufferAhead(this.video);
+    this._maybeRefreshLiveLowBuffer(ahead);
+    if (this._recoverLiveWindowDrift(ahead)) return;
     if (!force && ahead >= this._bufferAheadGoal()) return;
     if (!this.manualTrackId) this._maybeSwitchAuto();
     this._scheduleMediaRequests(!this.startupBufferComplete ? this._startupBufferGoal() : this._bufferAheadGoal());
@@ -1602,7 +1768,7 @@
   };
 
   NativeHlsProvider.prototype._buildSegmentCandidates = function (windowGoal, tracks) {
-    var ct = this.video.currentTime || 0;
+    var ct = this._schedulerTime();
     if (this.live && this.liveWindow && ct < this.liveWindow.start) ct = this.liveWindow.start;
     var goal = windowGoal || this._bufferAheadGoal();
     var target = ct + goal;
@@ -1741,31 +1907,41 @@
   NativeHlsProvider.prototype._drainAppendQueue = function (track) {
     var self = this;
     track = track || this._mediaTracks()[0];
-    if (!track || !track.sb || track.sb.updating || track._appending) return false;
+    if (!track || !track.sb || track._appending) return false;
+    if (track.sb.updating && !recoverStuckSourceBuffer(this, track)) return false;
     var next = nextFetchedSegmentForAppend(track, this.video.currentTime || 0);
     if (!next) return false;
     track._appending = true;
     next.state = 'appending';
+    next._appendStartedAt = performance.now();
     var data = next._data;
     delete next._data;
-    this._appendSegmentData(track, next, data).then(function () {
+    hlsAppendSegmentWithWatchdog(self, track, next, data).then(function () {
       next.state = 'appended';
       next.appended = true;
       if (next._hlsPart || next._hlsPreloadHint) self.partialSegmentAppendCount++;
+      delete next._appendStartedAt;
       delete next._fetchStartedAt;
       track._appending = false;
       self.appendFailures = 0;
       self.stallReports = 0;
       self.stallRecoveryStage = 0;
       self.schedulerDrainCount++;
+      self._alignHlsBufferedTarget();
       self.engine._player.emit('adaptation');
       self._drainAppendQueue(track);
+      self._maybeEndVodStream();
       self._tick();
     }).catch(function (err) {
       track._appending = false;
       if (err.name !== 'AbortError') {
         next.state = 'failed';
         next.appended = false;
+        delete next._appendStartedAt;
+        if (isHlsTsTerminalError(err)) {
+          self._completeNativeRuntimeTerminal(err.message || 'hls-first-party-ts-transmuxer-unavailable');
+          return;
+        }
         self._handleAppendFailure(track, err);
       }
     });
@@ -1779,7 +1955,7 @@
     var appendPromise = prepareDiscontinuity.call(this, track, seg).then(function () {
       return self.isTsPlaylist && track.kind === 'video'
       ? this._transmuxTsSegment(track, seg, data, 'video').then(function (output) {
-        var chain = self._appendTransmuxedOutput(track.sb, output);
+        var chain = self._appendTransmuxedOutput(track.sb, output, track, seg);
         if (self.muxedTsAudio && self.audioSb) {
           chain = chain.then(function () {
             self._muxedAudioTrack = self._muxedAudioTrack || { id: 'muxed-audio', kind: 'audio', sb: self.audioSb };
@@ -1787,7 +1963,7 @@
             return self._prepareDiscontinuityAppend(self._muxedAudioTrack, seg);
           }).then(function () {
             return self._transmuxTsSegment(track, seg, data, 'audio').then(function (audioOutput) {
-              return self._appendTransmuxedOutput(self.audioSb, audioOutput);
+              return self._appendTransmuxedOutput(self.audioSb, audioOutput, self._muxedAudioTrack, seg);
             });
           });
         }
@@ -1795,9 +1971,9 @@
       })
       : (isTsAudioTrack
         ? this._transmuxTsSegment(track, seg, data, 'audio').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output);
+          return self._appendTransmuxedOutput(track.sb, output, track, seg);
         })
-        : appendBuffer(track.sb, data));
+        : appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset(self, track, seg)));
     }.bind(this));
     return appendPromise.catch(function (err) {
       if (!isQuotaExceeded(err)) throw err;
@@ -1809,6 +1985,20 @@
         throw retryErr;
       });
     });
+  };
+
+  NativeHlsProvider.prototype._maybeEndVodStream = function () {
+    if (this.live || !this.mediaSource || this.mediaSource.readyState !== 'open') return false;
+    if ((this.sb && this.sb.updating) || (this.audioSb && this.audioSb.updating)) return false;
+    if (!segmentsAppendedThroughEnd(this.segments, this.duration)) return false;
+    if (this.activeAudio && this.audioSegments.length && !segmentsAppendedThroughEnd(this.audioSegments, this.duration)) return false;
+    try {
+      this.mediaSource.endOfStream();
+      this.vodEndOfStreamCount++;
+      return true;
+    } catch (e) {
+      return false;
+    }
   };
 
   NativeHlsProvider.prototype._prepareDiscontinuityAppend = function (track, seg) {
@@ -1828,11 +2018,13 @@
     return Promise.resolve();
   };
 
-  NativeHlsProvider.prototype._appendTransmuxedOutput = function (sb, output) {
+  NativeHlsProvider.prototype._appendTransmuxedOutput = function (sb, output, track, seg) {
     var self = this;
     var chain = Promise.resolve();
     if (output.init && output.init.byteLength) chain = chain.then(function () { return appendBuffer(sb, output.init); });
-    if (output.data && output.data.byteLength) chain = chain.then(function () { return appendBuffer(sb, output.data); });
+    if (output.data && output.data.byteLength) chain = chain.then(function () {
+      return appendBuffer(sb, output.data, null, hlsLiveTimestampOffset(self, track, seg));
+    });
     return chain.then(function () {
       self._alignTsStartupTime();
     });
@@ -1846,52 +2038,80 @@
     }
   };
 
+  NativeHlsProvider.prototype._schedulerTime = function () {
+    if (this.live && this.liveWindow) {
+      if (this.seekBufferPending && isFinite(this.lastSeekTarget)) return this._clampSeekTarget(this.lastSeekTarget);
+      if (!this.startupBufferComplete && isFinite(this.startupLiveTarget)) return this._clampSeekTarget(this.startupLiveTarget);
+    }
+    return this.video.currentTime || 0;
+  };
+
+  NativeHlsProvider.prototype._alignHlsBufferedTarget = function () {
+    if (!this.live || !this.video || !this.video.buffered || !this.video.buffered.length) return;
+    var target = this.seekBufferPending && isFinite(this.lastSeekTarget)
+      ? this._clampSeekTarget(this.lastSeekTarget)
+      : (!this.startupBufferComplete && isFinite(this.startupLiveTarget) ? this._clampSeekTarget(this.startupLiveTarget) : NaN);
+    if (!isFinite(target) || !bufferedContains(this.video.buffered, target)) return;
+    if (Math.abs((this.video.currentTime || 0) - target) > 0.25) {
+      try { this.video.currentTime = target; } catch (e) {}
+    }
+  };
+
+  NativeHlsProvider.prototype._recoverLiveWindowDrift = function (ahead) {
+    if (!this.live || !this.liveWindow || !this.video || this.video.seeking) return false;
+    var ct = this.video.currentTime || 0;
+    var ranges = bufferedRanges(this.video.buffered);
+    var bufferedEnd = ranges.length ? ranges[ranges.length - 1].end : 0;
+    var windowStart = this.liveWindow.start || 0;
+    var expiredPlayhead = ct < windowStart - 0.25;
+    var expiredBuffer = ahead < MIN_BUFFER_AHEAD && bufferedEnd > 0 && bufferedEnd < windowStart - 0.25;
+    if (!expiredPlayhead && !expiredBuffer) return false;
+
+    var target = this._defaultLiveStartTime();
+    target = this._clampSeekTarget ? this._clampSeekTarget(target) : clamp(target, windowStart, this.liveWindow.end || windowStart);
+    if (!isFinite(target)) target = windowStart;
+    try { this.video.currentTime = target; } catch (e) {}
+    this.liveWindowDriftRecoveryCount++;
+    this.seekBufferPending = true;
+    this.lastSeekTarget = target;
+    this.lastError = 'hls-live-window-drift';
+    if (this.engine && this.engine._telemetry) this.engine._telemetry.record('recovery', { lastError: this.lastError });
+    markSegmentsForTime(this, target, Math.max(2, this._bufferAheadGoal()));
+    if (this.activeAudio) markSegmentsForTime(this.activeAudio, target, Math.max(2, this._bufferAheadGoal()));
+    this._scheduleMediaRequests(this._seekBufferGoal());
+    return true;
+  };
+
   NativeHlsProvider.prototype._ensureTsTransmuxer = function (contentType, codecs) {
     var self = this;
     if (contentType === 'audio' && this.tsAudioTransmuxer) return Promise.resolve();
     if (contentType !== 'audio' && this.tsVideoTransmuxer) return Promise.resolve();
     var started = performance.now();
-    return loadShaka().then(function () {
-      if (!window.shaka || !shaka.transmuxer || !shaka.transmuxer.TsTransmuxer) throw new Error('hls-ts-transmuxer-unavailable');
-      var mimeType = 'video/mp2t; codecs="' + codecs + '"';
-      var transmuxer = new shaka.transmuxer.TsTransmuxer(mimeType);
-      if (!transmuxer.isSupported(mimeType, contentType)) throw new Error('hls-ts-transmuxer-unsupported');
-      if (contentType === 'audio') self.tsAudioTransmuxer = transmuxer;
-      else self.tsVideoTransmuxer = transmuxer;
+    return createTsTransmuxerAdapter(contentType, codecs).then(function (adapter) {
+      self.tsTransmuxers[contentType === 'audio' ? 'audio' : 'video'] = adapter;
+      if (contentType === 'audio') self.tsAudioTransmuxer = adapter;
+      else self.tsVideoTransmuxer = adapter;
       self.tsTransmuxer = self.tsVideoTransmuxer || self.tsAudioTransmuxer;
-      self.tsTransmuxerProvider = 'shaka-ts';
+      self.tsTransmuxerProvider = adapter.provider;
       if (!self.tsTransmuxerLoadMs) self.tsTransmuxerLoadMs = Math.max(1, performance.now() - started);
       if (self.manifestCompatibilityWarnings.indexOf('hls-ts-transmuxed') === -1) self.manifestCompatibilityWarnings.push('hls-ts-transmuxed');
     });
   };
 
   NativeHlsProvider.prototype._transmuxTsSegment = function (track, seg, data, contentType) {
-    var transmuxer = contentType === 'audio' ? this.tsAudioTransmuxer : this.tsVideoTransmuxer;
-    if (!transmuxer) return Promise.reject(new Error('hls-ts-transmuxer-unavailable'));
-    var codecs = contentType === 'audio'
-      ? ((track && track.codecs) || (this.activeVariant && this.activeVariant.audioCodecs) || 'mp4a.40.2')
-      : ((this.activeVariant && this.activeVariant.codecs) || 'avc1.42c01f');
-    var stream = {
-      id: (contentType === 'audio' ? 'audio' : (track.id || 'video')),
-      mimeType: 'video/mp2t',
-      codecs: codecs,
-      language: 'und',
-      width: this.activeVariant ? this.activeVariant.width : 0,
-      height: this.activeVariant ? this.activeVariant.height : 0
-    };
-    var reference = shaka.media && shaka.media.SegmentReference
-      ? new shaka.media.SegmentReference(seg.start || 0, seg.end || ((seg.start || 0) + (seg.duration || 0)), function () { return [seg.url || '']; }, 0, null, null, 0, 0, Infinity)
-      : {
-        discontinuitySequence: seg.discontinuitySequence || 0,
-        getUris: function () { return [seg.url || '']; }
-    };
+    var adapter = contentType === 'audio' ? this.tsAudioTransmuxer : this.tsVideoTransmuxer;
+    if (!adapter) return Promise.reject(new Error('hls-ts-transmuxer-unavailable'));
     var self = this;
-    return transmuxer.transmux(data, stream, reference, seg.duration || 0, contentType).then(function (output) {
+    return adapter.transmux(data, {
+      activeVariant: this.activeVariant,
+      contentType: contentType,
+      segment: seg,
+      track: track
+    }).then(function (output) {
       self.transmuxedSegmentCount++;
       if (contentType === 'audio') self.transmuxedAudioSegmentCount++;
       else self.transmuxedVideoSegmentCount++;
-      if (output && output.data) return output;
-      return { data: output, init: null };
+      return normalizeTransmuxOutput(output);
     });
   };
 
@@ -1904,12 +2124,12 @@
     ]).then(function () {
       if (self.isTsPlaylist && track.kind === 'video') {
         return self._transmuxTsSegment(track, seg || {}, data, 'video').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output);
+          return self._appendTransmuxedOutput(track.sb, output, track, seg || {});
         });
       }
       if (track.kind === 'audio' && track.isTsPlaylist) {
         return self._transmuxTsSegment(track, seg || {}, data, 'audio').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output);
+          return self._appendTransmuxedOutput(track.sb, output, track, seg || {});
         });
       }
       return appendBuffer(track.sb, data);
@@ -1939,10 +2159,19 @@
         this._switchVariant(lower, true, 'append-recovery');
         return;
       }
-      this.engine._fallbackToShaka('hls-video-append-exhausted');
+      this._completeNativeRuntimeTerminal('hls-video-append-exhausted');
       return;
     }
-    if (this.appendFailures >= 2) this.engine._fallbackToShaka('hls-audio-append-failed');
+    if (this.appendFailures >= 2) this._completeNativeRuntimeTerminal('hls-audio-append-failed');
+  };
+
+  NativeHlsProvider.prototype._completeNativeRuntimeTerminal = function (reason) {
+    this.lastError = reason || this.lastError || 'hls-runtime-exhausted';
+    this.fatalError = this.lastError;
+    this.nativeUnsupportedReason = this.lastError;
+    if (this.engine && this.engine._completeNativeTerminalError) {
+      this.engine._completeNativeTerminalError(nativeTerminalError(this, this.lastError));
+    }
   };
 
   NativeHlsProvider.prototype._tryNativeRecovery = function (reason) {
@@ -2020,6 +2249,30 @@
     });
   };
 
+  NativeHlsProvider.prototype._maybeRefreshLiveLowBuffer = function (ahead) {
+    if (!this.live || !this.liveWindow || this.destroyed || this.liveRefreshInFlight) return;
+    var currentTime = this.video.currentTime || 0;
+    var nearEdge = this.liveWindow.end - currentTime <= Math.max(MIN_BUFFER_AHEAD, LIVE_TARGET_LATENCY + 2);
+    if (!nearEdge || ahead >= MIN_BUFFER_AHEAD) return;
+    var now = performance.now();
+    var minInterval = Math.max(500, (this.targetDuration || 2) * 500);
+    if (this.lastLiveRefreshStartedAt && now - this.lastLiveRefreshStartedAt < minInterval) return;
+    this.liveRefreshInFlight = true;
+    this.lastLiveRefreshStartedAt = now;
+    this.liveLowBufferRefreshCount++;
+    var self = this;
+    this._refreshMediaPlaylist('live-low-buffer').then(function () {
+      self._evictExpiredLiveSegmentState();
+      self.playlistRefreshFailed = false;
+      self.liveRefreshInFlight = false;
+      self._tick(true);
+    }).catch(function (err) {
+      self.liveRefreshInFlight = false;
+      self.lastError = err && err.message ? err.message : 'hls-live-low-buffer-refresh-failed';
+      self.playlistRefreshFailed = true;
+    });
+  };
+
   NativeHlsProvider.prototype._schedulePlaylistRefresh = function () {
     var self = this;
     if (this.destroyed || !this.live) return;
@@ -2066,6 +2319,7 @@
     var ready = getBufferAhead(this.video) >= Math.min(goal, this._bufferAheadGoal());
     if (ready && !this.startupBufferComplete) {
       this.startupBufferComplete = true;
+      this.liveStartupCandidate = false;
       this.startupBufferMs = this.startupBufferStartedAt ? performance.now() - this.startupBufferStartedAt : 0;
       if (this.engine && this.engine._telemetry) this.engine._telemetry.record('startup-buffer-ready', { startupBufferMs: this.startupBufferMs });
     }
@@ -2093,12 +2347,13 @@
     if (this.destroyed) return;
     this.lastError = err && err.message ? err.message : 'hls-media-error';
     if (err && err.status) this.lastHttpStatus = err.status;
-    this.engine._fallbackToShaka(this.lastError, this.video.currentTime || this.engine.lastGoodTime || 0);
+    this._completeNativeRuntimeTerminal(this.lastError);
   };
 
   NativeHlsProvider.prototype._bufferAheadGoal = function () {
     var cfg = this.engine._player.config.streaming || {};
-    return Math.max(1, cfg.bufferingGoal || BUFFER_AHEAD);
+    var goal = Math.max(1, cfg.bufferingGoal || BUFFER_AHEAD);
+    return this.live ? Math.max(goal, LIVE_BUFFER_AHEAD) : goal;
   };
 
   NativeHlsProvider.prototype._startupBufferGoal = function () {
@@ -2119,6 +2374,12 @@
   NativeHlsProvider.prototype._bufferBehindGoal = function () {
     var cfg = this.engine._player.config.streaming || {};
     return Math.max(0, cfg.bufferBehind == null ? BUFFER_BEHIND : cfg.bufferBehind);
+  };
+
+  NativeHlsProvider.prototype._defaultLiveStartTime = function () {
+    if (!this.liveWindow) return this.video.currentTime || 0;
+    var goal = Math.max(LIVE_STABLE_START_LATENCY, LIVE_MAX_LATENCY, this._bufferAheadGoal ? this._bufferAheadGoal() + 30 : LIVE_BUFFER_AHEAD + 30);
+    return Math.max(this.liveWindow.start, this.liveWindow.end - goal);
   };
 
   NativeHlsProvider.prototype._updateLivePositionStats = function () {
@@ -2145,8 +2406,12 @@
   };
 
   NativeHlsProvider.prototype._clampSeekTarget = function (targetTime) {
-    var target = isFinite(Number(targetTime)) ? Number(targetTime) : (this.video.currentTime || 0);
+    var requested = isFinite(Number(targetTime)) ? Number(targetTime) : (this.video.currentTime || 0);
+    var target = requested;
     if (this.live && this.liveWindow) target = clamp(target, this.liveWindow.start, this.liveWindow.end);
+    if (this.live && this.liveWindow && requested > this.liveWindow.start + 0.001 && requested <= this.liveWindow.end && this.segments && this.segments.length) {
+      target = hlsSeekTargetInsideSegment(this, target);
+    }
     return target;
   };
 
@@ -2253,7 +2518,7 @@
         return;
       }
     }
-    if (this.stallReports >= 3) this.engine._fallbackToShaka('hls-stall-exhausted');
+    if (this.stallReports >= 3) this._completeNativeRuntimeTerminal('hls-stall-exhausted');
   };
 
   NativeHlsProvider.prototype._fetchRange = function (url, range, opts) {
@@ -2488,7 +2753,12 @@
       var manual = candidates.find(function (variant) { return variant.id === this.manualTrackId; }, this);
       if (manual) return manual;
     }
-    var chosen = this._chooseForBudget(candidates, 0.8);
+    var conservativeLiveStartup = this.live || this.liveStartupCandidate;
+    if (conservativeLiveStartup) {
+      var capped = candidates.filter(function (variant) { return !variant.height || variant.height <= LIVE_STARTUP_MAX_HEIGHT; });
+      if (capped.length) candidates = capped;
+    }
+    var chosen = this._chooseForBudget(candidates, conservativeLiveStartup ? LIVE_STARTUP_ABR_FACTOR : 0.8);
     for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === chosen;
     return chosen;
   };
@@ -2572,11 +2842,29 @@
     if (this.bandwidthSamples < 2 && ahead >= ABR_DOWNGRADE_BUFFER) {
       this.bandwidth = Math.max(this.bandwidth || 0, this.engine._player.config.abr.defaultBandwidthEstimate || 3000000);
     }
-    var chosen = this._chooseForBudget(this._candidateVariants(), this.bandwidthSamples < 2 || ahead >= MIN_BUFFER_AHEAD ? 0.8 : 0.55);
+    var stableLiveCandidate = this.live && ahead >= Math.min(this._bufferAheadGoal(), LIVE_BUFFER_AHEAD) * 0.75 && this.liveLatency >= LIVE_STABLE_START_LATENCY * 0.5;
+    if (stableLiveCandidate) {
+      if (!this.liveStableSince) this.liveStableSince = now;
+    } else {
+      this.liveStableSince = 0;
+    }
+    var stableLive = stableLiveCandidate && this.liveStableSince && now - this.liveStableSince >= LIVE_UPGRADE_HOLDOFF_MS;
+    var normalFactor = this.live ? (stableLive ? LIVE_STABLE_ABR_FACTOR : LIVE_STARTUP_ABR_FACTOR) : 0.8;
+    var candidates = this._candidateVariants();
+    if (this.live && !stableLive) {
+      var capped = candidates.filter(function (variant) { return !variant.height || variant.height <= LIVE_STARTUP_MAX_HEIGHT; });
+      if (capped.length) candidates = capped;
+    }
+    var chosen = this._chooseForBudget(candidates, this.bandwidthSamples < 2 || ahead >= MIN_BUFFER_AHEAD ? normalFactor : 0.55);
     var reason = 'bandwidth';
     if (ahead < ABR_DOWNGRADE_BUFFER && this.bandwidthSamples >= 2) {
       this.bandwidth = previousBandwidth;
-      chosen = this._chooseForBudget(this._candidateVariants(), 0.45);
+      var lowBufferCandidates = this._candidateVariants();
+      if (this.live) {
+        var lowBufferCapped = lowBufferCandidates.filter(function (variant) { return !variant.height || variant.height <= LIVE_STARTUP_MAX_HEIGHT; });
+        if (lowBufferCapped.length) lowBufferCandidates = lowBufferCapped;
+      }
+      chosen = this._chooseForBudget(lowBufferCandidates, 0.35);
       reason = 'low-buffer';
     }
     this.bandwidth = previousBandwidth;
@@ -2697,9 +2985,11 @@
         roles: ['subtitle'],
         accessibility: [],
         url: rendition.url,
-        source: 'native-hls',
-        supported: isSupportedTextMime(rendition.mimeType || 'text/vtt'),
-        renderSupported: isRenderableTextMime(rendition.mimeType || 'text/vtt'),
+        source: rendition.source || 'native-hls',
+        embedded: !!rendition.embedded,
+        instreamId: rendition.instreamId || '',
+        supported: rendition.supported === false ? false : isSupportedTextMime(rendition.mimeType || 'text/vtt'),
+        renderSupported: rendition.renderSupported === false ? false : isRenderableTextMime(rendition.mimeType || 'text/vtt'),
         loadState: rendition.loadState
       }, !!rendition.active);
     });
@@ -2713,7 +3003,7 @@
 
   NativeHlsProvider.prototype.selectTextTrack = function (track) {
     var rendition = (this.subtitleRenditions || []).find(function (item) { return item.id === track.id || item.language === track.language; });
-    if (!rendition) return Promise.resolve();
+    if (!rendition || rendition.supported === false || rendition.renderSupported === false || rendition.embedded) return Promise.resolve();
     return selectNativeTextTrack(this, rendition, function (active) {
       for (var i = 0; i < this.subtitleRenditions.length; i++) this.subtitleRenditions[i].active = active && this.subtitleRenditions[i] === rendition;
       this.activeTextTrackId = active ? rendition.id : '';
@@ -2734,7 +3024,7 @@
   };
 
   NativeHlsProvider.prototype.getIFrameTracks = function () {
-    return (this.iframeVariants || []).map(function (variant) {
+    var iframeTracks = (this.iframeVariants || []).map(function (variant) {
       return {
         id: variant.id,
         url: variant.url || '',
@@ -2744,16 +3034,35 @@
         codecs: variant.codecs || '',
         pathwayId: variant.pathwayId || '',
         iframeOnly: true,
+        imageOnly: false,
+        thumbnailType: 'iframe',
         loaded: !!(this.iframePlaylists && this.iframePlaylists[variant.id])
       };
     }, this);
+    var imageTracks = (this.imageVariants || []).map(function (variant) {
+      return {
+        id: variant.id,
+        url: variant.url || '',
+        bandwidth: variant.bandwidth || 0,
+        width: variant.width || 0,
+        height: variant.height || 0,
+        codecs: variant.codecs || '',
+        pathwayId: variant.pathwayId || '',
+        iframeOnly: false,
+        imageOnly: true,
+        thumbnailType: 'image',
+        loaded: !!(this.imagePlaylists && this.imagePlaylists[variant.id])
+      };
+    }, this);
+    return iframeTracks.concat(imageTracks);
   };
 
   NativeHlsProvider.prototype.getIFramePreview = function (time, trackId) {
     var self = this;
     var track = chooseIFrameTrack(this, trackId);
     if (!track) return Promise.resolve(null);
-    return this._loadIFramePlaylist(track).then(function (playlist) {
+    var loadPlaylist = track.imageOnly ? this._loadImagePlaylist(track) : this._loadIFramePlaylist(track);
+    return loadPlaylist.then(function (playlist) {
       var segment = nearestIFrameSegment(playlist.segments || [], Number(time) || 0);
       if (!segment) return null;
       return {
@@ -2764,13 +3073,18 @@
           height: track.height || 0,
           codecs: track.codecs || '',
           pathwayId: track.pathwayId || '',
-          iframeOnly: true
+          iframeOnly: !track.imageOnly,
+          imageOnly: !!track.imageOnly,
+          thumbnailType: track.imageOnly ? 'image' : 'iframe'
         },
         start: segment.start || 0,
         end: segment.end || segment.start || 0,
         duration: segment.duration || 0,
         url: segment.url || '',
         range: segment.range || null,
+        tiles: segment.tiles || null,
+        imageOnly: !!track.imageOnly,
+        thumbnailType: track.imageOnly ? 'image' : 'iframe',
         mediaSequence: segment.mediaSequence || 0
       };
     }).catch(function (err) {
@@ -2809,6 +3123,67 @@
     });
   };
 
+  NativeHlsProvider.prototype._loadImagePlaylist = function (track) {
+    if (!track || !track.url) return Promise.reject(new Error('hls-image-track-unavailable'));
+    this.imagePlaylists = this.imagePlaylists || {};
+    if (this.imagePlaylists[track.id]) return Promise.resolve(this.imagePlaylists[track.id]);
+    var self = this;
+    this.imagePlaylistRequestCount++;
+    return this._fetchPlaylistText(track.url).then(function (text) {
+      var playlistUrl = resolveUrl(track.url, window.location && window.location.href ? window.location.href : self.playlistUrl);
+      var parsed = parseHlsPlaylist(text, playlistUrl);
+      if (parsed.unsupportedEncryption) throw new Error(parsed.unsupportedEncryptionReason || 'hls-image-encrypted-unsupported');
+      if (!parsed.segments.length) throw new Error('hls-image-playlist-empty');
+      var playlist = {
+        trackId: track.id,
+        url: track.url,
+        segments: parsed.segments,
+        duration: parsed.duration || 0,
+        mediaSequence: parsed.mediaSequence || 0,
+        imagesOnly: !!parsed.imagesOnly
+      };
+      self.imagePlaylists[track.id] = playlist;
+      self.imageSegmentCount += parsed.segments.length;
+      self.lastImagePlaylistError = '';
+      return playlist;
+    }).catch(function (err) {
+      self.lastImagePlaylistError = err && err.message ? err.message : 'hls-image-playlist-failed';
+      throw err;
+    });
+  };
+
+  NativeHlsProvider.prototype._loadHlsChapters = function (parsed) {
+    var self = this;
+    var refs = hlsChapterSessionData(parsed && parsed.sessionData);
+    if (!refs.length) {
+      this.hlsChapterCount = 0;
+      this.lastHlsChapterError = '';
+      return Promise.resolve();
+    }
+    return Promise.all(refs.map(function (ref) {
+      if (ref.value) {
+        try {
+          return Promise.resolve(parseHlsChapterRegions(ref.value, ref));
+        } catch (err) {
+          return Promise.reject(err);
+        }
+      }
+      if (!ref.uri) return Promise.resolve([]);
+      return fetchText(self.engine, ref.uri).then(function (text) {
+        return parseHlsChapterRegions(text, ref);
+      });
+    })).then(function (lists) {
+      var regions = [];
+      for (var i = 0; i < lists.length; i++) regions = regions.concat(lists[i] || []);
+      self.hlsChapterCount = regions.length;
+      self.lastHlsChapterError = '';
+      self._addTimelineRegions(regions);
+    }).catch(function (err) {
+      self.hlsChapterCount = 0;
+      self.lastHlsChapterError = err && err.message ? err.message : 'hls-chapters-load-failed';
+    });
+  };
+
   NativeHlsProvider.prototype.isLive = function () {
     return !!this.live;
   };
@@ -2841,6 +3216,9 @@
       lastTextTrackError: this.lastTextTrackError || '',
       timelineRegionCount: this.timelineRegions ? this.timelineRegions.length : 0,
       lastTimelineRegion: this.lastTimelineRegion || null,
+      sessionDataCount: this.sessionDataCount || 0,
+      hlsChapterCount: this.hlsChapterCount || 0,
+      lastHlsChapterError: this.lastHlsChapterError || '',
       manifestStartTime: isFinite(this.manifestStartTime) ? this.manifestStartTime : null,
       abrEnabled: !!(this.engine && this.engine._player && this.engine._player.config.abr.enabled),
       activeRestrictions: activeAbrRestrictions(this),
@@ -2864,6 +3242,10 @@
       lastError: this.lastError,
       lastHttpStatus: this.lastHttpStatus,
       playlistRefreshCount: this.playlistRefreshCount,
+      liveLowBufferRefreshCount: this.liveLowBufferRefreshCount || 0,
+      liveWindowDriftRecoveryCount: this.liveWindowDriftRecoveryCount || 0,
+      vodEndOfStreamCount: this.vodEndOfStreamCount || 0,
+      liveRefreshInFlight: !!this.liveRefreshInFlight,
       mediaFetchCompletedCount: this.mediaFetchCompletedCount,
       mediaFetchRetryCount: this.mediaFetchRetryCount,
       mediaFetchTotalMs: this.mediaFetchTotalMs,
@@ -2883,6 +3265,7 @@
       schedulerQueueDepth: appendQueueDepth(this.sb),
       schedulerBackpressureCount: this.schedulerBackpressureCount,
       schedulerDrainCount: this.schedulerDrainCount,
+      sourceBufferAbortCount: this.sourceBufferAbortCount || 0,
       startupBufferComplete: this.startupBufferComplete,
       startupBufferMs: this.startupBufferMs,
       seekBufferPending: !!this.seekBufferPending,
@@ -2904,6 +3287,9 @@
       hlsKeyFetchCount: this.keyFetchCount,
       hlsKeyCacheHitCount: this.keyCacheHitCount,
       lastDecryptionError: this.lastDecryptionError,
+      hlsEncryptionMethod: this.hlsEncryptionMethod || '',
+      hlsKeyFormat: this.hlsKeyFormat || '',
+      nativeUnsupportedReason: this.nativeUnsupportedReason || '',
       nativeRecoveryAttemptCount: this.nativeRecoveryAttemptCount || 0,
       nativeRecoverySuccessCount: this.nativeRecoverySuccessCount || 0,
       lastNativeRecoveryReason: this.lastNativeRecoveryReason || '',
@@ -2928,6 +3314,10 @@
       iframeSegmentCount: this.iframeSegmentCount || 0,
       iframeTracks: this.getIFrameTracks ? this.getIFrameTracks() : [],
       lastIFramePlaylistError: this.lastIFramePlaylistError || '',
+      imageVariantCount: this.imageVariantCount || 0,
+      imagePlaylistRequestCount: this.imagePlaylistRequestCount || 0,
+      imageSegmentCount: this.imageSegmentCount || 0,
+      lastImagePlaylistError: this.lastImagePlaylistError || '',
       contentSteeringUri: this.contentSteeringUri || '',
       contentSteeringReloadUri: this.contentSteeringReloadUri || '',
       contentSteeringPathwayId: this.contentSteeringPathwayId || '',
@@ -2939,7 +3329,7 @@
       manifestCompatibilityWarnings: this.manifestCompatibilityWarnings,
       droppedFrames: quality ? quality.droppedVideoFrames : 0,
       totalFrames: quality ? quality.totalVideoFrames : 0,
-      fatalError: ''
+      fatalError: this.fatalError || ''
     };
   };
 
@@ -3057,6 +3447,8 @@
     this.manifestProfile = '';
     this.manifestCompatibilityWarnings = [];
     this.textReps = [];
+    this.imageReps = [];
+    this.imageRepCount = 0;
     this.activeTextTrackId = '';
     this.textTrackVisibility = false;
     this.textCueCache = {};
@@ -3081,10 +3473,14 @@
     this.drmSessionCount = 0;
     this.drmLicenseRequestCount = 0;
     this.lastDrmError = '';
+    this.nativeUnsupportedReason = '';
+    this.fatalError = '';
     this.timelineRegions = [];
     this.timelineRegionKeys = {};
     this.lastTimelineRegion = null;
     this.manifestStartTime = null;
+    this.imageSegmentCount = 0;
+    this.vodEndOfStreamCount = 0;
   }
 
   NativeDashProvider.prototype.load = function () {
@@ -3098,6 +3494,9 @@
     this.manifestProfile = parsed.profile || '';
     this.manifestCompatibilityWarnings = parsed.warnings || [];
     this.textReps = parsed.text || [];
+    this.imageReps = parsed.images || [];
+    this.imageRepCount = this.imageReps.length;
+    this.imageSegmentCount = this.imageReps.reduce(function (count, rep) { return count + ((rep.segments && rep.segments.length) || (rep.templateSegments && rep.templateSegments.length) || 0); }, 0);
     addTimelineRegions(this, parsed.timelineRegions || []);
     this.engine.setLive(this.live);
     this.unsupportedVideoCount = parsed.video.filter(function (rep) { return !isSupportedRepresentation(rep); }).length;
@@ -3113,8 +3512,8 @@
     }
     self.audioReps.sort(function (a, b) { return compareAudioReps(a, b); });
     self.audio = self.audioReps[0] || null;
-    if (!self.videoReps.length) throw new Error('dash-no-supported-video');
-    if (!self.audio) throw new Error('dash-no-supported-audio');
+    if (!self.videoReps.length) throw nativeTerminalError(self, 'dash-no-supported-video');
+    if (!self.audio) throw nativeTerminalError(self, 'dash-no-supported-audio');
     self.videoReps.sort(function (a, b) { return compareVideoReps(a, b); });
     self.activeVideo = self.chooseVideoRep();
     self.startupBufferStartedAt = performance.now();
@@ -3181,11 +3580,11 @@
     }
     if (drmInfo.keySystem === 'com.widevine.alpha' && !drmInfo.licenseServerUrl) {
       this.lastDrmError = 'dash-widevine-license-unconfigured';
-      return Promise.reject(new Error(this.lastDrmError));
+      return Promise.reject(dashNativeTerminalError(this, this.lastDrmError));
     }
     if (drmInfo.keySystem === 'com.microsoft.playready') {
       this.lastDrmError = 'dash-playready-unsupported';
-      return Promise.reject(new Error(this.lastDrmError));
+      return Promise.reject(dashNativeTerminalError(this, this.lastDrmError));
     }
     if (drmInfo.keySystem !== 'org.w3.clearkey' && drmInfo.keySystem !== 'com.widevine.alpha') {
       this.lastDrmError = 'dash-drm-keysystem-unsupported';
@@ -3229,14 +3628,22 @@
     this.drmSessionCount = this.drmSessions.length;
     session.addEventListener('message', function (messageEvent) {
       self._handleDrmMessage(session, messageEvent.message).catch(function (err) {
-        self.lastDrmError = err && err.message ? err.message : 'dash-drm-license-failed';
-        self.engine._fallbackToShaka(self.lastDrmError, self.video.currentTime || self.engine.lastGoodTime || 0);
+        self._completeDrmTerminalError(err && err.message ? err.message : 'dash-drm-license-failed');
       });
     });
     session.generateRequest(event.initDataType || 'cenc', event.initData).catch(function (err) {
-      self.lastDrmError = err && err.message ? err.message : 'dash-drm-request-failed';
-      self.engine._fallbackToShaka(self.lastDrmError, self.video.currentTime || self.engine.lastGoodTime || 0);
+      self._completeDrmTerminalError(err && err.message ? err.message : 'dash-drm-request-failed');
     });
+  };
+
+  NativeDashProvider.prototype._completeDrmTerminalError = function (reason) {
+    this.lastDrmError = reason || 'dash-drm-runtime-failed';
+    this.lastError = this.lastDrmError;
+    this.fatalError = this.lastDrmError;
+    this.nativeUnsupportedReason = this.lastDrmError;
+    if (this.engine && this.engine._completeNativeTerminalError) {
+      this.engine._completeNativeTerminalError(dashNativeTerminalError(this, this.lastDrmError));
+    }
   };
 
   NativeDashProvider.prototype._handleDrmMessage = function (session, message) {
@@ -3297,7 +3704,10 @@
     ]).then(function (parts) {
       rep.initData = parts[0];
       cacheInitData(rep, rep.generationKey || generationKeyForRep(rep), parts[0]);
-      rep.segments = parseSidx(parts[1], rep.indexRange.end);
+      rep.segments = parseSidx(parts[1], rep.indexRange.end).map(function (segment) {
+        segment.url = rep.baseUrl;
+        return segment;
+      });
       if (!rep.segments.length) throw new Error('empty-sidx-' + rep.id);
       if (!rep.duration && rep.segments.length) rep.duration = rep.segments[rep.segments.length - 1].end;
       return rep;
@@ -3620,6 +4030,7 @@
         schedulerQueueDepth: self._schedulerQueueDepth()
       });
       self._drainAppendQueue(rep, sb);
+      self._maybeEndVodStream();
       self._tick();
     }).catch(function (err) {
       rep._appending = false;
@@ -3630,6 +4041,20 @@
       }
     });
     return true;
+  };
+
+  NativeDashProvider.prototype._maybeEndVodStream = function () {
+    if (this.live || !this.mediaSource || this.mediaSource.readyState !== 'open') return false;
+    if ((this.videoSb && this.videoSb.updating) || (this.audioSb && this.audioSb.updating)) return false;
+    if (!this.activeVideo || !segmentsAppendedThroughEnd(this.activeVideo.segments, this.duration)) return false;
+    if (this.audio && !segmentsAppendedThroughEnd(this.audio.segments, this.duration)) return false;
+    try {
+      this.mediaSource.endOfStream();
+      this.vodEndOfStreamCount++;
+      return true;
+    } catch (e) {
+      return false;
+    }
   };
 
   NativeDashProvider.prototype._selectNextSegment = function (rep, currentTime, targetTime) {
@@ -3674,6 +4099,8 @@
     var chain = Promise.resolve();
     if (nextMime && nextMime !== currentMime) {
       if (!window.MediaSource || !MediaSource.isTypeSupported(nextMime)) {
+        this.lastPeriodTransitionReason = 'unsupported-codec';
+        this.lastPeriodTransitionError = 'dash-period-codec-change-unsupported';
         return Promise.reject(new Error('dash-period-codec-change-unsupported'));
       }
       var typeRep = {
@@ -3794,7 +4221,8 @@
     this.appendFailures++;
     this._recordRangeError(err);
     if (err && err.message === 'dash-period-codec-change-unsupported') {
-      this.engine._fallbackToShaka('dash-period-codec-change-unsupported');
+      this.lastPeriodTransitionError = err.message;
+      this._completeNativeRuntimeTerminal('dash-period-codec-change-unsupported');
       return;
     }
     var recoveryReason = rep.kind === 'video' ? 'native-video-append' : 'native-audio-append';
@@ -3809,11 +4237,20 @@
       try {
         this._switchVideo(this.chooseVideoRep(), true);
       } catch (e) {
-        this.engine._fallbackToShaka('native-video-append-exhausted');
+        this._completeNativeRuntimeTerminal('native-video-append-exhausted');
       }
       return;
     }
-    if (this.appendFailures >= 2) this.engine._fallbackToShaka('native-audio-append-failed');
+    if (this.appendFailures >= 2) this._completeNativeRuntimeTerminal('native-audio-append-failed');
+  };
+
+  NativeDashProvider.prototype._completeNativeRuntimeTerminal = function (reason) {
+    this.lastError = reason || this.lastError || 'dash-runtime-exhausted';
+    this.fatalError = this.lastError;
+    this.nativeUnsupportedReason = this.lastError;
+    if (this.engine && this.engine._completeNativeTerminalError) {
+      this.engine._completeNativeTerminalError(nativeTerminalError(this, this.lastError));
+    }
   };
 
   NativeDashProvider.prototype._tryNativeRecovery = function (reason) {
@@ -4125,6 +4562,60 @@
     return Promise.resolve();
   };
 
+  NativeDashProvider.prototype.getIFrameTracks = function () {
+    return (this.imageReps || []).map(function (rep) {
+      return {
+        id: rep.id,
+        url: rep.baseUrl || rep.url || rep.initUrl || '',
+        bandwidth: rep.bandwidth || 0,
+        width: rep.width || 0,
+        height: rep.height || 0,
+        codecs: rep.codecs || '',
+        pathwayId: '',
+        iframeOnly: false,
+        imageOnly: true,
+        thumbnailType: 'dash-image',
+        source: 'native-dash',
+        loaded: true
+      };
+    });
+  };
+
+  NativeDashProvider.prototype.getIFramePreview = function (time, trackId) {
+    var reps = this.imageReps || [];
+    if (!reps.length) return Promise.resolve(null);
+    var rep = reps[0];
+    if (trackId) {
+      var explicit = reps.find(function (item) { return item.id === trackId; });
+      if (explicit) rep = explicit;
+    }
+    var segments = rep.segments || rep.templateSegments || [];
+    var segment = nearestIFrameSegment(segments, Number(time) || 0);
+    if (!segment) return Promise.resolve(null);
+    return Promise.resolve({
+      track: {
+        id: rep.id,
+        bandwidth: rep.bandwidth || 0,
+        width: rep.width || 0,
+        height: rep.height || 0,
+        codecs: rep.codecs || '',
+        iframeOnly: false,
+        imageOnly: true,
+        thumbnailType: 'dash-image',
+        source: 'native-dash'
+      },
+      start: segment.start || 0,
+      end: segment.end || segment.start || 0,
+      duration: segment.duration || Math.max(0, (segment.end || 0) - (segment.start || 0)),
+      url: segment.url || rep.baseUrl || rep.url || '',
+      range: segment.range || null,
+      tiles: segment.tiles || null,
+      imageOnly: true,
+      thumbnailType: 'dash-image',
+      mediaSequence: segment.mediaSequence || 0
+    });
+  };
+
   NativeDashProvider.prototype._switchAudio = function (rep) {
     var self = this;
     this._abortRequests();
@@ -4224,12 +4715,16 @@
       lastTextTrackError: this.lastTextTrackError || '',
       timelineRegionCount: this.timelineRegions ? this.timelineRegions.length : 0,
       lastTimelineRegion: this.lastTimelineRegion || null,
+      imageVariantCount: this.imageRepCount || 0,
+      imageSegmentCount: this.imageSegmentCount || 0,
+      iframeTracks: this.getIFrameTracks ? this.getIFrameTracks() : [],
       manifestStartTime: isFinite(this.manifestStartTime) ? this.manifestStartTime : null,
       drmKeySystem: this.drmInfo ? this.drmInfo.keySystem : '',
       drmLicenseServerConfigured: !!(this.drmInfo && this.drmInfo.licenseServerUrl),
       drmSessionCount: this.drmSessionCount || 0,
       drmLicenseRequestCount: this.drmLicenseRequestCount || 0,
       lastDrmError: this.lastDrmError || '',
+      nativeUnsupportedReason: this.nativeUnsupportedReason || '',
       abrEnabled: !!(this.engine && this.engine._player && this.engine._player.config.abr.enabled),
       activeRestrictions: activeAbrRestrictions(this),
       restrictedVariantCount: restrictedVariantCount(this, this.videoReps),
@@ -4270,6 +4765,7 @@
       mediaFetchCancelledCount: this.requestCancellationCount || 0,
       mediaFetchRetryCount: this.mediaFetchRetryCount || 0,
       mediaUrlRefreshCount: this.mediaUrlRefreshCount || 0,
+      vodEndOfStreamCount: this.vodEndOfStreamCount || 0,
       mediaFetchAverageMs: this.mediaFetchCompletedCount ? this.mediaFetchTotalMs / this.mediaFetchCompletedCount : 0,
       schedulerBackpressureCount: this.schedulerBackpressureCount || 0,
       schedulerDrainCount: this.schedulerDrainCount || 0,
@@ -4297,7 +4793,7 @@
       segmentCacheHitCount: this.segmentCacheHitCount || 0,
       segmentCacheMissCount: this.segmentCacheMissCount || 0,
       lastOfflineError: this.lastOfflineError || (this.engine ? (this.engine._lastOfflineError || '') : ''),
-      fatalError: '',
+      fatalError: this.fatalError || '',
       droppedFrames: quality ? quality.droppedVideoFrames : 0,
       totalFrames: quality ? quality.totalVideoFrames : 0
     };
@@ -4670,7 +5166,7 @@
         }
       }
       if (this.stallReports >= 3) {
-        this.engine._fallbackToShaka('native-stall-exhausted');
+        this._completeNativeRuntimeTerminal('native-stall-exhausted');
       }
     }
   };
@@ -4698,292 +5194,6 @@
     } catch (e) {}
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
   };
-
-  function ShakaFallbackProvider(engine, reason) {
-    this.engine = engine;
-    this.video = engine.video;
-    this.name = 'shaka-fallback';
-    this.isAdaptive = true;
-    this.reason = reason;
-    this.player = new shaka.Player();
-    this.rebufferCount = 0;
-    this.rebufferStartedAt = 0;
-    this.rebufferDuration = 0;
-    this.lastError = '';
-    this.seekCount = 0;
-    this.seekCancelCount = 0;
-    this.seekAbortCount = 0;
-    this.seekBufferReadyCount = 0;
-    this.seekBufferPending = false;
-    this.lastSeekTarget = 0;
-    this.lastSeekStartedAt = 0;
-    this.lastSeekMs = 0;
-    this._lastSeekHandledTarget = null;
-    this._lastSeekHandledAt = 0;
-  }
-
-  ShakaFallbackProvider.prototype.load = function (url, startTime) {
-    var self = this;
-    shaka.polyfill.installAll();
-    if (!shaka.Player.isBrowserSupported()) throw new Error('shaka-browser-unsupported');
-    installShakaHttpPlugin(this.engine);
-    return this.player.attach(this.video).then(function () {
-      self.player.configure({
-        abr: {
-          enabled: true,
-          useNetworkInformation: true,
-          defaultBandwidthEstimate: 3000000,
-          bandwidthUpgradeTarget: 0.85,
-          bandwidthDowngradeTarget: 0.95,
-          restrictions: {}
-        },
-        streaming: { bufferingGoal: 30, rebufferingGoal: 0.3, bufferBehind: 60 }
-      });
-      self.player.addEventListener('error', function (event) {
-        var error = event.detail;
-        if (error) {
-          self.lastError = 'shaka-' + error.category + '-' + error.code;
-          self.engine._telemetry.record('fatal-error', { lastError: self.lastError });
-          console.debug('[player-engine] shaka error cat=' + error.category + ' code=' + error.code);
-        }
-      });
-      self.video.addEventListener('waiting', self._boundWaiting = function () {
-        if (self.rebufferStartedAt || self.video.paused || self.video.seeking) return;
-        self.rebufferStartedAt = performance.now();
-        self.rebufferCount++;
-        self.engine._telemetry.record('rebuffer-start');
-      });
-      self.video.addEventListener('playing', self._boundPlaying = function () {
-        if (!self.rebufferStartedAt) return;
-        self.rebufferDuration += (performance.now() - self.rebufferStartedAt) / 1000;
-        self.rebufferStartedAt = 0;
-        self.engine._telemetry.record('rebuffer-end');
-      });
-      return self.player.load(url, startTime > 1 ? startTime : undefined);
-    }).then(function () {
-      self.engine._setState('ready');
-      self.engine._player.emit('loaded');
-      self.engine._player.emit('trackschanged');
-    });
-  };
-
-  ShakaFallbackProvider.prototype.configure = function (config) {
-    try { this.player.configure(config); } catch (e) {}
-  };
-
-  ShakaFallbackProvider.prototype.getVariantTracks = function () {
-    try { return this.player.getVariantTracks(); } catch (e) { return []; }
-  };
-
-  ShakaFallbackProvider.prototype.getActiveVariantTrack = function () {
-    var tracks = this.getVariantTracks();
-    for (var i = 0; i < tracks.length; i++) {
-      if (tracks[i].active) return tracks[i];
-    }
-    return null;
-  };
-
-  ShakaFallbackProvider.prototype.selectVariantTrack = function (track, clearBuffer) {
-    try { this.player.selectVariantTrack(track, clearBuffer); } catch (e) {}
-  };
-
-  ShakaFallbackProvider.prototype.getAudioTracks = function () {
-    try {
-      if (this.player.getAudioTracks) return this.player.getAudioTracks();
-      var variants = this.getVariantTracks();
-      var seen = {};
-      var tracks = [];
-      for (var i = 0; i < variants.length; i++) {
-        var key = variants[i].audioId || variants[i].language || 'default';
-        if (seen[key]) continue;
-        seen[key] = true;
-        tracks.push({
-          id: key,
-          active: !!variants[i].active,
-          language: variants[i].language || '',
-          label: variants[i].label || variants[i].language || 'Default',
-          bandwidth: variants[i].audioBandwidth || 0,
-          codecs: variants[i].audioCodec || ''
-        });
-      }
-      return tracks;
-    } catch (e) { return []; }
-  };
-
-  ShakaFallbackProvider.prototype.getActiveAudioTrack = function () {
-    var tracks = this.getAudioTracks();
-    for (var i = 0; i < tracks.length; i++) {
-      if (tracks[i].active) return tracks[i];
-    }
-    return tracks[0] || null;
-  };
-
-  ShakaFallbackProvider.prototype.selectAudioTrack = function (track) {
-    try {
-      if (this.player.selectAudioTrack) {
-        this.player.selectAudioTrack(track);
-      }
-      this.engine._player.emit('audiotrackchanged', track);
-    } catch (e) {}
-  };
-
-  ShakaFallbackProvider.prototype.isLive = function () {
-    try { return this.player.isLive(); } catch (e) { return false; }
-  };
-
-  ShakaFallbackProvider.prototype.seekRange = function () {
-    try {
-      if (this.player.seekRange) {
-        var range = this.player.seekRange();
-        if (range && isFinite(range.start) && isFinite(range.end) && range.end >= range.start) return range;
-      }
-    } catch (e) {}
-    return mediaSeekRange(this.video);
-  };
-
-  ShakaFallbackProvider.prototype._clampSeekTarget = function (targetTime) {
-    var target = isFinite(Number(targetTime)) ? Number(targetTime) : (this.video.currentTime || 0);
-    var range = this.seekRange();
-    if (this.isLive() && range && range.end > range.start) target = clamp(target, range.start, range.end);
-    return target;
-  };
-
-  ShakaFallbackProvider.prototype.beginSeek = function (targetTime) {
-    var target = this._clampSeekTarget(targetTime);
-    this.lastSeekTarget = target;
-    this.lastSeekStartedAt = performance.now();
-    this.seekBufferPending = true;
-    if (this.engine && this.engine._setState) this.engine._setState('seeking');
-    return target;
-  };
-
-  ShakaFallbackProvider.prototype.commitSeek = function (targetTime) {
-    var target = this.beginSeek(targetTime);
-    this.seekCount++;
-    try { this.video.currentTime = target; } catch (e) {}
-    return target;
-  };
-
-  ShakaFallbackProvider.prototype.cancelSeek = function () {
-    this.seekCancelCount++;
-    this.seekBufferPending = false;
-    this.lastSeekStartedAt = 0;
-    if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
-  };
-
-  ShakaFallbackProvider.prototype.endSeek = function () {
-    if (this.lastSeekStartedAt) this.lastSeekMs = performance.now() - this.lastSeekStartedAt;
-    this.lastSeekStartedAt = 0;
-    this.seekBufferPending = false;
-    this.seekBufferReadyCount++;
-    if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
-  };
-
-  ShakaFallbackProvider.prototype.getBufferedInfo = function () {
-    try {
-      if (this.player.getBufferedInfo) return this.player.getBufferedInfo();
-    } catch (e) {}
-    return getBufferedInfoFor(this.video, null, null);
-  };
-
-  ShakaFallbackProvider.prototype.getStats = function () {
-    var quality = this.video.getVideoPlaybackQuality ? this.video.getVideoPlaybackQuality() : null;
-    var active = this.getActiveVariantTrack();
-    var bufferedInfo = this.getBufferedInfo();
-    var bufferedSummary = summarizeBufferedInfo(bufferedInfo);
-    return {
-      provider: this.name,
-      mode: 'fallback',
-      isLive: this.isLive(),
-      assetUri: this.engine.manifestUrl,
-      fallbackReason: this.reason || this.engine._fallbackReason || '',
-      bandwidthEstimate: 0,
-      lastBandwidthSample: 0,
-      bufferAhead: getBufferAhead(this.video),
-      bufferedRangeCount: bufferedSummary.count,
-      bufferedStart: bufferedSummary.start,
-      bufferedEnd: bufferedSummary.end,
-      activeVariant: active,
-      activeAudio: this.getActiveAudioTrack(),
-      audioTrackCount: this.getAudioTracks().length,
-      activeTextTrack: this.engine._player.getActiveTextTrack(),
-      textTrackCount: this.engine._player.getTextTracks().length,
-      lastSwitchReason: '',
-      rebufferCount: this.rebufferCount,
-      rebufferDuration: this.rebufferDuration + (this.rebufferStartedAt ? (performance.now() - this.rebufferStartedAt) / 1000 : 0),
-      seekBufferPending: !!this.seekBufferPending,
-      seekBufferReadyCount: this.seekBufferReadyCount || 0,
-      seekCount: this.seekCount || 0,
-      seekCancelCount: this.seekCancelCount || 0,
-      seekAbortCount: this.seekAbortCount || 0,
-      lastSeekTarget: this.lastSeekTarget || 0,
-      lastSeekMs: this.lastSeekMs || 0,
-      recoveryCount: 0,
-      lastError: this.lastError,
-      lastHttpStatus: 0,
-      fatalError: '',
-      droppedFrames: quality ? quality.droppedVideoFrames : 0,
-      totalFrames: quality ? quality.totalVideoFrames : 0
-    };
-  };
-
-  ShakaFallbackProvider.prototype.destroy = function () {
-    if (this._boundWaiting) this.video.removeEventListener('waiting', this._boundWaiting);
-    if (this._boundPlaying) this.video.removeEventListener('playing', this._boundPlaying);
-    try { this.player.destroy(); } catch (e) {}
-  };
-
-  function installShakaHttpPlugin(engine) {
-    if (!window.shaka || installShakaHttpPlugin.installed) return;
-    function stamp(uri) { return stampUri(engine, uri); }
-    function waitForServer() {
-      if (!engine._serverDown) return Promise.resolve();
-      return new Promise(function (resolve) { engine._heldRequests.push(resolve); });
-    }
-    function httpPlugin(uri, request, requestType, progressUpdated, headersReceived) {
-      var abortController = new AbortController();
-      var aborted = false;
-      function doFetch() {
-        if (aborted) return Promise.reject(new shaka.util.Error(shaka.util.Error.Severity.RECOVERABLE, shaka.util.Error.Category.NETWORK, shaka.util.Error.Code.OPERATION_ABORTED));
-        var init = { method: request.method || 'GET', headers: request.headers || {}, signal: abortController.signal };
-        if (request.body) init.body = request.body;
-        var fetchUri = stamp(uri);
-        return fetch(fetchUri, init).then(function (response) {
-          if (response.status === 401 || response.status === 403 || response.status >= 500) {
-            if (!engine._serverDown) engine._enterServerDown(response.status === 401 ? 'token-expired' : 'server-error');
-            return waitForServer().then(doFetch);
-          }
-          if (requestType === shaka.net.NetworkingEngine.RequestType.MANIFEST) {
-            var via = response.headers.get('x-stream-via');
-            if (via) { engine._finalVia = via; engine.emit('via', via); }
-            var dlHeight = response.headers.get('x-downloaded-height');
-            if (dlHeight) engine.emit('downloaded-height', parseInt(dlHeight, 10));
-          }
-          var headers = {};
-          response.headers.forEach(function (value, key) { headers[key] = value; });
-          if (headersReceived) headersReceived(headers);
-          return response.arrayBuffer().then(function (data) {
-            if (progressUpdated) progressUpdated(0, data.byteLength, data.byteLength);
-            return { uri: response.url || fetchUri, originalUri: uri, data: data, status: response.status, headers: headers, timeMs: 0 };
-          });
-        }).catch(function (err) {
-          if (aborted || err.name === 'AbortError') throw new shaka.util.Error(shaka.util.Error.Severity.RECOVERABLE, shaka.util.Error.Category.NETWORK, shaka.util.Error.Code.OPERATION_ABORTED);
-          if (!engine._serverDown) engine._enterServerDown('network-error');
-          return waitForServer().then(doFetch);
-        });
-      }
-      var promise = (engine._serverDown ? waitForServer() : Promise.resolve()).then(doFetch);
-      return new shaka.util.AbortableOperation(promise, function () {
-        aborted = true;
-        abortController.abort();
-        return Promise.resolve();
-      });
-    }
-    var APP = shaka.net.NetworkingEngine.PluginPriority.APPLICATION;
-    shaka.net.NetworkingEngine.registerScheme('http', httpPlugin, APP);
-    shaka.net.NetworkingEngine.registerScheme('https', httpPlugin, APP);
-    installShakaHttpPlugin.installed = true;
-  }
 
   function fetchManifest(engine, url) {
     if (url.indexOf('data:') === 0) {
@@ -5030,8 +5240,11 @@
     var lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
     var variants = [];
     var iframeVariants = [];
+    var imageVariants = [];
     var audioRenditions = [];
     var subtitleRenditions = [];
+    var closedCaptionRenditions = [];
+    var sessionData = [];
     var segments = [];
     var pendingParts = [];
     var preloadHints = [];
@@ -5046,6 +5259,8 @@
     var encrypted = false;
     var unsupportedEncryption = false;
     var unsupportedEncryptionReason = '';
+    var encryptionMethod = '';
+    var keyFormat = '';
     var currentKey = null;
     var discontinuity = false;
     var discontinuityCount = 0;
@@ -5056,6 +5271,7 @@
     var targetDuration = 0;
     var mediaSequence = 0;
     var pendingDuration = 0;
+    var imageTiles = null;
     var duration = 0;
     var timeline = 0;
     var nextRange = null;
@@ -5069,8 +5285,7 @@
       if (!line) continue;
       if (line.indexOf('#EXT-X-MEDIA-SEQUENCE') === 0) {
         mediaSequence = parseInt(line.split(':')[1] || '0', 10) || 0;
-        timeline = mediaSequence * (targetDuration || 0);
-        duration = timeline;
+        if (!segments.length && targetDuration > 0) timeline = mediaSequence * targetDuration;
       } else if (line.indexOf('#EXT-X-STREAM-INF') === 0) {
         var attrs = hlsAttrs(line);
         var uri = nextHlsUri(lines, i + 1);
@@ -5084,10 +5299,11 @@
             width: res ? parseInt(res[1], 10) : 0,
             height: res ? parseInt(res[2], 10) : 0,
             codecs: codecs,
-            audioGroup: unquote(attrs.AUDIO || ''),
-            subtitleGroup: unquote(attrs.SUBTITLES || ''),
-            pathwayId: unquote(attrs['PATHWAY-ID'] || ''),
-            active: false
+          audioGroup: unquote(attrs.AUDIO || ''),
+          subtitleGroup: unquote(attrs.SUBTITLES || ''),
+          closedCaptions: unquote(attrs['CLOSED-CAPTIONS'] || ''),
+          pathwayId: unquote(attrs['PATHWAY-ID'] || ''),
+          active: false
           });
           if (codecs) playlistCodecs = codecs;
         }
@@ -5108,6 +5324,23 @@
             iframeOnly: true
           });
           if (iframeCodecs && !playlistCodecs) playlistCodecs = iframeCodecs;
+        }
+      } else if (line.indexOf('#EXT-X-IMAGE-STREAM-INF') === 0) {
+        var imageAttrs = hlsAttrs(line);
+        var imageUri = unquote(imageAttrs.URI || '');
+        if (imageUri) {
+          var imageRes = String(imageAttrs.RESOLUTION || '').match(/(\d+)x(\d+)/);
+          var imageCodecs = unquote(imageAttrs.CODECS || '');
+          imageVariants.push({
+            id: 'image-' + imageVariants.length,
+            url: resolveUrl(imageUri, playlistUrl),
+            bandwidth: parseInt(imageAttrs.BANDWIDTH || imageAttrs['AVERAGE-BANDWIDTH'] || '0', 10) || 0,
+            width: imageRes ? parseInt(imageRes[1], 10) : 0,
+            height: imageRes ? parseInt(imageRes[2], 10) : 0,
+            codecs: imageCodecs,
+            pathwayId: unquote(imageAttrs['PATHWAY-ID'] || ''),
+            imageOnly: true
+          });
         }
       } else if (line.indexOf('#EXT-X-MEDIA') === 0) {
         var mediaAttrs = hlsAttrs(line);
@@ -5131,6 +5364,27 @@
           mediaItem.mimeType = /ttml|xml/i.test(mediaItem.url) ? 'application/ttml+xml' : 'text/vtt';
           subtitleRenditions.push(mediaItem);
         }
+        if (type === 'CLOSED-CAPTIONS') {
+          mediaItem.id = mediaItem.groupId + ':' + unquote(mediaAttrs['INSTREAM-ID'] || mediaAttrs.NAME || String(closedCaptionRenditions.length));
+          mediaItem.url = '';
+          mediaItem.mimeType = 'application/cea-608';
+          mediaItem.source = 'native-hls-cea';
+          mediaItem.embedded = true;
+          mediaItem.instreamId = unquote(mediaAttrs['INSTREAM-ID'] || '');
+          mediaItem.supported = false;
+          mediaItem.renderSupported = false;
+          closedCaptionRenditions.push(mediaItem);
+        }
+      } else if (line.indexOf('#EXT-X-SESSION-DATA') === 0) {
+        var sessionAttrs = hlsAttrs(line);
+        var sessionUri = unquote(sessionAttrs.URI || '');
+        sessionData.push({
+          dataId: unquote(sessionAttrs['DATA-ID'] || ''),
+          value: unquote(sessionAttrs.VALUE || ''),
+          uri: sessionUri ? resolveUrl(sessionUri, playlistUrl) : '',
+          language: unquote(sessionAttrs.LANGUAGE || ''),
+          raw: clonePlain(sessionAttrs)
+        });
       } else if (line.indexOf('#EXT-X-MAP') === 0) {
         var mapAttrs = hlsAttrs(line);
         map = {
@@ -5140,10 +5394,12 @@
       } else if (line.indexOf('#EXT-X-KEY') === 0) {
         var keyAttrs = hlsAttrs(line);
         var method = String(keyAttrs.METHOD || '').toUpperCase();
+        encryptionMethod = method;
         if (method === 'NONE') {
           currentKey = null;
         } else if (method === 'AES-128') {
           var keyFormat = unquote(keyAttrs.KEYFORMAT || 'identity');
+          keyFormat = keyFormat || 'identity';
           var keyUri = unquote(keyAttrs.URI || '');
           var iv = unquote(keyAttrs.IV || '');
           encrypted = true;
@@ -5165,6 +5421,7 @@
             }
           }
         } else {
+          keyFormat = unquote(keyAttrs.KEYFORMAT || 'identity') || 'identity';
           encrypted = true;
           unsupportedEncryption = true;
           unsupportedEncryptionReason = method === 'SAMPLE-AES' ? 'hls-sample-aes-unsupported' : 'hls-encrypted-unsupported';
@@ -5232,6 +5489,10 @@
       } else if (line.indexOf('#EXT-X-DATERANGE') === 0) {
         var dateRange = hlsDateRange(line);
         if (dateRange) dateRanges.push(dateRange);
+      } else if (line.indexOf('#EXT-X-IMAGES-ONLY') === 0) {
+        imageTiles = imageTiles || {};
+      } else if (line.indexOf('#EXT-X-TILES') === 0) {
+        imageTiles = hlsTiles(line);
       } else if (line.indexOf('#EXT-X-PROGRAM-DATE-TIME') === 0) {
         pendingProgramDateTimeMs = Date.parse(line.slice(line.indexOf(':') + 1).trim());
       } else if (line.indexOf('#EXT-X-DISCONTINUITY-SEQUENCE') === 0) {
@@ -5244,12 +5505,10 @@
         pendingDiscontinuity = true;
       } else if (line.indexOf('#EXT-X-TARGETDURATION') === 0) {
         targetDuration = parseFloat(line.split(':')[1] || '0') || 0;
-        timeline = mediaSequence * targetDuration;
-        duration = timeline;
+        if (!segments.length && mediaSequence > 0 && targetDuration > 0) timeline = mediaSequence * targetDuration;
       } else if (line.indexOf('#EXT-X-MEDIA-SEQUENCE') === 0) {
         mediaSequence = parseInt(line.split(':')[1] || '0', 10) || 0;
-        timeline = mediaSequence * (targetDuration || 0);
-        duration = timeline;
+        if (!segments.length && targetDuration > 0) timeline = mediaSequence * targetDuration;
       } else if (line.indexOf('#EXT-X-ENDLIST') === 0) {
         endList = true;
       } else if (line.indexOf('#EXTINF') === 0) {
@@ -5269,6 +5528,7 @@
           url: resolveUrl(line, playlistUrl),
           range: range
         };
+        if (imageTiles) segment.tiles = imageTiles;
         if (pendingParts.length) {
           segment.parts = normalizeHlsParts(pendingParts, segment);
           pendingParts = [];
@@ -5287,8 +5547,11 @@
     return {
       variants: variants,
       iframeVariants: iframeVariants,
+      imageVariants: imageVariants,
       audioRenditions: audioRenditions,
       subtitleRenditions: subtitleRenditions,
+      closedCaptionRenditions: closedCaptionRenditions,
+      sessionData: sessionData,
       segments: segments,
       preloadHints: preloadHints,
       renditionReports: renditionReports,
@@ -5297,6 +5560,7 @@
       partialSegmentCount: segments.reduce(function (count, segment) { return count + ((segment.parts && segment.parts.length) || 0); }, 0) + pendingParts.length,
       skippedSegmentCount: skippedSegmentCount,
       lowLatencyPlaylist: !!(partTargetDuration || preloadHints.length || renditionReports.length || pendingParts.length || serverControl),
+      imagesOnly: !!imageTiles,
       contentSteeringUri: contentSteeringUri,
       contentSteeringPathwayId: contentSteeringPathwayId,
       warnings: warnings,
@@ -5304,6 +5568,8 @@
       encrypted: encrypted,
       unsupportedEncryption: unsupportedEncryption,
       unsupportedEncryptionReason: unsupportedEncryptionReason,
+      encryptionMethod: encryptionMethod,
+      keyFormat: keyFormat,
       discontinuity: discontinuity,
       discontinuitySequence: discontinuitySequence,
       discontinuityCount: discontinuityCount,
@@ -5315,6 +5581,57 @@
       dateRanges: dateRanges,
       codecs: playlistCodecs
     };
+  }
+
+  function hlsUnsupportedEncryptionError(provider, parsed) {
+    var reason = parsed.unsupportedEncryptionReason || 'hls-encrypted-unsupported';
+    var err = nativeTerminalError(provider, reason);
+    err.hlsEncryptionMethod = parsed.encryptionMethod || '';
+    err.hlsKeyFormat = parsed.keyFormat || '';
+    if (provider) {
+      provider.hlsEncryptionMethod = err.hlsEncryptionMethod;
+      provider.hlsKeyFormat = err.hlsKeyFormat;
+    }
+    return err;
+  }
+
+  function dashNativeTerminalError(provider, reason) {
+    var err = nativeTerminalError(provider, reason || 'dash-native-unsupported');
+    err.drmKeySystem = provider && provider.drmInfo ? provider.drmInfo.keySystem : '';
+    if (provider) {
+      provider.lastDrmError = err.message;
+    }
+    return err;
+  }
+
+  function nativeTerminalError(provider, reason) {
+    var err = new Error(reason || 'native-unsupported');
+    err.nativeTerminal = true;
+    if (provider) {
+      provider.lastError = err.message;
+      provider.fatalError = err.message;
+      provider.nativeUnsupportedReason = err.message;
+    }
+    return err;
+  }
+
+  function isNativeTerminalError(err) {
+    return !!(err && err.nativeTerminal);
+  }
+
+  function isNativeLoadTerminalError(err) {
+    var reason = err && err.message ? err.message : 'native-load-failed';
+    if (reason === 'native-load-failed' || reason === 'mse-unavailable') return true;
+    if (isHlsTsTerminalError(err)) return true;
+    if (/^manifest-http-\d+/.test(reason)) return true;
+    if (/Failed to fetch|NetworkError|Load failed/i.test(reason)) return true;
+    if (/JSON|Unexpected token|Unexpected end/i.test(reason)) return true;
+    return false;
+  }
+
+  function isHlsTsTerminalError(err) {
+    var reason = err && err.message ? err.message : '';
+    return /^hls-first-party-ts-/.test(reason) || /^hls-ts-transmuxer-/.test(reason);
   }
 
   function nextHlsUri(lines, start) {
@@ -5364,6 +5681,20 @@
       customAttributes: custom,
       startTime: 0,
       endTime: 0
+    };
+  }
+
+  function hlsTiles(line) {
+    var attrs = hlsAttrs(line);
+    var resolution = String(unquote(attrs.RESOLUTION || '')).match(/(\d+)x(\d+)/);
+    var layout = String(unquote(attrs.LAYOUT || '')).match(/(\d+)x(\d+)/);
+    var duration = parseFloat(unquote(attrs.DURATION || ''));
+    return {
+      width: resolution ? parseInt(resolution[1], 10) : 0,
+      height: resolution ? parseInt(resolution[2], 10) : 0,
+      columns: layout ? parseInt(layout[1], 10) : 0,
+      rows: layout ? parseInt(layout[2], 10) : 0,
+      duration: isFinite(duration) ? duration : 0
     };
   }
 
@@ -5679,20 +6010,6 @@
     return infos[0].keySystem ? infos[0] : { keySystem: '', schemeIdUri: infos[0].schemeIdUri || '', defaultKid: infos[0].defaultKid || '', pssh: infos[0].pssh || null, licenseServerUrl: '' };
   }
 
-  function loadShaka() {
-    if (window.shaka && window.shaka.Player) return Promise.resolve();
-    if (loadShaka.promise) return loadShaka.promise;
-    loadShaka.promise = new Promise(function (resolve, reject) {
-      var script = document.createElement('script');
-      script.src = SHAKA_URL;
-      script.async = true;
-      script.onload = function () { resolve(); };
-      script.onerror = function () { reject(new Error('shaka-script-load-failed')); };
-      document.head.appendChild(script);
-    });
-    return loadShaka.promise;
-  }
-
   function parseMPD(text, manifestUrl) {
     var doc = new DOMParser().parseFromString(text, 'application/xml');
     if (doc.querySelector('parsererror')) throw new Error('mpd-parse-failed');
@@ -5712,10 +6029,12 @@
     }
     var reps = [];
     var textReps = [];
+    var imageReps = [];
     var timelineRegions = [];
     var mpdBase = directChildText(mpd, 'BaseURL');
     var mpdTemplate = directChild(mpd, 'SegmentTemplate');
     var mpdList = segmentListChain([], directChild(mpd, 'SegmentList'));
+    var mpdSegmentBase = segmentListChain([], directChild(mpd, 'SegmentBase'));
     var periods = periodNodes.length ? periodNodes : [mpd];
     for (var p = 0; p < periods.length; p++) {
       var period = periods[p];
@@ -5728,8 +6047,10 @@
       var periodBase = resolveBaseUrl(mpdBase, directChildText(period, 'BaseURL'), manifestUrl);
       var periodDirectTemplate = directChild(period, 'SegmentTemplate');
       var periodDirectList = directChild(period, 'SegmentList');
+      var periodDirectSegmentBase = directChild(period, 'SegmentBase');
       var periodTemplate = periodDirectTemplate || (periodDirectList ? null : mpdTemplate);
       var periodList = segmentListChain(periodDirectTemplate ? [] : mpdList, periodDirectList);
+      var periodSegmentBase = segmentListChain(periodDirectTemplate || periodDirectList ? [] : mpdSegmentBase, periodDirectSegmentBase);
       var sets = period.querySelectorAll('AdaptationSet');
       for (var i = 0; i < sets.length; i++) {
       var set = sets[i];
@@ -5738,8 +6059,10 @@
       var setBase = resolveBaseUrl(periodBase, directChildText(set, 'BaseURL'), manifestUrl);
       var setDirectTemplate = directChild(set, 'SegmentTemplate');
       var setDirectList = directChild(set, 'SegmentList');
+      var setDirectSegmentBase = directChild(set, 'SegmentBase');
       var setTemplate = setDirectTemplate || (setDirectList ? null : periodTemplate);
       var setList = segmentListChain(setDirectTemplate ? [] : periodList, setDirectList);
+      var setSegmentBase = segmentListChain(setDirectTemplate || setDirectList ? [] : periodSegmentBase, setDirectSegmentBase);
       var setRoles = descriptorValues(set, 'Role');
       var setAccessibility = descriptorValues(set, 'Accessibility');
       var setLabel = directChildText(set, 'Label') || set.getAttribute('label') || '';
@@ -5749,15 +6072,17 @@
         var r = repNodes[j];
         var repDrmInfos = mergeDrmInfos(setDrmInfos, parseContentProtectionList(directChildren(r, 'ContentProtection')));
         var baseText = resolveBaseUrl(setBase, directChildText(r, 'BaseURL'), manifestUrl);
-        var segBase = directChild(r, 'SegmentBase');
+        var repDirectSegmentBase = directChild(r, 'SegmentBase');
         var repDirectTemplate = directChild(r, 'SegmentTemplate');
         var repDirectList = directChild(r, 'SegmentList');
         var segTemplate = repDirectTemplate || (repDirectList ? null : setTemplate);
         var segList = segmentListChain(repDirectTemplate ? [] : setList, repDirectList);
-        var init = segBase && segBase.querySelector('Initialization');
+        var segmentBaseChain = segmentListChain(repDirectTemplate || repDirectList ? [] : setSegmentBase, repDirectSegmentBase);
+        var segBase = segmentBaseChain.length ? segmentBaseChain[segmentBaseChain.length - 1] : null;
+        var init = segmentBaseChain.length ? inheritedDirectChild(segmentBaseChain, 'Initialization') : null;
         var mimeType = r.getAttribute('mimeType') || setMime;
         var codecs = r.getAttribute('codecs') || '';
-        var kind = mimeType.indexOf('audio/') === 0 ? 'audio' : (isTextMime(mimeType) ? 'text' : 'video');
+        var kind = mimeType.indexOf('audio/') === 0 ? 'audio' : (isTextMime(mimeType) ? 'text' : (isImageMime(mimeType) ? 'image' : 'video'));
         var language = r.getAttribute('lang') || set.getAttribute('lang') || '';
         var label = directChildText(r, 'Label') || r.getAttribute('label') || setLabel || language || '';
         var roles = mergeUnique(setRoles, descriptorValues(r, 'Role'));
@@ -5771,6 +6096,8 @@
           bandwidth: parseInt(r.getAttribute('bandwidth') || '0', 10),
           width: parseInt(r.getAttribute('width') || '0', 10),
           height: parseInt(r.getAttribute('height') || '0', 10),
+          tilesHorizontal: r.getAttribute('tilesHorizontal') || r.getAttribute('tileColumns') || '',
+          tilesVertical: r.getAttribute('tilesVertical') || r.getAttribute('tileRows') || '',
           asr: parseInt(r.getAttribute('audioSamplingRate') || '0', 10),
           language: language,
           label: label,
@@ -5781,6 +6108,7 @@
           source: kind === 'text' ? 'native-dash' : '',
           drmInfos: repDrmInfos
         };
+        textReps = textReps.concat(parseDashCeaTextTracks(set, r, rep));
         if (kind === 'text') {
           rep.supported = isSupportedTextMime(mimeType);
           rep.renderSupported = isRenderableTextMime(mimeType);
@@ -5790,11 +6118,45 @@
           textReps.push(rep);
           continue;
         }
+        if (kind === 'image') {
+          rep.source = 'native-dash';
+          if (segTemplate) {
+            var imageTemplateData = parseSegmentTemplate(segTemplate, rep, baseText, manifestUrl, isFinite(periodDuration) ? periodDuration : duration, type, periodStart, periodEnd, warnings, {
+              availabilityStartTime: availabilityStartTime,
+              publishTime: publishTime,
+              timeShiftBufferDepth: timeShiftBufferDepth,
+              minimumUpdatePeriod: minimumUpdatePeriod
+            });
+            if (imageTemplateData) {
+              rep.initUrl = imageTemplateData.initUrl;
+              rep.templateSegments = imageTemplateData.segments.map(function (segment) { return annotateImageSegment(segment, rep); });
+              imageReps.push(rep);
+            }
+            continue;
+          }
+          if (segList) {
+            var imageListData = parseSegmentList(segList, rep, baseText, manifestUrl, isFinite(periodDuration) ? periodDuration : duration, periodStart, periodEnd, warnings);
+            if (imageListData) {
+              rep.initUrl = imageListData.initUrl;
+              rep.initRange = imageListData.initRange;
+              rep.segments = imageListData.segments.map(function (segment) { return annotateImageSegment(segment, rep); });
+              imageReps.push(rep);
+            }
+            continue;
+          }
+          if (segBase && init && baseText) {
+            rep.baseUrl = resolveUrl(baseText, manifestUrl);
+            rep.initRange = parseRange(init.getAttribute('range'));
+            rep.indexRange = parseRange(inheritedAttr(segmentBaseChain, 'indexRange'));
+            imageReps.push(rep);
+          }
+          continue;
+        }
         if (segBase && init) {
           if (!baseText) continue;
           rep.baseUrl = resolveUrl(baseText, manifestUrl);
           rep.initRange = parseRange(init.getAttribute('range'));
-          rep.indexRange = parseRange(segBase.getAttribute('indexRange'));
+          rep.indexRange = parseRange(inheritedAttr(segmentBaseChain, 'indexRange'));
           rep.generationKey = generationKeyForRep(rep);
           rep.periodGenerations = [periodGenerationForRep(rep)];
           reps.push(rep);
@@ -5844,14 +6206,15 @@
       timelineRegions: timelineRegions,
       video: reps.filter(function (r) { return r.kind === 'video'; }),
       audio: reps.filter(function (r) { return r.kind === 'audio'; }),
-      text: mergeTextRepresentations(textReps)
+      text: mergeTextRepresentations(textReps),
+      images: mergeImageRepresentations(imageReps)
     };
   }
 
   function parseSegmentTemplate(node, rep, baseText, manifestUrl, duration, mpdType, periodStart, periodEnd, warnings, liveContext) {
     var initPattern = node.getAttribute('initialization') || '';
     var mediaPattern = node.getAttribute('media') || '';
-    if (!initPattern || !mediaPattern) return null;
+    if (!mediaPattern || (!initPattern && rep.kind !== 'image')) return null;
     var timescale = parseInt(node.getAttribute('timescale') || '1', 10) || 1;
     var startNumber = parseInt(node.getAttribute('startNumber') || '1', 10) || 1;
     var pto = parseInt(node.getAttribute('presentationTimeOffset') || '0', 10) || 0;
@@ -5864,8 +6227,26 @@
         : templateNumberSegments(node, mediaPattern, rep, base, timescale, startNumber, duration, periodStart || 0, periodEnd));
     if (!segments.length) return null;
     return {
-      initUrl: resolveUrl(expandTemplateUrl(initPattern, rep, startNumber, 0), base),
+      initUrl: initPattern ? resolveUrl(expandTemplateUrl(initPattern, rep, startNumber, 0), base) : '',
       segments: segments
+    };
+  }
+
+  function annotateImageSegment(segment, rep) {
+    segment = clonePlain(segment);
+    segment.imageOnly = true;
+    segment.thumbnailType = 'dash-image';
+    segment.tiles = dashImageTiles(rep);
+    return segment;
+  }
+
+  function dashImageTiles(rep) {
+    return {
+      width: rep.width || 0,
+      height: rep.height || 0,
+      columns: parseInt(rep.tilesHorizontal || rep.tileColumns || '0', 10) || 0,
+      rows: parseInt(rep.tilesVertical || rep.tileRows || '0', 10) || 0,
+      duration: 0
     };
   }
 
@@ -6122,6 +6503,10 @@
 
   function isTextMime(mimeType) {
     return /^(text\/|application\/(ttml|vtt))/i.test(mimeType || '') && mimeType.indexOf('audio/') !== 0 && mimeType.indexOf('video/') !== 0;
+  }
+
+  function isImageMime(mimeType) {
+    return /^image\//i.test(mimeType || '');
   }
 
   function isSupportedTextMime(mimeType) {
@@ -6454,6 +6839,20 @@
     return merged;
   }
 
+  function mergeImageRepresentations(reps) {
+    var byKey = {};
+    var merged = [];
+    for (var i = 0; i < reps.length; i++) {
+      var rep = reps[i];
+      var key = rep.id || [rep.mimeType, rep.baseUrl || rep.url || rep.initUrl].join(':');
+      if (!byKey[key]) {
+        byKey[key] = rep;
+        merged.push(rep);
+      }
+    }
+    return merged;
+  }
+
   function liveWindowForReps(reps, timeShiftBufferDepth) {
     var start = Infinity;
     var end = 0;
@@ -6533,11 +6932,13 @@
     return (parseInt(m[1] || '0', 10) * 3600) + (parseInt(m[2] || '0', 10) * 60) + parseFloat(m[3] || '0');
   }
 
-  function appendBuffer(sb, data, appendWindow) {
+  function appendBuffer(sb, data, appendWindow, timestampOffset) {
     return queueSourceBuffer(sb, function () {
       return waitForSourceBufferIdle(sb).then(function () {
         return new Promise(function (resolve, reject) {
+          var timeoutId = 0;
           function cleanup() {
+            if (timeoutId) clearTimeout(timeoutId);
             sb.removeEventListener('updateend', onEnd);
             sb.removeEventListener('error', onError);
           }
@@ -6551,7 +6952,15 @@
               sb.appendWindowStart = appendWindow.start;
               sb.appendWindowEnd = appendWindow.end;
             }
+            if (isFinite(timestampOffset) && Math.abs((sb.timestampOffset || 0) - timestampOffset) > 0.001) {
+              sb.timestampOffset = timestampOffset;
+            }
             sb.appendBuffer(data);
+            timeoutId = setTimeout(function () {
+              cleanup();
+              if (!sb.updating) resolve();
+              else reject(new Error('sourcebuffer-timeout'));
+            }, SOURCEBUFFER_WATCHDOG_MS);
           } catch (e) { cleanup(); reject(e); }
         });
       });
@@ -6612,11 +7021,14 @@
   function waitForSourceBufferIdle(sb) {
     if (!sb.updating) return Promise.resolve();
     return new Promise(function (resolve) {
+      var timeoutId = 0;
       function done() {
+        if (timeoutId) clearTimeout(timeoutId);
         sb.removeEventListener('updateend', done);
         resolve();
       }
       sb.addEventListener('updateend', done);
+      timeoutId = setTimeout(done, SOURCEBUFFER_WATCHDOG_MS);
     });
   }
 
@@ -6693,6 +7105,82 @@
       });
     }
     return regions;
+  }
+
+  function hlsChapterSessionData(sessionData) {
+    var refs = [];
+    for (var i = 0; i < (sessionData || []).length; i++) {
+      var item = sessionData[i] || {};
+      if (String(item.dataId || '').toLowerCase() !== 'com.apple.hls.chapters') continue;
+      refs.push(item);
+    }
+    return refs;
+  }
+
+  function parseHlsChapterRegions(text, ref) {
+    var parsed = JSON.parse(String(text || '[]'));
+    var chapters = Array.isArray(parsed) ? parsed : (Array.isArray(parsed.chapters) ? parsed.chapters : []);
+    var regions = [];
+    for (var i = 0; i < chapters.length; i++) {
+      var chapter = chapters[i] || {};
+      var start = Number(chapter.startTime != null ? chapter.startTime : (chapter.start != null ? chapter.start : chapter.time));
+      var end = Number(chapter.endTime != null ? chapter.endTime : chapter.end);
+      var chapterDuration = Number(chapter.duration);
+      if (!isFinite(start)) continue;
+      if (!isFinite(end)) end = isFinite(chapterDuration) ? start + chapterDuration : start;
+      regions.push({
+        id: String(chapter.id || chapter.title || ('chapter-' + i)),
+        schemeIdUri: 'com.apple.hls.chapters',
+        value: chapter.title || chapter.name || '',
+        startTime: start,
+        endTime: end,
+        eventElement: chapter.title || chapter.name || '',
+        customAttributes: {
+          language: (ref && ref.language) || chapter.language || '',
+          uri: (ref && ref.uri) || '',
+          image: chapter.image || chapter.uri || ''
+        },
+        source: 'hls-session-data'
+      });
+    }
+    return regions;
+  }
+
+  function parseDashCeaTextTracks(set, repNode, rep) {
+    var nodes = directChildren(set, 'Accessibility').concat(directChildren(repNode, 'Accessibility'));
+    var tracks = [];
+    for (var i = 0; i < nodes.length; i++) {
+      var node = nodes[i];
+      var scheme = String(node.getAttribute('schemeIdUri') || '').toLowerCase();
+      var value = node.getAttribute('value') || node.textContent.trim() || '';
+      var isCea608 = scheme.indexOf('cea-608') !== -1 || /^cc\d/i.test(value);
+      var isCea708 = scheme.indexOf('cea-708') !== -1 || /^service\d/i.test(value);
+      if (!isCea608 && !isCea708) continue;
+      var parts = value ? value.split(/[;,]/) : [isCea608 ? 'CC1' : 'SERVICE1'];
+      for (var p = 0; p < parts.length; p++) {
+        var part = parts[p].trim();
+        if (!part) continue;
+        var split = part.split('=');
+        var instreamId = split[0].trim();
+        var language = (split[1] || rep.language || '').trim();
+        tracks.push({
+          id: 'cea:' + (rep.id || 'rep') + ':' + instreamId,
+          kind: 'text',
+          mimeType: isCea708 ? 'application/cea-708' : 'application/cea-608',
+          language: language,
+          label: language || instreamId,
+          roles: ['caption'],
+          accessibility: [node.getAttribute('schemeIdUri') || value],
+          source: 'native-dash-cea',
+          embedded: true,
+          instreamId: instreamId,
+          supported: false,
+          renderSupported: false,
+          loadState: 'embedded'
+        });
+      }
+    }
+    return tracks;
   }
 
   function hlsProgramDateOrigin(segments) {
@@ -6807,6 +7295,22 @@
     return 0;
   }
 
+  function bufferedContains(ranges, time) {
+    if (!ranges || !isFinite(time)) return false;
+    try {
+      for (var i = 0; i < ranges.length; i++) {
+        if (time >= ranges.start(i) - 0.05 && time <= ranges.end(i) - 0.05) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function segmentBuffered(video, seg) {
+    if (!video || !video.buffered || !seg || !isFinite(seg.start) || !isFinite(seg.end)) return false;
+    var probe = Math.max(seg.start, seg.end - 0.1);
+    return bufferedContains(video.buffered, probe);
+  }
+
   function playableRangeAround(video) {
     var buf = video.buffered;
     var ct = video.currentTime || 0;
@@ -6862,6 +7366,19 @@
     return seg.appended || seg.state === 'fetching' || seg.state === 'fetched' || seg.state === 'appending' || seg.state === 'appended';
   }
 
+  function segmentsAppendedThroughEnd(segments, duration) {
+    if (!segments || !segments.length) return false;
+    var expectedEnd = isFinite(duration) && duration > 0 ? duration : segments[segments.length - 1].end;
+    var appendedEnd = 0;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (seg.end < 0.05) continue;
+      if (!seg.appended && seg.state !== 'appended') return false;
+      appendedEnd = Math.max(appendedEnd, seg.end || 0);
+    }
+    return appendedEnd >= expectedEnd - 0.25;
+  }
+
   function segmentPriority(seg, currentTime, readyGoal) {
     if (currentTime >= seg.start - 0.05 && currentTime < seg.end + 0.05) return 0;
     if (seg.start < currentTime + readyGoal) return 1;
@@ -6882,10 +7399,23 @@
   }
 
   function hasEarlierFetchedOrFetching(rep, seg, currentTime) {
+    var now = performance.now();
     for (var i = 0; i < rep.segments.length; i++) {
       var other = rep.segments[i];
       if (other === seg || other.state === 'expired' || other.end <= currentTime - 0.5 || other.start >= seg.start) continue;
-      if (other.state === 'fetching' || other.state === 'fetched' || other.state === 'appending') return true;
+      if (other.state === 'fetching' || other.state === 'appending') {
+        var startedAt = other.state === 'fetching' ? other._fetchStartedAt : other._appendStartedAt;
+        if (startedAt && now - startedAt > SEGMENT_BUSY_WATCHDOG_MS) {
+          other.state = 'pending';
+          other.appended = false;
+          delete other._data;
+          delete other._fetchStartedAt;
+          delete other._appendStartedAt;
+          continue;
+        }
+        return true;
+      }
+      if (other.state === 'fetched') return true;
     }
     return false;
   }
@@ -7003,8 +7533,28 @@
     return freshSegments.map(function (seg) {
       var old = oldByKey[segmentKey(seg)];
       if (old) {
+        if (old.state === 'fetching' || old.state === 'fetched' || old.state === 'appending') {
+          old.start = seg.start;
+          old.end = seg.end;
+          old.duration = seg.duration;
+          old.mediaSequence = seg.mediaSequence;
+          old.discontinuity = seg.discontinuity;
+          old.discontinuitySequence = seg.discontinuitySequence;
+          old.url = seg.url;
+          old.range = seg.range;
+          old.parts = seg.parts || old.parts;
+          old.key = seg.key || old.key;
+          if (isFinite(seg.programDateTimeMs)) old.programDateTimeMs = seg.programDateTimeMs;
+          mergeHlsPartState(old, seg);
+          return old;
+        }
         seg.appended = old.appended;
-        seg.state = old.state === 'failed' || old.state === 'recovering' || old.state === 'fetching' ? '' : old.state;
+        if (old.state === 'fetched' && old._data) {
+          seg.state = old.state;
+          seg._data = old._data;
+        } else {
+          seg.state = old.state === 'failed' || old.state === 'recovering' || old.state === 'fetching' || old.state === 'fetched' ? '' : old.state;
+        }
         mergeHlsPartState(old, seg);
       }
       return seg;
@@ -7110,8 +7660,623 @@
     }
   }
 
+  function createTsTransmuxerAdapter(contentType, codecs) {
+    var factory = window.__nativeTsTransmuxerFactory;
+    if (typeof factory === 'function') {
+      return Promise.resolve(factory({
+        codecs: codecs,
+        contentType: contentType,
+        mimeType: 'video/mp2t; codecs="' + codecs + '"'
+      })).then(function (adapter) {
+        return normalizeTsTransmuxerAdapter(adapter);
+      });
+    }
+    if (window.__enableFirstPartyTsTransmuxer) return Promise.resolve(new FirstPartyTsTransmuxerAdapter(contentType, codecs));
+    if (firstPartyTsTransmuxerSupported(contentType, codecs)) return Promise.resolve(new FirstPartyTsTransmuxerAdapter(contentType, codecs));
+    return Promise.reject(new Error('hls-first-party-ts-transmuxer-unavailable'));
+  }
+
+  function firstPartyTsTransmuxerSupported(contentType, codecs) {
+    var normalized = String(codecs || '').toLowerCase();
+    if (contentType === 'audio') return /^mp4a(\.|$)/.test(normalized);
+    return /^(avc1|avc3)(\.|$)/.test(normalized);
+  }
+
+  function normalizeTsTransmuxerAdapter(adapter) {
+    if (!adapter || typeof adapter.transmux !== 'function') throw new Error('hls-first-party-ts-transmuxer-invalid');
+    if (!adapter.provider) adapter.provider = 'first-party-ts';
+    return adapter;
+  }
+
+  function FirstPartyTsTransmuxerAdapter(contentType, codecs) {
+    this.provider = 'first-party-ts';
+    this.contentType = contentType;
+    this.codecs = codecs;
+    this.lastDemux = null;
+    this.sequenceNumber = 1;
+  }
+
+  FirstPartyTsTransmuxerAdapter.prototype.transmux = function (data, context) {
+    this.lastDemux = demuxMpegTs(data);
+    if (this.contentType === 'video') {
+      return Promise.resolve(remuxH264ToFragmentedMp4(this.lastDemux, {
+        codecs: this.codecs,
+        height: context && context.activeVariant ? context.activeVariant.height : 0,
+        sequenceNumber: this.sequenceNumber++,
+        width: context && context.activeVariant ? context.activeVariant.width : 0
+      }));
+    }
+    if (this.contentType === 'audio') {
+      return Promise.resolve(remuxAacToFragmentedMp4(this.lastDemux, {
+        codecs: this.codecs,
+        sequenceNumber: this.sequenceNumber++
+      }));
+    }
+    return Promise.reject(new Error('hls-first-party-ts-remuxer-unavailable'));
+  };
+
+  function normalizeTransmuxOutput(output) {
+    if (output && output.data) return output;
+    return { data: output, init: null };
+  }
+
+  function remuxH264ToFragmentedMp4(demux, options) {
+    var track = firstTrackOfType(demux, 'video');
+    if (!track || !track.pes.length) throw new Error('hls-first-party-ts-no-video');
+    var samples = h264SamplesFromPes(track.pes);
+    if (!samples.length) throw new Error('hls-first-party-ts-no-video-samples');
+    var sps = null;
+    var pps = null;
+    for (var i = 0; i < samples.length; i++) {
+      for (var j = 0; j < samples[i].nalUnits.length; j++) {
+        var nal = samples[i].nalUnits[j];
+        if (nal.type === 7 && !sps) sps = nal.data;
+        if (nal.type === 8 && !pps) pps = nal.data;
+      }
+    }
+    if (!sps || !pps) throw new Error('hls-first-party-ts-missing-avc-config');
+    var width = options.width || 0;
+    var height = options.height || 0;
+    var timescale = 90000;
+    var init = concatUint8Arrays([
+      mp4Box('ftyp', mp4String('iso6'), mp4Uint32(1), mp4String('iso6'), mp4String('mp41')),
+      mp4Moov({
+        duration: 0,
+        height: height,
+        id: 1,
+        pps: pps,
+        sps: sps,
+        timescale: timescale,
+        width: width
+      })
+    ]);
+    return {
+      init: init.buffer,
+      data: mp4VideoFragment({
+        baseDecodeTime: 0,
+        samples: samples,
+        sequenceNumber: options.sequenceNumber || 1,
+        timescale: timescale,
+        trackId: 1
+      }).buffer
+    };
+  }
+
+  function firstTrackOfType(demux, type) {
+    var tracks = demux && demux.tracks ? demux.tracks : [];
+    for (var i = 0; i < tracks.length; i++) {
+      if (tracks[i].type === type) return tracks[i];
+    }
+    return null;
+  }
+
+  function h264SamplesFromPes(pesList) {
+    var samples = [];
+    for (var i = 0; i < pesList.length; i++) {
+      var pes = pesList[i];
+      var units = h264NalUnits(pes.data).filter(function (nal) { return nal.type !== 9; });
+      if (!units.length) continue;
+      var dataParts = [];
+      var size = 0;
+      var keyframe = false;
+      for (var j = 0; j < units.length; j++) {
+        var unit = units[j].data;
+        dataParts.push(mp4Uint32(unit.length), unit);
+        size += 4 + unit.length;
+        if (units[j].type === 5) keyframe = true;
+      }
+      samples.push({
+        data: concatUint8Arrays(dataParts),
+        dts: pes.dts === null ? pes.pts : pes.dts,
+        duration: 0,
+        keyframe: keyframe,
+        nalUnits: units,
+        pts: pes.pts,
+        size: size
+      });
+    }
+    for (var k = 0; k < samples.length; k++) {
+      if (k + 1 < samples.length && samples[k].dts !== null && samples[k + 1].dts !== null) samples[k].duration = Math.max(1, Math.round((samples[k + 1].dts - samples[k].dts) * 90000));
+      else samples[k].duration = k > 0 ? samples[k - 1].duration : 90000;
+    }
+    return samples;
+  }
+
+  function remuxAacToFragmentedMp4(demux, options) {
+    var track = firstTrackOfType(demux, 'audio');
+    if (!track || !track.pes.length) throw new Error('hls-first-party-ts-no-audio');
+    var samples = aacSamplesFromPes(track.pes);
+    if (!samples.length) throw new Error('hls-first-party-ts-no-audio-samples');
+    var config = samples[0].config;
+    var init = concatUint8Arrays([
+      mp4Box('ftyp', mp4String('iso6'), mp4Uint32(1), mp4String('iso6'), mp4String('mp41')),
+      mp4Moov({
+        channelCount: config.channelConfig || 2,
+        codecs: options.codecs || 'mp4a.40.2',
+        duration: 0,
+        id: 1,
+        sampleRate: config.sampleRate || 44100,
+        sampleRateIndex: config.sampleRateIndex,
+        timescale: config.sampleRate || 44100,
+        type: 'audio'
+      })
+    ]);
+    return {
+      init: init.buffer,
+      data: mp4AudioFragment({
+        baseDecodeTime: 0,
+        samples: samples,
+        sequenceNumber: options.sequenceNumber || 1,
+        timescale: config.sampleRate || 44100,
+        trackId: 1
+      }).buffer
+    };
+  }
+
+  function aacSamplesFromPes(pesList) {
+    var samples = [];
+    for (var i = 0; i < pesList.length; i++) {
+      var pes = pesList[i];
+      var frames = pes.adtsFrames || parseAdtsFrames(pes.data);
+      if (!frames.length) continue;
+      for (var j = 0; j < frames.length; j++) {
+        var frame = frames[j];
+        var payload = pes.data.subarray(frame.payloadOffset, frame.offset + frame.length);
+        samples.push({
+          config: frame,
+          data: payload,
+          dts: pes.dts === null ? pes.pts : pes.dts,
+          duration: 1024,
+          keyframe: true,
+          pts: pes.pts,
+          size: payload.length
+        });
+      }
+    }
+    return samples;
+  }
+
+  function mp4VideoFragment(info) {
+    var mdatPayload = concatUint8Arrays(info.samples.map(function (sample) { return sample.data; }));
+    var moof = mp4Moof(info, 0);
+    moof = mp4Moof(info, moof.length + 8);
+    return concatUint8Arrays([moof, mp4Box('mdat', mdatPayload)]);
+  }
+
+  function mp4AudioFragment(info) {
+    var mdatPayload = concatUint8Arrays(info.samples.map(function (sample) { return sample.data; }));
+    var moof = mp4Moof(info, 0);
+    moof = mp4Moof(info, moof.length + 8);
+    return concatUint8Arrays([moof, mp4Box('mdat', mdatPayload)]);
+  }
+
+  function mp4Moof(info, dataOffset) {
+    return mp4Box('moof',
+      mp4FullBox('mfhd', 0, 0, mp4Uint32(info.sequenceNumber)),
+      mp4Box('traf',
+        mp4FullBox('tfhd', 0, 0x020000, mp4Uint32(info.trackId)),
+        mp4FullBox('tfdt', 1, 0, mp4Uint64(info.baseDecodeTime)),
+        mp4Trun(info.samples, dataOffset)
+      )
+    );
+  }
+
+  function mp4Trun(samples, dataOffset) {
+    var parts = [mp4Uint32(samples.length), mp4Uint32(dataOffset)];
+    for (var i = 0; i < samples.length; i++) {
+      var sample = samples[i];
+      parts.push(
+        mp4Uint32(sample.duration || 90000),
+        mp4Uint32(sample.size),
+        mp4Uint32(sample.keyframe ? 0x02000000 : 0x01010000)
+      );
+    }
+    return mp4FullBox.apply(null, ['trun', 0, 0x000701].concat(parts));
+  }
+
+  function mp4Moov(track) {
+    return mp4Box('moov',
+      mp4Mvhd(track.timescale, track.duration),
+      mp4Trak(track),
+      mp4Box('mvex', mp4FullBox('trex', 0, 0, mp4Uint32(track.id), mp4Uint32(1), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0)))
+    );
+  }
+
+  function mp4Mvhd(timescale, duration) {
+    return mp4FullBox('mvhd', 0, 0,
+      mp4Uint32(0), mp4Uint32(0), mp4Uint32(timescale), mp4Uint32(duration),
+      mp4Uint32(0x00010000), mp4Uint16(0x0100), mp4Uint16(0), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint32(0x00010000), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint32(0x00010000), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint32(0x40000000), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint32(0), mp4Uint32(0), mp4Uint32(0), mp4Uint32(2)
+    );
+  }
+
+  function mp4Trak(track) {
+    var isAudio = track.type === 'audio';
+    return mp4Box('trak',
+      mp4Tkhd(track),
+      mp4Box('mdia',
+        mp4FullBox('mdhd', 0, 0, mp4Uint32(0), mp4Uint32(0), mp4Uint32(track.timescale), mp4Uint32(track.duration), mp4Uint16(0x55c4), mp4Uint16(0)),
+        mp4FullBox('hdlr', 0, 0, mp4Uint32(0), mp4String(isAudio ? 'soun' : 'vide'), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0), mp4String(isAudio ? 'SoundHandler' : 'VideoHandler'), new Uint8Array([0])),
+        mp4Box('minf',
+          isAudio ? mp4FullBox('smhd', 0, 0, mp4Uint16(0), mp4Uint16(0)) : mp4FullBox('vmhd', 0, 1, mp4Uint16(0), mp4Uint16(0), mp4Uint16(0), mp4Uint16(0)),
+          mp4Dinf(),
+          mp4Stbl(track)
+        )
+      )
+    );
+  }
+
+  function mp4Tkhd(track) {
+    return mp4FullBox('tkhd', 0, 0x000007,
+      mp4Uint32(0), mp4Uint32(0), mp4Uint32(track.id), mp4Uint32(0), mp4Uint32(track.duration),
+      mp4Uint32(0), mp4Uint32(0), mp4Uint16(0), mp4Uint16(0), mp4Uint16(0), mp4Uint16(0),
+      mp4Uint32(0x00010000), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint32(0x00010000), mp4Uint32(0), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint32(0x40000000), mp4Uint32((track.width || 0) << 16), mp4Uint32((track.height || 0) << 16)
+    );
+  }
+
+  function mp4Dinf() {
+    return mp4Box('dinf', mp4FullBox('dref', 0, 0, mp4Uint32(1), mp4FullBox('url ', 0, 1)));
+  }
+
+  function mp4Stbl(track) {
+    return mp4Box('stbl',
+      mp4Box('stsd', mp4Uint32(0), mp4Uint32(1), track.type === 'audio' ? mp4Mp4a(track) : mp4Avc1(track)),
+      mp4FullBox('stts', 0, 0, mp4Uint32(0)),
+      mp4FullBox('stsc', 0, 0, mp4Uint32(0)),
+      mp4FullBox('stsz', 0, 0, mp4Uint32(0), mp4Uint32(0)),
+      mp4FullBox('stco', 0, 0, mp4Uint32(0))
+    );
+  }
+
+  function mp4Avc1(track) {
+    var sampleEntryHeader = concatUint8Arrays([
+      new Uint8Array(6), mp4Uint16(1), new Uint8Array(16), mp4Uint16(track.width || 0), mp4Uint16(track.height || 0),
+      mp4Uint32(0x00480000), mp4Uint32(0x00480000), mp4Uint32(0), mp4Uint16(1), new Uint8Array(32),
+      mp4Uint16(0x0018), mp4Uint16(0xffff)
+    ]);
+    return mp4Box('avc1', sampleEntryHeader, mp4AvcC(track.sps, track.pps), mp4Box('btrt', mp4Uint32(0), mp4Uint32(0), mp4Uint32(0)));
+  }
+
+  function mp4AvcC(sps, pps) {
+    return mp4Box('avcC', new Uint8Array([
+      1, sps[1] || 0x42, sps[2] || 0, sps[3] || 0x1f, 0xff, 0xe1,
+      (sps.length >> 8) & 0xff, sps.length & 0xff
+    ]), sps, new Uint8Array([1, (pps.length >> 8) & 0xff, pps.length & 0xff]), pps);
+  }
+
+  function mp4Mp4a(track) {
+    var sampleEntryHeader = concatUint8Arrays([
+      new Uint8Array(6), mp4Uint16(1), mp4Uint32(0), mp4Uint32(0),
+      mp4Uint16(track.channelCount || 2), mp4Uint16(16), mp4Uint16(0), mp4Uint16(0),
+      mp4Uint32((track.sampleRate || 44100) << 16)
+    ]);
+    return mp4Box('mp4a', sampleEntryHeader, mp4Esds(track));
+  }
+
+  function mp4Esds(track) {
+    var asc = audioSpecificConfig(track);
+    return mp4FullBox('esds', 0, 0, new Uint8Array([
+      0x03, 25, 0x00, 0x01, 0x00,
+      0x04, 17, 0x40, 0x15, 0x00, 0x00, 0x00,
+      0x00, 0x01, 0xf4, 0x00,
+      0x00, 0x01, 0xf4, 0x00,
+      0x05, 2, asc[0], asc[1],
+      0x06, 1, 2
+    ]));
+  }
+
+  function audioSpecificConfig(track) {
+    var objectType = audioObjectTypeFromCodecs(track.codecs) || 2;
+    var sampleRateIndex = track.sampleRateIndex == null ? 4 : track.sampleRateIndex;
+    var channelConfig = track.channelCount || 2;
+    return new Uint8Array([
+      ((objectType & 0x1f) << 3) | ((sampleRateIndex >> 1) & 0x07),
+      ((sampleRateIndex & 0x01) << 7) | ((channelConfig & 0x0f) << 3)
+    ]);
+  }
+
+  function audioObjectTypeFromCodecs(codecs) {
+    var match = /mp4a\.40\.(\d+)/i.exec(codecs || '');
+    return match ? Number(match[1]) : 0;
+  }
+
+  function mp4Box(type) {
+    var payloads = Array.prototype.slice.call(arguments, 1).map(toUint8Array);
+    var size = 8;
+    for (var i = 0; i < payloads.length; i++) size += payloads[i].length;
+    return concatUint8Arrays([mp4Uint32(size), mp4String(type)].concat(payloads));
+  }
+
+  function mp4FullBox(type, version, flags) {
+    var header = new Uint8Array([version & 0xff, (flags >> 16) & 0xff, (flags >> 8) & 0xff, flags & 0xff]);
+    return mp4Box.apply(null, [type, header].concat(Array.prototype.slice.call(arguments, 3)));
+  }
+
+  function mp4String(value) {
+    var out = new Uint8Array(value.length);
+    for (var i = 0; i < value.length; i++) out[i] = value.charCodeAt(i) & 0xff;
+    return out;
+  }
+
+  function mp4Uint16(value) {
+    var out = new Uint8Array(2);
+    out[0] = (value >> 8) & 0xff;
+    out[1] = value & 0xff;
+    return out;
+  }
+
+  function mp4Uint32(value) {
+    var out = new Uint8Array(4);
+    value = value >>> 0;
+    out[0] = (value >>> 24) & 0xff;
+    out[1] = (value >>> 16) & 0xff;
+    out[2] = (value >>> 8) & 0xff;
+    out[3] = value & 0xff;
+    return out;
+  }
+
+  function mp4Uint64(value) {
+    var high = Math.floor(value / 4294967296);
+    var low = value >>> 0;
+    return concatUint8Arrays([mp4Uint32(high), mp4Uint32(low)]);
+  }
+
+  function demuxMpegTs(data) {
+    var bytes = toUint8Array(data);
+    var state = {
+      pmtPid: -1,
+      streams: {},
+      pesByPid: {},
+      tracks: {},
+      packetCount: 0,
+      invalidSyncCount: 0
+    };
+    for (var offset = 0; offset + 188 <= bytes.length; offset += 188) {
+      if (bytes[offset] !== 0x47) {
+        state.invalidSyncCount++;
+        continue;
+      }
+      state.packetCount++;
+      parseTsPacket(bytes, offset, state);
+    }
+    for (var pid in state.pesByPid) flushPes(pid, state);
+    var tracks = [];
+    for (var trackPid in state.tracks) tracks.push(state.tracks[trackPid]);
+    tracks.sort(function (a, b) { return a.pid - b.pid; });
+    return {
+      packetCount: state.packetCount,
+      invalidSyncCount: state.invalidSyncCount,
+      pmtPid: state.pmtPid,
+      tracks: tracks
+    };
+  }
+
+  function parseTsPacket(bytes, offset, state) {
+    var payloadUnitStart = !!(bytes[offset + 1] & 0x40);
+    var pid = ((bytes[offset + 1] & 0x1f) << 8) | bytes[offset + 2];
+    var adaptationFieldControl = (bytes[offset + 3] >> 4) & 0x03;
+    var payloadOffset = offset + 4;
+    if (adaptationFieldControl === 0 || adaptationFieldControl === 2) return;
+    if (adaptationFieldControl === 3) payloadOffset += 1 + (bytes[payloadOffset] || 0);
+    if (payloadOffset >= offset + 188) return;
+    if (pid === 0) {
+      parsePat(bytes, payloadOffset, offset + 188, payloadUnitStart, state);
+      return;
+    }
+    if (pid === state.pmtPid) {
+      parsePmt(bytes, payloadOffset, offset + 188, payloadUnitStart, state);
+      return;
+    }
+    if (!state.streams[pid]) return;
+    if (payloadUnitStart) flushPes(pid, state);
+    var payload = bytes.subarray(payloadOffset, offset + 188);
+    if (!state.pesByPid[pid]) state.pesByPid[pid] = [];
+    state.pesByPid[pid].push(payload);
+  }
+
+  function parsePat(bytes, start, end, payloadUnitStart, state) {
+    if (payloadUnitStart) start += (bytes[start] || 0) + 1;
+    if (start + 12 > end || bytes[start] !== 0x00) return;
+    var sectionLength = ((bytes[start + 1] & 0x0f) << 8) | bytes[start + 2];
+    var sectionEnd = Math.min(end, start + 3 + sectionLength - 4);
+    for (var pos = start + 8; pos + 4 <= sectionEnd; pos += 4) {
+      var programNumber = (bytes[pos] << 8) | bytes[pos + 1];
+      if (programNumber) state.pmtPid = ((bytes[pos + 2] & 0x1f) << 8) | bytes[pos + 3];
+    }
+  }
+
+  function parsePmt(bytes, start, end, payloadUnitStart, state) {
+    if (payloadUnitStart) start += (bytes[start] || 0) + 1;
+    if (start + 12 > end || bytes[start] !== 0x02) return;
+    var sectionLength = ((bytes[start + 1] & 0x0f) << 8) | bytes[start + 2];
+    var sectionEnd = Math.min(end, start + 3 + sectionLength - 4);
+    var programInfoLength = ((bytes[start + 10] & 0x0f) << 8) | bytes[start + 11];
+    for (var pos = start + 12 + programInfoLength; pos + 5 <= sectionEnd;) {
+      var streamType = bytes[pos];
+      var pid = ((bytes[pos + 1] & 0x1f) << 8) | bytes[pos + 2];
+      var esInfoLength = ((bytes[pos + 3] & 0x0f) << 8) | bytes[pos + 4];
+      if (streamType === 0x1b) state.streams[pid] = { pid: pid, streamType: streamType, type: 'video' };
+      else if (streamType === 0x0f) state.streams[pid] = { pid: pid, streamType: streamType, type: 'audio' };
+      pos += 5 + esInfoLength;
+    }
+  }
+
+  function flushPes(pid, state) {
+    var chunks = state.pesByPid[pid];
+    if (!chunks || !chunks.length) return;
+    delete state.pesByPid[pid];
+    var stream = state.streams[pid];
+    if (!stream) return;
+    var data = concatUint8Arrays(chunks);
+    var pes = parsePes(data);
+    if (!pes) return;
+    var track = state.tracks[pid];
+    if (!track) {
+      track = state.tracks[pid] = {
+        pid: Number(pid),
+        streamType: stream.streamType,
+        type: stream.type,
+        pes: [],
+        nalTypes: [],
+        adtsFrames: 0
+      };
+    }
+    if (stream.type === 'video') {
+      pes.nalTypes = h264NalTypes(pes.data);
+      mergeUniqueInPlace(track.nalTypes, pes.nalTypes);
+    } else if (stream.type === 'audio') {
+      pes.adtsFrames = parseAdtsFrames(pes.data);
+      track.adtsFrames += pes.adtsFrames.length;
+    }
+    track.pes.push(pes);
+  }
+
+  function parsePes(data) {
+    if (data.length < 9 || data[0] !== 0 || data[1] !== 0 || data[2] !== 1) return null;
+    var flags = data[7] || 0;
+    var headerLength = data[8] || 0;
+    var payloadOffset = 9 + headerLength;
+    var pts = null;
+    var dts = null;
+    if ((flags & 0x80) && data.length >= 14) pts = parsePts(data, 9);
+    if ((flags & 0x40) && data.length >= 19) dts = parsePts(data, 14);
+    return {
+      streamId: data[3],
+      pts: pts,
+      dts: dts === null ? pts : dts,
+      data: data.subarray(payloadOffset),
+      dataLength: Math.max(0, data.length - payloadOffset)
+    };
+  }
+
+  function parsePts(data, offset) {
+    return (((data[offset] & 0x0e) * 536870912)
+      + (data[offset + 1] * 4194304)
+      + ((data[offset + 2] & 0xfe) * 16384)
+      + (data[offset + 3] * 128)
+      + ((data[offset + 4] & 0xfe) / 2)) / 90000;
+  }
+
+  function h264NalTypes(data) {
+    var types = [];
+    var units = h264NalUnits(data);
+    for (var i = 0; i < units.length; i++) types.push(units[i].type);
+    return types;
+  }
+
+  function h264NalUnits(data) {
+    var units = [];
+    var starts = h264StartCodes(data);
+    for (var i = 0; i < starts.length; i++) {
+      var start = starts[i].offset + starts[i].length;
+      var end = i + 1 < starts.length ? starts[i + 1].offset : data.length;
+      while (end > start && data[end - 1] === 0) end--;
+      if (start < end) {
+        units.push({
+          data: data.subarray(start, end),
+          type: data[start] & 0x1f
+        });
+      }
+    }
+    return units;
+  }
+
+  function h264StartCodes(data) {
+    var starts = [];
+    for (var i = 0; i + 3 < data.length; i++) {
+      if (data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 1) {
+        starts.push({ offset: i, length: 3 });
+        i += 2;
+      } else if (i + 4 < data.length && data[i] === 0 && data[i + 1] === 0 && data[i + 2] === 0 && data[i + 3] === 1) {
+        starts.push({ offset: i, length: 4 });
+        i += 3;
+      }
+    }
+    return starts;
+  }
+
+  function parseAdtsFrames(data) {
+    var frames = [];
+    var sampleRates = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
+    for (var i = 0; i + 7 <= data.length;) {
+      if (data[i] !== 0xff || (data[i + 1] & 0xf0) !== 0xf0) {
+        i++;
+        continue;
+      }
+      var protectionAbsent = data[i + 1] & 1;
+      var profile = ((data[i + 2] >> 6) & 0x03) + 1;
+      var sampleRateIndex = (data[i + 2] >> 2) & 0x0f;
+      var channelConfig = ((data[i + 2] & 1) << 2) | ((data[i + 3] >> 6) & 0x03);
+      var frameLength = ((data[i + 3] & 0x03) << 11) | (data[i + 4] << 3) | ((data[i + 5] >> 5) & 0x07);
+      if (frameLength < (protectionAbsent ? 7 : 9) || i + frameLength > data.length) break;
+      var headerLength = protectionAbsent ? 7 : 9;
+      frames.push({
+        offset: i,
+        length: frameLength,
+        headerLength: headerLength,
+        payloadOffset: i + headerLength,
+        profile: profile,
+        sampleRate: sampleRates[sampleRateIndex] || 44100,
+        sampleRateIndex: sampleRateIndex,
+        channelConfig: channelConfig
+      });
+      i += frameLength;
+    }
+    return frames;
+  }
+
+  function toUint8Array(data) {
+    if (data instanceof Uint8Array) return data;
+    return new Uint8Array(data || 0);
+  }
+
+  function concatUint8Arrays(chunks) {
+    var length = 0;
+    for (var i = 0; i < chunks.length; i++) length += chunks[i].length;
+    var out = new Uint8Array(length);
+    var offset = 0;
+    for (var j = 0; j < chunks.length; j++) {
+      out.set(chunks[j], offset);
+      offset += chunks[j].length;
+    }
+    return out;
+  }
+
+  function mergeUniqueInPlace(target, source) {
+    for (var i = 0; i < source.length; i++) {
+      if (target.indexOf(source[i]) === -1) target.push(source[i]);
+    }
+  }
+
   function chooseIFrameTrack(provider, trackId) {
-    var tracks = provider && provider.iframeVariants ? provider.iframeVariants : [];
+    var tracks = [];
+    if (provider && provider.iframeVariants) tracks = tracks.concat(provider.iframeVariants);
+    if (provider && provider.imageVariants) tracks = tracks.concat(provider.imageVariants);
     if (!tracks.length) return null;
     if (trackId) {
       var explicit = tracks.find(function (track) { return track.id === trackId; });
@@ -7175,6 +8340,83 @@
     return (seg.url || String(seg.start)) + range + hlsSeq + hlsPart;
   }
 
+  function hlsFmp4TimestampOffset(provider, track, seg) {
+    if (!provider || !provider.live || provider.isTsPlaylist || !track || track.isTsPlaylist || !seg) return NaN;
+    return hlsLiveTimestampOffset(provider, track, seg);
+  }
+
+  function hlsLiveTimestampOffset(provider, track, seg) {
+    if (!provider || !provider.live || !track || !seg) return NaN;
+    if (!isFinite(seg.start) || seg.start < 0) return NaN;
+    return seg.start;
+  }
+
+  function hlsAppendSegmentWithWatchdog(provider, track, seg, data) {
+    var append = provider._appendSegmentData(track, seg, data);
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var timeoutId = setTimeout(function () {
+        if (done) return;
+        done = true;
+        if (segmentBuffered(provider.video, seg)) {
+          resolve();
+        } else {
+          reject(new Error('hls-append-timeout'));
+        }
+      }, SOURCEBUFFER_WATCHDOG_MS * 2);
+      append.then(function (value) {
+        if (done) return;
+        done = true;
+        clearTimeout(timeoutId);
+        resolve(value);
+      }).catch(function (err) {
+        if (done) return;
+        done = true;
+        clearTimeout(timeoutId);
+        reject(err);
+      });
+    });
+  }
+
+  function recoverStuckSourceBuffer(provider, track) {
+    if (!track || !track.sb || !track.sb.updating) {
+      if (track) track._sourceBufferUpdatingSince = 0;
+      return true;
+    }
+    var now = performance.now();
+    track._sourceBufferUpdatingSince = track._sourceBufferUpdatingSince || now;
+    if (now - track._sourceBufferUpdatingSince < SOURCEBUFFER_WATCHDOG_MS) return false;
+    try {
+      if (track.sb.abort) track.sb.abort();
+      if (provider) {
+        provider.sourceBufferAbortCount = (provider.sourceBufferAbortCount || 0) + 1;
+        provider.lastError = 'sourcebuffer-abort';
+      }
+    } catch (e) {}
+    track._sourceBufferUpdatingSince = 0;
+    return !track.sb.updating;
+  }
+
+  function hlsSeekTargetInsideSegment(provider, target) {
+    var segments = provider && provider.segments ? provider.segments : [];
+    if (!segments.length || !isFinite(target)) return target;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (!isFinite(seg.start) || !isFinite(seg.end) || seg.end <= seg.start) continue;
+      if (target >= seg.start - 0.05 && target < seg.end - 0.1) {
+        return clamp(target, seg.start + 0.05, seg.end - 0.1);
+      }
+      if (Math.abs(target - seg.end) <= 0.1) {
+        var next = segments[i + 1];
+        if (next && isFinite(next.start) && isFinite(next.end) && next.end > next.start) {
+          return clamp(next.start + 0.05, next.start + 0.05, next.end - 0.1);
+        }
+        return clamp(target, seg.start + 0.05, seg.end - 0.1);
+      }
+    }
+    return target;
+  }
+
   function clamp(value, min, max) {
     return Math.max(min, Math.min(max, value));
   }
@@ -7209,7 +8451,7 @@
   }
 
   function isRefreshableRequestError(err) {
-    return !!(err && /range-http-(403|404|410|416|5\d\d)|Failed to fetch|Load failed|network/i.test(err.message || ''));
+    return !!(err && /(range|manifest)-http-(403|404|410|416|5\d\d)|Failed to fetch|Load failed|network/i.test(err.message || ''));
   }
 
   function mime(rep) {
@@ -7396,6 +8638,8 @@
       accessibility: rep.accessibility || [],
       kind: rep.roles && rep.roles.length ? rep.roles[0] : 'subtitles',
       url: rep.url || '',
+      embedded: !!rep.embedded,
+      instreamId: rep.instreamId || '',
       supported: rep.supported !== false,
       renderSupported: rep.renderSupported !== false && isRenderableTextMime(rep.mimeType || ''),
       error: rep.error || '',
@@ -7443,12 +8687,26 @@
 
   function stampToken(uri, token) {
     if (!token || uri.indexOf('/api/stream/') === -1) return uri;
-    var base = uri.replace(/[?&]token=[^&]*/, '');
-    return base + (base.indexOf('?') === -1 ? '?' : '&') + 'token=' + token;
+    var hashIndex = uri.indexOf('#');
+    var hash = hashIndex === -1 ? '' : uri.slice(hashIndex);
+    var withoutHash = hashIndex === -1 ? uri : uri.slice(0, hashIndex);
+    var queryIndex = withoutHash.indexOf('?');
+    if (queryIndex === -1) return withoutHash + '?token=' + encodeURIComponent(token) + hash;
+    var path = withoutHash.slice(0, queryIndex);
+    var query = withoutHash.slice(queryIndex + 1);
+    var parts = query.split('&').filter(function (part) {
+      return part && part.split('=')[0] !== 'token';
+    });
+    parts.push('token=' + encodeURIComponent(token));
+    return path + '?' + parts.join('&') + hash;
   }
 
   function isLikelyNativeUrl(url) {
     return /\.(m3u8|mp4|m4v|webm)(\?|$)/i.test(url);
+  }
+
+  function shouldUseFirstPartyHls(url) {
+    return !!(window.MediaSource && url && url.indexOf('/api/stream/') !== -1 && /\.m3u8(\?|$)/i.test(url));
   }
 
   function isHlsMimeType(mimeType) {
@@ -7488,11 +8746,23 @@
   }
 
   window.PlayerEngine = PlayerEngine;
+  window.NativeUrlProviderForTest = {
+    load: NativeUrlProvider.prototype.load,
+    getStats: NativeUrlProvider.prototype.getStats,
+    _onRuntimeError: NativeUrlProvider.prototype._onRuntimeError,
+    isLive: NativeUrlProvider.prototype.isLive,
+    getBufferedInfo: NativeUrlProvider.prototype.getBufferedInfo,
+    getVariantTracks: NativeUrlProvider.prototype.getVariantTracks,
+    getActiveVariantTrack: NativeUrlProvider.prototype.getActiveVariantTrack,
+    getAudioTracks: NativeUrlProvider.prototype.getAudioTracks,
+    getActiveAudioTrack: NativeUrlProvider.prototype.getActiveAudioTrack
+  };
   window.NativeDashProviderForTest = {
     _candidateVideos: NativeDashProvider.prototype._candidateVideos,
     _chooseForBudget: NativeDashProvider.prototype._chooseForBudget,
     _appendSegmentData: NativeDashProvider.prototype._appendSegmentData,
     _handleAppendFailure: NativeDashProvider.prototype._handleAppendFailure,
+    _completeNativeRuntimeTerminal: NativeDashProvider.prototype._completeNativeRuntimeTerminal,
     _tryNativeRecovery: NativeDashProvider.prototype._tryNativeRecovery,
     _prepareSegmentGeneration: NativeDashProvider.prototype._prepareSegmentGeneration,
     _rebuildSourceBufferForPeriod: NativeDashProvider.prototype._rebuildSourceBufferForPeriod,
@@ -7522,6 +8792,7 @@
     _isCapabilityAllowed: NativeDashProvider.prototype._isCapabilityAllowed,
     _ensureDrmReady: NativeDashProvider.prototype._ensureDrmReady,
     _onEncrypted: NativeDashProvider.prototype._onEncrypted,
+    _completeDrmTerminalError: NativeDashProvider.prototype._completeDrmTerminalError,
     _handleDrmMessage: NativeDashProvider.prototype._handleDrmMessage,
     _jumpSmallGap: NativeDashProvider.prototype._jumpSmallGap,
     _refreshManifest: NativeDashProvider.prototype._refreshManifest,
@@ -7534,6 +8805,7 @@
     _recordRangeRecovery: NativeDashProvider.prototype._recordRangeRecovery,
     _recordRangeError: NativeDashProvider.prototype._recordRangeError,
     _fetchRange: NativeDashProvider.prototype._fetchRange,
+    _prepareRep: NativeDashProvider.prototype._prepareRep,
     _viewportMaxHeight: NativeDashProvider.prototype._viewportMaxHeight,
     chooseVideoRep: NativeDashProvider.prototype.chooseVideoRep,
     getAudioTracks: NativeDashProvider.prototype.getAudioTracks,
@@ -7544,6 +8816,8 @@
     setTextTrackVisibility: NativeDashProvider.prototype.setTextTrackVisibility,
     getVariantTracks: NativeDashProvider.prototype.getVariantTracks,
     getActiveVariantTrack: NativeDashProvider.prototype.getActiveVariantTrack,
+    getIFrameTracks: NativeDashProvider.prototype.getIFrameTracks,
+    getIFramePreview: NativeDashProvider.prototype.getIFramePreview,
     getLiveRange: NativeDashProvider.prototype.getLiveRange,
     getBufferedInfo: NativeDashProvider.prototype.getBufferedInfo,
     _addTimelineRegions: NativeDashProvider.prototype._addTimelineRegions,
@@ -7567,6 +8841,8 @@
     _appendSegmentData: NativeHlsProvider.prototype._appendSegmentData,
     _recoverQuota: NativeHlsProvider.prototype._recoverQuota,
     _handleAppendFailure: NativeHlsProvider.prototype._handleAppendFailure,
+    _handleFatal: NativeHlsProvider.prototype._handleFatal,
+    _completeNativeRuntimeTerminal: NativeHlsProvider.prototype._completeNativeRuntimeTerminal,
     _tryNativeRecovery: NativeHlsProvider.prototype._tryNativeRecovery,
     _probeCapabilities: NativeHlsProvider.prototype._probeCapabilities,
     _isCapabilityAllowed: NativeHlsProvider.prototype._isCapabilityAllowed,
@@ -7577,6 +8853,9 @@
     _fetchPlaylistText: NativeHlsProvider.prototype._fetchPlaylistText,
     _recordServiceWorkerFetch: NativeHlsProvider.prototype._recordServiceWorkerFetch,
     _recordOfflineHttpError: NativeHlsProvider.prototype._recordOfflineHttpError,
+    _drainAppendQueue: NativeHlsProvider.prototype._drainAppendQueue,
+    _ensureTsTransmuxer: NativeHlsProvider.prototype._ensureTsTransmuxer,
+    _transmuxTsSegment: NativeHlsProvider.prototype._transmuxTsSegment,
     _jumpSmallGap: NativeHlsProvider.prototype._jumpSmallGap,
     reportStall: NativeHlsProvider.prototype.reportStall,
     chooseVariant: NativeHlsProvider.prototype.chooseVariant,
@@ -7585,6 +8864,7 @@
     getIFrameTracks: NativeHlsProvider.prototype.getIFrameTracks,
     getIFramePreview: NativeHlsProvider.prototype.getIFramePreview,
     _loadIFramePlaylist: NativeHlsProvider.prototype._loadIFramePlaylist,
+    _loadImagePlaylist: NativeHlsProvider.prototype._loadImagePlaylist,
     getTextTracks: NativeHlsProvider.prototype.getTextTracks,
     getActiveTextTrack: NativeHlsProvider.prototype.getActiveTextTrack,
     selectTextTrack: NativeHlsProvider.prototype.selectTextTrack,
@@ -7603,5 +8883,9 @@
     _checkBufferMilestones: NativeHlsProvider.prototype._checkBufferMilestones,
     _abortRequests: NativeHlsProvider.prototype._abortRequests,
     getStats: NativeHlsProvider.prototype.getStats
+  };
+  window.NativeTsTransmuxerForTest = {
+    demuxMpegTs: demuxMpegTs,
+    FirstPartyTsTransmuxerAdapter: FirstPartyTsTransmuxerAdapter
   };
 })();

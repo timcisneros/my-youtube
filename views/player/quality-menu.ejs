@@ -39,7 +39,9 @@
 
           var tracks = [];
           try { tracks = player.getVariantTracks(); } catch (e) {}
-          var isProgressive = !player.getAssetUri();
+          var assetUri = '';
+          try { assetUri = player.getAssetUri && player.getAssetUri(); } catch (e) {}
+          var isProgressive = !tracks.length && !assetUri;
 
           if (isProgressive) {
             // Progressive mode — show current resolution only
@@ -115,7 +117,11 @@
         function updateQualityState() {
           if (engine.recovering || engine.networkTrouble) return;
           var isProgressive = false;
-          safePlayerCall(function () { isProgressive = !player.getAssetUri(); });
+          safePlayerCall(function () {
+            var tracks = [];
+            try { tracks = player.getVariantTracks(); } catch (e) {}
+            isProgressive = !tracks.length && !player.getAssetUri();
+          });
           if (isProgressive) {
             var h = video.videoHeight || 0;
             qualityRow.stateSpan.textContent = h ? h + 'p' : '';
@@ -191,4 +197,9 @@
         player.addEventListener('adaptation', scheduleQualityRebuild);
         player.addEventListener('loaded', scheduleQualityRebuild);
         video.addEventListener('loadedmetadata', scheduleQualityRebuild);
+        qualityRow.button.addEventListener('click', function () {
+          restoreSavedQuality();
+          rebuildQualityMenu();
+          updateQualityState();
+        });
       })();

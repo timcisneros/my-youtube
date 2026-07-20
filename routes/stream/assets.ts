@@ -3,7 +3,7 @@ import { pipeline } from 'stream/promises';
 import { promisify } from 'util';
 import { execFile } from 'child_process';
 import express from 'express';
-import { ytdlpArgs } from '../../ytdlp.js';
+import { YTDLP_BIN, ytdlpArgs } from '../../ytdlp.js';
 import { getCachedDuration } from '../../youtube/index.js';
 import { fetchVideoMetaBatch } from '../../yt-meta.js';
 import { isYouTubeCdnUrl, fetchLiveStoryboardSpec } from '../../extractors.js';
@@ -116,7 +116,7 @@ function mountAssetRoutes(router) {
     }
     // Fetch via yt-dlp (single video only, not batch)
     try {
-      const { stdout } = await execFileAsync('yt-dlp', [
+      const { stdout } = await execFileAsync(YTDLP_BIN, [
         ...ytdlpArgs(), '--print', 'duration', '--no-warnings', '--', videoId
       ], { timeout: 15000 });
       const d = parseFloat(stdout.trim());

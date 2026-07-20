@@ -1,4 +1,9 @@
 {
   "ignore": ["public/**"],
-  "ignoreDependencies": ["ejs", "shaka-player"]
+  "ignoreBinaries": ["ffmpeg"],
+  "ignoreDependencies": ["ejs"],
+  "ignoreExportsUsedInFile": {
+    "interface": true,
+    "type": true
+  }
 }

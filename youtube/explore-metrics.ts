@@ -13,8 +13,8 @@ const STOP_WORDS = new Set([
   'there', 'when', 'how', 'who', 'why', 'where', 'just', 'also', 'very',
 ]);
 
-export function tokenize(title: string): string[] {
-  return title
+export function tokenize(title: unknown): string[] {
+  return String(title || '')
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, '')
     .split(/\s+/)

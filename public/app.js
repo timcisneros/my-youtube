@@ -22,6 +22,21 @@ function hideOfflineBadge() {
 window.addEventListener('online', hideOfflineBadge);
 window.addEventListener('offline', showOfflineBadge);
 
+function setNavStreamVia(text) {
+  var el = document.getElementById('stream-via');
+  if (el) el.textContent = text || '';
+}
+
+function finishShellLoad() {
+  if (window._stopLoadTimer) window._stopLoadTimer();
+  if (window._finishLoadingBar) window._finishLoadingBar();
+}
+
+function resetShellLoadState() {
+  if (window._resetLoadTimer) window._resetLoadTimer();
+  setNavStreamVia('');
+}
+
 // Request durable storage so IDB data isn't evicted under storage pressure
 if (navigator.storage && navigator.storage.persist) {
   navigator.storage.persist().catch(function () {});
@@ -32,9 +47,14 @@ if (navigator.storage && navigator.storage.persist) {
 // For downloads, render from localStorage. For other pages, render the fallback HTML.
 function handleFallback(html) {
   var main = document.querySelector('main');
-  if (!main) return;
+  if (!main) {
+    resetShellLoadState();
+    if (window._finishLoadingBar) window._finishLoadingBar();
+    return;
+  }
   // Downloads: render from localStorage
   if (window.location.pathname === '/downloads') {
+    resetShellLoadState();
     try {
       var data = localStorage.getItem('offline_downloads');
       if (data) {
@@ -66,6 +86,7 @@ function handleFallback(html) {
   if (window.location.pathname === '/watch' && videoMatch) {
     var videoId = videoMatch[1];
     var title = '';
+    setNavStreamVia('offline...');
     try {
       var dlData = localStorage.getItem('offline_downloads');
       if (dlData) {
@@ -85,12 +106,21 @@ function handleFallback(html) {
       var engine = new PlayerEngine(video, { videoId: videoId, streamToken: '' });
       window._player = engine.getPlayer();
       window._playerEngine = engine;
-      engine.init().then(function () { return engine.load(); }).catch(function (err) {
+      engine.init().then(function () { return engine.load(); }).then(function () {
+        setNavStreamVia('offline');
+        finishShellLoad();
+      }).catch(function (err) {
         console.error('[player-engine] offline fallback load failed:', err);
+        setNavStreamVia('');
+        finishShellLoad();
       });
+    } else {
+      setNavStreamVia('');
+      finishShellLoad();
     }
     return;
   }
+  resetShellLoadState();
   // Default: render the /offline fallback page from SW
   if (html) {
     var doc = new DOMParser().parseFromString(html, 'text/html');
@@ -516,7 +546,13 @@ function loadWatchProgress() {
 
 // Pjax navigation + loading bar
 (function () {
-  var bar, fastInterval, slowInterval;
+  var bar, fastInterval, slowInterval, finishTimeout;
+
+  function clearBarTimers() {
+    if (fastInterval) { clearInterval(fastInterval); fastInterval = null; }
+    if (slowInterval) { clearInterval(slowInterval); slowInterval = null; }
+    if (finishTimeout) { clearTimeout(finishTimeout); finishTimeout = null; }
+  }
 
   function appendBar() {
     if (!bar) return;
@@ -529,6 +565,7 @@ function loadWatchProgress() {
   }
 
   function startBar() {
+    clearBarTimers();
     if (bar) bar.remove();
     bar = document.createElement('div');
     bar.className = 'top-loading-bar';
@@ -555,12 +592,16 @@ function loadWatchProgress() {
   }
 
   function finishBar() {
-    if (fastInterval) { clearInterval(fastInterval); fastInterval = null; }
-    if (slowInterval) { clearInterval(slowInterval); slowInterval = null; }
+    clearBarTimers();
     if (!bar) return;
+    var finishedBar = bar;
     bar.style.width = '100%';
     bar.classList.add('done');
-    setTimeout(function () { if (bar) { bar.remove(); bar = null; } }, 600);
+    finishTimeout = setTimeout(function () {
+      finishTimeout = null;
+      finishedBar.remove();
+      if (bar === finishedBar) bar = null;
+    }, 600);
   }
 
   // Set bar to a specific percentage (used by player to reflect extraction progress)
@@ -573,6 +614,11 @@ function loadWatchProgress() {
 
   window._startLoadBar = startBar;
   window._finishLoadingBar = finishBar;
+  window._resetLoadingBar = function () {
+    clearBarTimers();
+    if (bar) { bar.remove(); bar = null; }
+    window._finishLoadingBar = finishBar;
+  };
 
   function updateActiveNav() {
     var path = window.location.pathname;
@@ -590,16 +636,22 @@ function loadWatchProgress() {
 
   // Destroy active player before navigating away to stop buffering
   function destroyPlayer() {
-    if (window._playerEngine) {
-      window._playerEngine.destroy();
-      window._playerEngine = null;
-    } else if (window._shakaPlayer) {
-      try { window._shakaPlayer.destroy(); } catch (e) {}
+    if (window._cleanupPlayer) {
+      try { window._cleanupPlayer(); } catch (e) {}
+      window._cleanupPlayer = null;
     }
-    window._shakaPlayer = null;
-    if (window._shakaKeydown) {
-      document.removeEventListener('keydown', window._shakaKeydown);
-      window._shakaKeydown = null;
+    if (window._playerEngine) {
+      if (window._playerEngine.destroy) window._playerEngine.destroy();
+      window._playerEngine = null;
+    }
+    window._player = null;
+    window._playerSeekTo = null;
+    window.__inlineMPD = null;
+    window.__engine = null;
+    window.__player = null;
+    if (window._playerKeydown) {
+      document.removeEventListener('keydown', window._playerKeydown);
+      window._playerKeydown = null;
     }
     if (window._stallTimer) {
       clearInterval(window._stallTimer);
@@ -652,7 +704,11 @@ function loadWatchProgress() {
     return promises.length > 0 ? Promise.all(promises) : Promise.resolve();
   }
 
-  function swapContent(html) {
+  var navigationSeq = 0;
+  var navigationController = null;
+
+  function swapContent(html, seq) {
+    if (seq && seq !== navigationSeq) return;
     destroyPlayer();
     var doc = new DOMParser().parseFromString(html, 'text/html');
     var resourcesReady = injectHeadResources(doc);
@@ -664,6 +720,7 @@ function loadWatchProgress() {
     // Wait for all head resources (CSS + JS) before swapping DOM and running scripts
     // so the page is never shown unstyled
     resourcesReady.then(function () {
+      if (seq && seq !== navigationSeq) return;
       if (newMain) {
         document.querySelector('main').innerHTML = newMain.innerHTML;
       }
@@ -693,38 +750,53 @@ function loadWatchProgress() {
   }
 
   async function navigate(href) {
+    var seq = ++navigationSeq;
+    if (navigationController) {
+      try { navigationController.abort(); } catch (e) {}
+    }
+    navigationController = window.AbortController ? new AbortController() : null;
     startBar();
     var watchMatch = href.match(/[?&]v=([A-Za-z0-9_-]+)/);
-    if (watchMatch && !_isOffline) {
+    if (watchMatch) {
       if (window._startLoadTimer) window._startLoadTimer();
-      fetch('/api/stream/' + watchMatch[1] + '/prefetch').catch(function () {});
+      if (!_isOffline) fetch('/api/stream/' + watchMatch[1] + '/prefetch').catch(function () {});
     }
     try {
-      var res = await fetch(href, { headers: { 'Accept': 'text/html' } });
-      if (!res.ok) { window.location.href = href; return; }
+      var fetchOpts = { headers: { 'Accept': 'text/html' } };
+      if (navigationController) fetchOpts.signal = navigationController.signal;
+      var res = await fetch(href, fetchOpts);
+      if (seq !== navigationSeq) return;
+      if (!res.ok) {
+        finishShellLoad();
+        window.location.href = href;
+        return;
+      }
       var isFallback = res.headers.get('X-SW-Fallback') === '1';
       var html = await res.text();
+      if (seq !== navigationSeq) return;
       history.pushState({}, '', href);
-      finishBar();
       if (isFallback) {
+        finishBar();
         destroyPlayer();
         updateActiveNav();
         handleFallback(html);
       } else {
         if (_isOffline) hideOfflineBadge();
-        swapContent(html);
+        swapContent(html, seq);
         cacheDownloadMetadata();
         if (watchMatch) {
-          window._finishLoadingBar = function () {};
+          window._finishLoadingBar = finishBar;
         } else {
-          var tel = document.getElementById('load-timer');
-          if (tel) tel.className = 'load-timer';
+          finishBar();
+          if (window._resetLoadTimer) window._resetLoadTimer();
           var svel = document.getElementById('stream-via');
           if (svel) svel.textContent = '';
         }
       }
       window.scrollTo(0, 0);
     } catch (e) {
+      if (e && e.name === 'AbortError') return;
+      if (seq !== navigationSeq) return;
       finishBar();
       history.pushState({}, '', href);
       destroyPlayer();
@@ -750,31 +822,54 @@ function loadWatchProgress() {
   });
 
   window.addEventListener('popstate', function () {
+    var seq = ++navigationSeq;
+    if (navigationController) {
+      try { navigationController.abort(); } catch (e) {}
+    }
+    navigationController = window.AbortController ? new AbortController() : null;
     destroyPlayer();
     startBar();
     var vMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]+)/);
-    if (vMatch && !_isOffline) {
+    if (vMatch) {
       if (window._startLoadTimer) window._startLoadTimer();
-      fetch('/api/stream/' + vMatch[1] + '/prefetch').catch(function () {});
+      if (!_isOffline) fetch('/api/stream/' + vMatch[1] + '/prefetch').catch(function () {});
     }
-    fetch(window.location.href, { headers: { 'Accept': 'text/html' } })
+    var fetchOpts = { headers: { 'Accept': 'text/html' } };
+    if (navigationController) fetchOpts.signal = navigationController.signal;
+    fetch(window.location.href, fetchOpts)
       .then(function (r) {
+        if (seq !== navigationSeq) return null;
         var fallback = r.headers.get('X-SW-Fallback') === '1';
         return r.ok ? r.text().then(function (t) { return { html: t, fallback: fallback }; }) : null;
       })
       .then(function (result) {
-        if (!result) { window.location.reload(); return; }
-        finishBar();
+        if (seq !== navigationSeq) return;
+        if (!result) {
+          finishShellLoad();
+          window.location.reload();
+          return;
+        }
         if (result.fallback) {
+          finishBar();
           updateActiveNav();
           handleFallback(result.html);
         } else {
           if (_isOffline) hideOfflineBadge();
-          swapContent(result.html);
+          swapContent(result.html, seq);
           cacheDownloadMetadata();
+          if (vMatch) {
+            window._finishLoadingBar = finishBar;
+          } else {
+            finishBar();
+            if (window._resetLoadTimer) window._resetLoadTimer();
+            var svel = document.getElementById('stream-via');
+            if (svel) svel.textContent = '';
+          }
         }
       })
-      .catch(function () {
+      .catch(function (err) {
+        if (err && err.name === 'AbortError') return;
+        if (seq !== navigationSeq) return;
         finishBar();
         updateActiveNav();
         handleFallback('');
@@ -1436,12 +1531,24 @@ function escapeHtml(str) {
 
   window._stopLoadTimer = function () {
     var el = getEl();
-    if (!el || !startTime) return;
+    if (!startTime) return;
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    if (!el) { startTime = 0; return; }
     var secs = (performance.now() - startTime) / 1000;
     el.textContent = secs.toFixed(2) + 's';
     var grade = secs < 4 ? 'green' : secs < 17 ? 'yellow' : 'red';
     el.className = 'load-timer done-' + grade;
+    startTime = 0;
+  };
+
+  window._resetLoadTimer = function () {
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
+    startTime = 0;
+    var el = getEl();
+    if (el) {
+      el.textContent = '';
+      el.className = 'load-timer';
+    }
   };
 
   // Start on direct page load if this is a video page

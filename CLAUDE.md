@@ -9,7 +9,8 @@ Self-hosted YouTube frontend. Proxies all video/audio/thumbnails through the ser
 - **Web framework**: Express 4
 - **Database**: SQLite (better-sqlite3) by default, PostgreSQL (pg) when `DATABASE_URL` is set
 - **Views**: EJS server-rendered with streaming HTML (shell flushed before data is ready)
-- **Video playback**: Shaka Player (DASH/HLS), with progressive MP4 fallback
+- **Video playback**: First-party native player for DASH/HLS/progressive playback, including native DASH SegmentTemplate/SegmentList/SegmentBase, DASH image thumbnails, HLS fMP4/MPEG-TS/image-thumbnail playlist support, HLS session-data chapters, and embedded CEA caption metadata detection
+- **Playlists**: Server-side YouTube playlist pages, saved playlist library, custom local playlists with ordered items, and watch-page previous/next playback context
 - **Optional services**: Redis (shared cache + sessions + BullMQ extraction queue), S3 (download storage)
 
 ## Architecture
@@ -49,6 +50,7 @@ youtube/               → YouTube data layer
   explore-metrics.ts   → Explore evaluation metrics, tokenize/STOP_WORDS, topic diversity (MMR re-ranking)
   video-details.ts     → Video metadata (oEmbed fast → Innertube enrichment)
   channel.ts           → Channel info + video listing (Innertube browse API)
+  playlists.ts         → YouTube playlist page fetch, continuation fetch, URL normalization, ytInitialData parser
   durations.ts         → Duration format/cache
 
 routes/                → Page routes + API endpoints
@@ -57,6 +59,7 @@ routes/                → Page routes + API endpoints
   subscriptions.ts     → GET /subscriptions
   channel.ts           → GET /channel/:id, avatar proxy
   player.ts            → GET /watch?v=, GET /watch/details
+  playlists.ts         → GET /playlist?list=, GET/POST/DELETE /playlists, local playlist item APIs
   tags.ts              → POST/DELETE /api/tags
   comments.ts          → GET /api/comments/:videoId, replies, avatar proxy
   downloads.ts         → GET /downloads, DELETE /downloads/:videoId
@@ -84,6 +87,7 @@ routes/stream/         → Video streaming pipeline (mounted at /api/stream)
   status.ts            → SSE + WebSocket extraction progress
 
 scripts/               → Tooling & evaluation
+  player-parity-guard.mjs → Static guard for native-player parity coverage and watch-shell asset contract
   explore-eval.ts      → Offline holdout evaluation of explore algorithm (npm run eval:explore)
   explore-optimize.ts  → Coordinate descent weight optimizer (npm run optimize:explore)
 
@@ -91,11 +95,12 @@ tests/                 → Test suites
   integration.test.mjs → DB layer, auth, rate limiting, HTTP endpoints (65 tests)
   resilience.test.mjs  → Resilience under failed optional services (22 tests)
   explore.test.mjs     → Explore algorithm unit tests — scoring, config injection, filtering (12 tests)
+  playlists.test.mjs   → Playlist initial-data parser and ID validation
 
 public/                → Browser JS (plain JS, not TypeScript)
   app.js               → Main UI (navigation, search, subscription management, offline detection)
   idb-helpers.js       → IndexedDB helpers for offline format chunk storage (2MB chunks, shared by app.js + sw.js)
-  player-engine.js     → Shaka Player setup, quality switching, keyboard shortcuts
+  native-player-engine.js → Native-first DASH/HLS/progressive player with the stable player adapter API, DASH sidx range parsing, DASH/HLS image preview metadata, HLS MPEG-TS transmuxing, HLS session-data chapters, and embedded CEA caption metadata
   sw.js                → Service worker (static + segment + image + app shell caches, IDB format serving, offline navigation)
   manifest.json        → PWA manifest for installability
 
@@ -108,13 +113,15 @@ views/                 → EJS templates
 ## Key patterns
 
 - **Extraction chain**: yt-dlp (cookies → browser cookies → alt clients) → Innertube API → Invidious API. Each backend has a circuit breaker. Core yt-dlp logic lives in `lib/ytdlp-extract.ts`, used by both `lib/extract.ts` (worker) and `routes/stream/extraction.ts` (web server).
-- **DatabaseAPI interface** (`types.ts`): Both `db.ts` and `db-pg.ts` implement `DatabaseAPI`. SQLite methods are sync, PostgreSQL methods are async. `db.ts` exports as `SyncDatabaseAPI` (mapped type that unwraps `MaybePromise<T>` to `T`) for the default SQLite path. Tables: `tags`, `subscriptions`, `downloads`, `channels`, `rss_cache`, `video_durations` (columns: `video_id`, `duration`, `live_status`, `tags`, `description`), `watch_time`, `related_videos`, `dismissals` (columns: `user_id`, `video_id`, `channel_id`), `channel_boosts`, `explore_events` (columns include `position`, `bounce_seconds`; event types: `impression`, `click`, `bounce`, `return`), `watch_queue`, `channel_mutes`, `video_ratings`, `topic_filters`, `explore_sessions` (columns: `user_id`, `session_id`, `started_at`, `clicks`, `total_watch_seconds`, `best_completion`).
+- **DatabaseAPI interface** (`types.ts`): Both `db.ts` and `db-pg.ts` implement `DatabaseAPI`. SQLite methods are sync, PostgreSQL methods are async. `db.ts` exports as `SyncDatabaseAPI` (mapped type that unwraps `MaybePromise<T>` to `T`) for the default SQLite path. Tables: `tags`, `subscriptions`, `downloads`, `channels`, `rss_cache`, `video_durations` (columns: `video_id`, `duration`, `live_status`, `tags`, `description`), `watch_time`, `related_videos`, `dismissals` (columns: `user_id`, `video_id`, `channel_id`), `channel_boosts`, `explore_events` (columns include `position`, `bounce_seconds`; event types: `impression`, `click`, `bounce`, `return`), `watch_queue`, `saved_playlists`, `local_playlist_items`, `channel_mutes`, `video_ratings`, `topic_filters`, `explore_sessions` (columns: `user_id`, `session_id`, `started_at`, `clicks`, `total_watch_seconds`, `best_completion`).
 - **Streaming HTML**: Routes call `res.flushShell()` to send head+nav immediately, then `res.streamContent()` with data once ready. Defined in `server.ts` middleware, typed in `express.d.ts`.
+- **Native player cutover guard**: `npm run test:player:guard` statically verifies that every `tests/browser/native-player.spec.mjs` test is selected by `test:player:parity`, that the watch shell loads `/native-player-engine.js`, and that repo runtime source does not reference retired Shaka assets, fallback symbols, or the legacy `/player-engine.js`.
 - **Two-tier cache**: `lib/cache.ts` provides `SharedLRUMap` — sync L1 (in-process LRU) with async L2 (Redis write-through). Used for format cache, MPD cache, URL lookup, HLS cache, VTT cache, and explore cache (shared across workers in cluster mode).
 - **Stream auth**: HMAC-signed tokens created in `auth.ts`, validated in `routes/stream/index.ts`. Tokens scoped per video ID with 8-hour TTL.
-- **Extraction rate limiting**: Per-IP token bucket (5 extractions/min) with per-videoId dedup — a single video page load (prefetch + dash.mpd + Shaka retries) only consumes 1 slot.
+- **Extraction rate limiting**: Per-IP token bucket (5 extractions/min) with per-videoId dedup — a single video page load (prefetch + dash.mpd + player retries) only consumes 1 slot.
 - **PWA offline mode**: `manifest.json` enables installability. SW caches `/offline` on install and caches `/downloads` + `/watch?v=*` pages + DASH MPD manifests on visit (network-first). All SW cache keys strip auth tokens via `stripToken()` so cached content is token-agnostic — segments cached during online play work offline with any/no token. SW marks fallback responses with `X-SW-Fallback` header so the client can detect server-unreachable state without falsely setting offline mode. `app.js` tracks `navigator.onLine` for offline badge (only real browser offline, not server-down). Download metadata cached in `localStorage` for offline rendering. Offline bundle system: `GET /api/stream/:videoId/offline-bundle` (token-exempt) returns streamToken, MPD, title, channelTitle, format list, and `formatSizes`. `prepareForOffline(videoId)` in `app.js` fetches the bundle, sends it to the SW via `postMessage`, and downloads format files to IndexedDB (not Cache API). The SW's `message` handler builds a self-contained offline watch page HTML and caches it + the MPD + poster. `player.ts` falls back to `downloads` DB metadata when YouTube APIs fail (server-running-no-internet case). The `/offline` route requires no auth.
 - **IndexedDB chunk-level storage**: Format files are stored as 2MB chunks in IndexedDB (`my-youtube-offline` database, v2) instead of single large blobs. `idb-helpers.js` provides shared IDB utilities used by both `app.js` (window) and `sw.js` (`importScripts`). Two object stores: `format-chunks` (2MB Blobs, key `videoId:formatId:chunkIndex`) and `format-meta` (meta with `chunkSize`, `totalSize`, `contentType`, `downloadedChunks`, `totalChunks`, `done`). Benefits: partial playability (partially downloaded files serve available chunks via Range requests), bounded memory (only ~2MB buffered at a time during download), simpler resume (skip to `downloadedChunks × chunkSize`), and smaller IDB writes (2MB per transaction). DB v2 upgrade drops old `format-files` store. `navigator.storage.persist()` is called on startup to request durable storage. The SW fmt handler reads meta first — Range requests compute start/end chunk indices, read chunks from IDB, and assemble via `Blob.slice()` (zero-copy) into a 206 response; non-Range requests with `done=true` use `getAllChunks()`; missing chunks fall through to Cache API and network. `downloadFormatToIDB()` in `app.js` streams response data, buffers incoming bytes, and writes a 2MB chunk to IDB every time the buffer fills. Meta updated every 3 chunks. Resume reads meta → `downloadedChunks * CHUNK_SIZE` = byte offset → `Range: bytes=N-`. Storage quota checked via `navigator.storage.estimate()` with 1.5× safety margin. Deletion cursor-iterates both stores for keys starting with `videoId:`.
+- **Playlist support**: `youtube/playlists.ts` fetches YouTube playlist pages server-side, extracts `ytInitialData`, normalizes raw IDs or YouTube URLs, preserves unavailable entries, and fetches continuation pages through Innertube browse. `/playlist?list=` renders playlist pages with pagination, save/remove controls, and capped `all=1` expansion. `/playlists` is the saved playlist library backed by `saved_playlists`; saved YouTube playlist metadata refreshes in the background when stale and can be refreshed manually. Custom local playlists use `playlist_type='local'` plus `local_playlist_items` for ordered items, with add/remove/move APIs under `/playlists/:playlistId/items`. `/watch?v=&list=&index=` renders both YouTube and local playlist context with previous/next links, media-session track actions, and autoplay-to-next when autoplay is enabled.
 - **Lazy thumbnails**: Templates render `<img data-src="..." class="lazy-thumb">` instead of `src`. `app.js` uses IntersectionObserver to swap `data-src` → `src` when images enter the viewport (400px margin). This prevents 45+ simultaneous HTTP requests on page load. The `loadThumbnails()` function is called alongside `loadDurations()` on every page render and pjax navigation.
 
 ## Commands
@@ -123,7 +130,10 @@ views/                 → EJS templates
 npm run dev              # Start dev server (tsx watch)
 npm test                 # Integration tests (65 tests)
 npm run test:resilience  # Resilience tests (22 tests)
-npm run test:all         # All test suites (65 + 22 + 12 = 99 tests)
+npm run test:playlists   # Playlist parser tests
+npm run test:player:guard # Static native-player parity/watch-shell cutover guard
+npm run test:player:parity # Browser native-player feature parity gate
+npm run test:all         # All test suites (65 + 22 + 12 + playlist parser tests)
 npm run typecheck        # tsc --noEmit (zero errors expected)
 npm run lint             # ESLint — catches floating/misused promises + any
 npm run lint:dead        # knip — catches unused exports/files/deps
@@ -137,7 +147,7 @@ npm run build            # tsc production build to dist/
 - **Privacy first**: No Google domains contacted from the browser. All thumbnails, avatars, video streams proxied through the server. CSP blocks external resources. See memory file `project_myyoutube_privacy.md`.
 - **ESM**: All `.ts` files use ESM (`import`/`export`). Local imports use `.js` extensions per TypeScript ESM convention. `import.meta.dirname` for directory paths.
 - **Tests are ESM**: Test files in `tests/` are `.mjs` running under `tsx --test`. They use standard ESM `import` syntax.
-- **Browser JS stays as JS**: `public/app.js`, `public/player-engine.js`, `public/sw.js` are not TypeScript.
+- **Browser JS stays as JS**: `public/app.js`, `public/native-player-engine.js`, `public/sw.js` are not TypeScript.
 - **TypeScript is permissive**: `strict: false`, `noImplicitAny: false`, but `noUnusedLocals: true` and `noUnusedParameters: true`. Prefix intentionally unused params with `_`.
 - **No `any`**: ESLint enforces `no-explicit-any`. Legitimate uses (better-sqlite3 returns, generic defaults) require `eslint-disable-next-line` with a justification comment.
 - After any change: `npm run typecheck`, `npm run lint`, `npm test` (65/65), `npm run test:resilience` (22/22), and `tsx --test tests/explore.test.mjs` (12/12) must all pass.

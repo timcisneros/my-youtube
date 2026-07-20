@@ -18,6 +18,7 @@ const FIXTURE_HLS_KEYS = [
   Buffer.from('00112233445566778899aabbccddeeff', 'hex'),
   Buffer.from('ffeeddccbbaa99887766554433221100', 'hex'),
 ];
+let fixtureH264Encoder: string | null = null;
 
 type BoxRange = { start: number; end: number };
 type FixtureFormat = {
@@ -69,9 +70,7 @@ function ensureFixtureFiles() {
         '-map', '0:v',
         '-an',
         '-vf', `scale=${rep.width}:${rep.height}`,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-profile:v', 'baseline',
+        ...h264FixtureEncoderArgs('baseline'),
         '-level:v', '3.1',
         '-pix_fmt', 'yuv420p',
         '-b:v', rep.bitrate,
@@ -101,9 +100,7 @@ function ensureFixtureFiles() {
         '-map', '0:v',
         '-an',
         '-vf', `scale=${rep.width}:${rep.height}`,
-        '-c:v', 'libx264',
-        '-preset', 'ultrafast',
-        '-profile:v', 'main',
+        ...h264FixtureEncoderArgs('main'),
         '-level:v', '3.1',
         '-pix_fmt', 'yuv420p',
         '-b:v', rep.bitrate,
@@ -157,6 +154,27 @@ function ensureFixtureFiles() {
       muxedTsPaths[index],
     ], { stdio: 'ignore' });
   });
+}
+
+function h264FixtureEncoderArgs(profile: 'baseline' | 'main') {
+  const encoder = fixtureH264EncoderName();
+  if (encoder === 'libx264') return ['-c:v', 'libx264', '-preset', 'ultrafast', '-profile:v', profile];
+  if (encoder === 'libopenh264') return ['-c:v', 'libopenh264', '-profile:v', profile === 'baseline' ? 'constrained_baseline' : 'main'];
+  return ['-c:v', encoder];
+}
+
+function fixtureH264EncoderName() {
+  if (fixtureH264Encoder) return fixtureH264Encoder;
+  let encoders = '';
+  try {
+    encoders = execFileSync('ffmpeg', ['-hide_banner', '-encoders'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    encoders = '';
+  }
+  if (/\blibx264\b/.test(encoders)) fixtureH264Encoder = 'libx264';
+  else if (/\blibopenh264\b/.test(encoders)) fixtureH264Encoder = 'libopenh264';
+  else fixtureH264Encoder = 'h264';
+  return fixtureH264Encoder;
 }
 
 function fixtureVideoFormats(): Record<string, FixtureFormat> {
@@ -872,11 +890,9 @@ function segmentsFor(filePath: string, indexEnd: number) {
 }
 
 export {
-  FIXTURE_VIDEO_ID,
   buildFixtureHlsMaster,
   buildFixtureHlsMedia,
   buildFixtureMPD,
-  isPlayerFixtureEnabled,
   isPlayerFixtureVideo,
   serveFixtureFormat,
   serveFixtureProgressive,

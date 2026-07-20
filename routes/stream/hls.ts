@@ -25,11 +25,20 @@ import {
 // Cache rewritten HLS manifests to avoid re-parsing on every request
 const hlsRewriteCache = new LRUMap(200);
 
-function rewriteHLS(body, videoId, baseUrl) {
-  const cacheKey = videoId + ':' + body.length;
+async function refreshHlsEntry(videoId) {
+  const info = await extractFormats(videoId);
+  const hlsFmt = selectBestHlsFormat(info.formats || [], info.language);
+  if (!hlsFmt) return null;
+  const entry = { url: hlsFmt.manifest_url || hlsFmt.url, headers: sanitizeHeaders(hlsFmt.http_headers), expires: Date.now() + CACHE_TTL };
+  hlsCache.set(videoId, entry);
+  return entry;
+}
+
+function rewriteHLS(body, videoId, baseUrl, token = '') {
+  const cacheKey = videoId + ':' + body.length + ':' + token;
   const cached = hlsRewriteCache.get(cacheKey);
   if (cached) return cached;
-  const proxyBase = '/api/stream/' + videoId + '/hls-proxy?u=';
+  const proxyBase = '/api/stream/' + videoId + '/hls-proxy?' + (token ? 'token=' + encodeURIComponent(token) + '&' : '') + 'u=';
   const lines = body.split('\n');
 
   // First pass: parse #EXT-X-STREAM-INF + URL pairs, extract resolution & bandwidth
@@ -122,20 +131,22 @@ function mountHlsRoutes(router) {
         return res.send(buildFixtureHlsMaster(videoId, req.query));
       }
       let entry = hlsCache.get(videoId);
-      if (!entry || Date.now() > entry.expires) return res.status(404).json({ error: 'HLS not available' });
+      if (!entry || Date.now() > entry.expires) {
+        entry = await refreshHlsEntry(videoId);
+        if (!entry) return res.status(404).json({ error: 'HLS not available' });
+      }
       let upstream = await fetchWithConnTimeout(entry.url, { headers: entry.headers });
 
       // If the master manifest URL expired, re-extract fresh HLS URL and retry
-      if (upstream.status === 403 || upstream.status === 410) {
+      if (upstream.status === 403 || upstream.status === 404 || upstream.status === 410) {
         await upstream.body?.cancel().catch(() => {});
         hlsCache.delete(videoId);
         formatCache.delete(videoId);
         mpdCache.delete(videoId);
-        const info = await extractFormats(videoId);
-        const hlsFmt = selectBestHlsFormat(info.formats || [], info.language);
+        const refreshed = await refreshHlsEntry(videoId);
+        const hlsFmt = refreshed ? { manifest_url: refreshed.url, url: refreshed.url, http_headers: refreshed.headers } : null;
         if (!hlsFmt) return res.status(404).json({ error: 'HLS not available after refresh' });
-        entry = { url: hlsFmt.manifest_url || hlsFmt.url, headers: sanitizeHeaders(hlsFmt.http_headers), expires: Date.now() + CACHE_TTL };
-        hlsCache.set(videoId, entry);
+        entry = refreshed;
         upstream = await fetchWithConnTimeout(entry.url, { headers: entry.headers });
       }
 
@@ -143,8 +154,9 @@ function mountHlsRoutes(router) {
         await upstream.body?.cancel().catch(() => {});
         return res.status(upstream.status).end();
       }
+      const token = typeof req.query.token === 'string' ? req.query.token : '';
       let body = await upstream.text();
-      body = rewriteHLS(body, videoId, entry.url);
+      body = rewriteHLS(body, videoId, entry.url, token);
       res.set('Content-Type', 'application/vnd.apple.mpegurl');
       res.set('Cache-Control', 'no-cache');
       res.send(body);
@@ -212,7 +224,7 @@ function mountHlsRoutes(router) {
       // request (from Shaka's HLS parser) triggers a fresh extraction via
       // the /hls.m3u8 route.  Return 410 to signal Shaka that this URL is
       // permanently gone — it will re-fetch the manifest and get new segment URLs.
-      if (upstream.status === 403 || upstream.status === 410) {
+      if (upstream.status === 403 || upstream.status === 404 || upstream.status === 410) {
         await upstream.body?.cancel().catch(() => {});
         hlsCache.delete(videoId);
         formatCache.delete(videoId);
@@ -235,8 +247,9 @@ function mountHlsRoutes(router) {
       }
       // If it's a sub-manifest, rewrite URLs too (check content-type only, not URL path)
       if (ct && ct.includes('mpegurl')) {
+        const token = typeof req.query.token === 'string' ? req.query.token : '';
         let body = await upstream.text();
-        body = rewriteHLS(body, req.params.videoId, url);
+        body = rewriteHLS(body, req.params.videoId, url, token);
         res.set('Content-Type', 'application/vnd.apple.mpegurl');
         res.send(body);
       } else {

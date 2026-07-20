@@ -73,7 +73,7 @@ function startBgDownload(videoId, itag, url, headers, meta) {
       }
       ws.end();
       clearTimeout(stallTimer);
-      await new Promise((resolve, reject) => { ws.on('finish', resolve); ws.on('error', reject); });
+      await new Promise<void>((resolve, reject) => { ws.on('finish', () => resolve()); ws.on('error', reject); });
       entry.done = true;
       console.log(`[bg-cache] ${key} complete (${(entry.bytesDownloaded / 1048576).toFixed(1)} MB)`);
       // Check if all formats for this video are done

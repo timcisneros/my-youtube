@@ -8,7 +8,7 @@
  */
 import { execFile } from 'child_process';
 import { promisify } from 'util';
-import { ytdlpArgs, ytdlpBrowserArgs, refreshCookiesFile } from '../ytdlp.js';
+import { YTDLP_BIN, ytdlpArgs, ytdlpBrowserArgs, refreshCookiesFile } from '../ytdlp.js';
 import { fetchScheduledStart } from '../extractors.js';
 
 const execFileAsync = promisify(execFile);
@@ -31,7 +31,7 @@ async function extractViaYtdlp(videoId: string, withSlot: <T>(fn: () => Promise<
   return withSlot(async () => {
     let stdout: string | undefined;
     try {
-      const result = await execFileAsync('yt-dlp', [
+      const result = await execFileAsync(YTDLP_BIN, [
         ...ytdlpArgs(), '--write-auto-subs', '-j', '--', videoId
       ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
       if (result.stderr) console.warn(`[${logTag} ${videoId}]`, result.stderr.trim());
@@ -51,7 +51,7 @@ async function extractViaYtdlp(videoId: string, withSlot: <T>(fn: () => Promise<
         if (browserArgs) {
           console.warn(`[${logTag} ${videoId}] bot detection, retrying with browser cookies`);
           try {
-            const retry = await execFileAsync('yt-dlp', [
+            const retry = await execFileAsync(YTDLP_BIN, [
               ...browserArgs, '--write-auto-subs', '-j', '--', videoId
             ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
             if (retry.stderr) console.warn(`[${logTag} ${videoId}]`, retry.stderr.trim());
@@ -75,7 +75,7 @@ async function extractViaYtdlp(videoId: string, withSlot: <T>(fn: () => Promise<
         if (hasCookieFlag && isCookieError) {
           console.warn(`[${logTag} ${videoId}] cookie extraction failed, retrying without cookies`);
           try {
-            const retry = await execFileAsync('yt-dlp', [
+            const retry = await execFileAsync(YTDLP_BIN, [
               '--write-auto-subs', '-j', '--', videoId
             ], { timeout: 30000, maxBuffer: 50 * 1024 * 1024 });
             if (retry.stderr) console.warn(`[${logTag} ${videoId}]`, retry.stderr.trim());
@@ -104,7 +104,7 @@ async function extractViaYtdlpAlt(videoId: string, withSlot: <T>(fn: () => Promi
   return withSlot(async () => {
     for (const clients of ALT_CLIENTS) {
       try {
-        const result = await execFileAsync('yt-dlp', [
+        const result = await execFileAsync(YTDLP_BIN, [
           '--no-warnings',
           '--extractor-args', 'youtube:player_client=' + clients,
           '-j', '--', videoId

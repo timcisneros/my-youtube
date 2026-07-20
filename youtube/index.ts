@@ -6,5 +6,6 @@ export * from './subscriptions.js';
 export * from './today.js';
 export * from './video-details.js';
 export * from './channel.js';
+export * from './playlists.js';
 export * from './durations.js';
 export * from './explore.js';

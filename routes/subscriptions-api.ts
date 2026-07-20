@@ -8,7 +8,7 @@ import { spawn, execFile } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import db from '../db.js';
-import { availableBrowsers } from '../ytdlp.js';
+import { YTDLP_BIN, availableBrowsers } from '../ytdlp.js';
 import { invalidateSubCaches } from '../youtube/index.js';
 import type { Subscription } from '../types.js';
 
@@ -19,7 +19,7 @@ const dataDir = path.join(import.meta.dirname, '..', 'data');
 function exportCookies(browser: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const cookiePath = path.join(dataDir, 'cookies-' + Date.now() + '.txt');
-    const child = spawn('yt-dlp', [
+    const child = spawn(YTDLP_BIN, [
       '--cookies-from-browser', browser,
       '--cookies', cookiePath,
       '--skip-download', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ'
@@ -52,45 +52,113 @@ function exportCookies(browser: string): Promise<string> {
   });
 }
 
+function textFromRuns(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  const obj = value as Record<string, unknown>;
+  if (typeof obj.simpleText === 'string') return obj.simpleText;
+  const runs = Array.isArray(obj.runs) ? obj.runs : [];
+  return runs.map((run) => {
+    if (!run || typeof run !== 'object') return '';
+    const text = (run as Record<string, unknown>).text;
+    return typeof text === 'string' ? text : '';
+  }).join('');
+}
+
+function thumbnailUrl(value: unknown): string {
+  if (!value || typeof value !== 'object') return '';
+  const thumbnails = (value as Record<string, unknown>).thumbnails;
+  if (!Array.isArray(thumbnails) || thumbnails.length === 0) return '';
+  const last = thumbnails[thumbnails.length - 1];
+  if (!last || typeof last !== 'object') return '';
+  const url = (last as Record<string, unknown>).url;
+  return typeof url === 'string' ? url : '';
+}
+
+function extractInitialData(html: string): unknown {
+  const markerIndex = html.indexOf('ytInitialData');
+  if (markerIndex === -1) {
+    if (/ServiceLogin|accounts\.google\.com|signin/i.test(html)) {
+      throw new Error('YouTube returned a sign-in page. Browser cookies were exported, but not accepted for youtube.com.');
+    }
+    throw new Error('Could not find subscription data in YouTube response.');
+  }
+  const start = html.indexOf('{', markerIndex);
+  if (start === -1) throw new Error('Could not find subscription data object in YouTube response.');
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i++) {
+    const ch = html[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return JSON.parse(html.slice(start, i + 1));
+    }
+  }
+  throw new Error('Subscription data object was incomplete.');
+}
+
+function subscriptionFromRenderer(renderer: Record<string, unknown>): Subscription | null {
+  const channelId = renderer.channelId;
+  if (typeof channelId !== 'string' || !channelId.startsWith('UC')) return null;
+  return {
+    channelId,
+    title: textFromRuns(renderer.title) || textFromRuns(renderer.shortBylineText),
+    thumbnail: thumbnailUrl(renderer.thumbnail),
+    description: textFromRuns(renderer.descriptionSnippet),
+  };
+}
+
+function parseSubscriptionList(data: unknown): Subscription[] {
+  const byId = new Map<string, Subscription>();
+  const visit = (node: unknown) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const obj = node as Record<string, unknown>;
+    for (const key of ['channelRenderer', 'gridChannelRenderer', 'compactChannelRenderer']) {
+      const renderer = obj[key];
+      if (renderer && typeof renderer === 'object') {
+        const sub = subscriptionFromRenderer(renderer as Record<string, unknown>);
+        if (sub && !byId.has(sub.channelId)) byId.set(sub.channelId, sub);
+      }
+    }
+    for (const value of Object.values(obj)) visit(value);
+  };
+  visit(data);
+  return [...byId.values()];
+}
+
 // Fetch youtube.com/feed/channels via curl with cookie jar, parse channels from ytInitialData
 function fetchChannelList(cookiePath: string): Promise<Subscription[]> {
   return new Promise((resolve, reject) => {
     execFile('curl', [
-      '-s', '-L', '-b', cookiePath,
+      '-s', '-L', '--compressed', '-b', cookiePath,
       '-H', 'User-Agent: Mozilla/5.0',
+      '-H', 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       '-H', 'Accept-Language: *',
       'https://www.youtube.com/feed/channels'
     ], { timeout: 15000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(new Error('Failed to fetch YouTube: ' + err.message));
       try {
-        const m = stdout.match(/var ytInitialData = ({.*?});<\/script>/);
-        if (!m) return reject(new Error('Could not find subscription data. Are you logged into YouTube in this browser?'));
-        const yt = JSON.parse(m[1]);
-        const subs: Subscription[] = [];
-        const tabs = yt.contents?.twoColumnBrowseResultsRenderer?.tabs || [];
-        for (const tab of tabs) {
-          const sections = tab.tabRenderer?.content?.sectionListRenderer?.contents || [];
-          for (const section of sections) {
-            const items = section.itemSectionRenderer?.contents || [];
-            for (const item of items) {
-              const entries = item.shelfRenderer?.content?.expandedShelfContentsRenderer?.items || [];
-              for (const entry of entries) {
-                const ch = entry.channelRenderer;
-                if (!ch?.channelId) continue;
-                const thumbs = ch.thumbnail?.thumbnails || [];
-                subs.push({
-                  channelId: ch.channelId,
-                  title: ch.title?.simpleText || '',
-                  thumbnail: thumbs.length ? thumbs[thumbs.length - 1].url : '',
-                  description: ch.descriptionSnippet?.runs?.map(r => r.text).join('') || ''
-                });
-              }
-            }
-          }
-        }
+        const yt = extractInitialData(stdout);
+        const subs = parseSubscriptionList(yt);
         resolve(subs);
       } catch (e) {
-        reject(new Error('Failed to parse YouTube response'));
+        reject(e instanceof Error ? e : new Error('Failed to parse YouTube response'));
       }
     });
   });
@@ -98,29 +166,86 @@ function fetchChannelList(cookiePath: string): Promise<Subscription[]> {
 
 const ALLOWED_BROWSERS = ['firefox','chrome','chromium','brave','edge','opera','vivaldi'];
 
+function browserBase(browserSpec: string): string {
+  return browserSpec.split(':', 1)[0].split('+', 1)[0].toLowerCase();
+}
+
+function requestBrowserHints(req: express.Request): string {
+  return [
+    req.headers['user-agent'],
+    req.headers['sec-ch-ua'],
+    req.headers['sec-ch-ua-platform'],
+  ].filter(Boolean).join(' ').toLowerCase();
+}
+
+function rankBrowserSpecsForRequest(req: express.Request, specs = availableBrowsers()): string[] {
+  const hints = requestBrowserHints(req);
+  const desired: string[] = [];
+  if (hints.includes('firefox')) desired.push('firefox');
+  if (hints.includes('edg')) desired.push('edge');
+  if (hints.includes('brave')) desired.push('brave');
+  if (hints.includes('chrome')) desired.push('chrome');
+  if (hints.includes('chromium') || hints.includes('chrome') || hints.includes('helium')) desired.push('chromium');
+
+  return [...specs].sort((a, b) => {
+    const aBase = browserBase(a);
+    const bBase = browserBase(b);
+    let aScore = desired.includes(aBase) ? 100 : 0;
+    let bScore = desired.includes(bBase) ? 100 : 0;
+    if (hints.includes('helium') && a.includes('net.imput.helium')) aScore += 50;
+    if (hints.includes('helium') && b.includes('net.imput.helium')) bScore += 50;
+    if (a.includes(':')) aScore += 1;
+    if (b.includes(':')) bScore += 1;
+    return bScore - aScore;
+  });
+}
+
+async function fetchSubscriptionsFromBrowserSpecs(specs: string[]) {
+  let lastError: Error | null = null;
+  for (const browser of specs) {
+    let cookiePath: string | undefined;
+    try {
+      cookiePath = await exportCookies(browser);
+      const subs = await fetchChannelList(cookiePath);
+      if (subs.length > 0) return { browser, subs };
+      lastError = new Error(`${browser} did not contain subscriptions`);
+    } catch (e: unknown) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+    } finally {
+      if (cookiePath) try { fs.unlinkSync(cookiePath); } catch {}
+    }
+  }
+  throw lastError || new Error('No browser cookies found');
+}
+
 // Fetch subscriptions from browser cookies
 router.post('/fetch', async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
-  const browser = (req.body.browser || '').toLowerCase();
-  if (!ALLOWED_BROWSERS.includes(browser)) {
-    return res.status(400).json({ error: 'Invalid browser. Allowed: ' + ALLOWED_BROWSERS.join(', ') });
-  }
   const available = availableBrowsers();
-  if (!available.includes(browser)) {
-    return res.status(400).json({ error: browser + ' cookies not found. Available: ' + (available.join(', ') || 'none') });
+  const requestedBrowser = typeof req.body?.browser === 'string' ? req.body.browser : '';
+  let candidates: string[];
+  if (requestedBrowser) {
+    if (!ALLOWED_BROWSERS.includes(browserBase(requestedBrowser))) {
+      return res.status(400).json({ error: 'Invalid browser. Allowed: ' + ALLOWED_BROWSERS.join(', ') });
+    }
+    if (!available.includes(requestedBrowser)) {
+      return res.status(400).json({ error: requestedBrowser + ' cookies not found. Available: ' + (available.join(', ') || 'none') });
+    }
+    candidates = [requestedBrowser];
+  } else {
+    candidates = rankBrowserSpecsForRequest(req, available);
+    if (candidates.length === 0) return res.status(400).json({ error: 'No browser cookies found' });
   }
-  let cookiePath: string | undefined;
+
   try {
-    cookiePath = await exportCookies(browser);
-    const subs = await fetchChannelList(cookiePath);
+    const { browser, subs } = await fetchSubscriptionsFromBrowserSpecs(candidates);
     if (subs.length === 0) return res.json({ imported: 0 });
-    db.upsertSubscriptions(req.session.userId, subs);
-    res.json({ imported: subs.length });
+    db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
+    invalidateSubCaches(req.session.userId);
+    res.json({ imported: subs.length, browser });
   } catch (e: unknown) {
     console.error('Subscription fetch error:', (e as Error).message);
     res.status(500).json({ error: (e as Error).message });
-  } finally {
-    if (cookiePath) try { fs.unlinkSync(cookiePath); } catch {}
   }
 });
 
@@ -136,7 +261,8 @@ router.post('/fetch-cookies', express.text({ type: '*/*', limit: '1mb' }), async
   try {
     const subs = await fetchChannelList(cookiePath);
     if (subs.length === 0) return res.json({ imported: 0 });
-    db.upsertSubscriptions(req.session.userId, subs);
+    db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
+    invalidateSubCaches(req.session.userId);
     res.json({ imported: subs.length });
   } catch (e: unknown) {
     console.error('Subscription fetch error:', (e as Error).message);
@@ -190,7 +316,8 @@ router.post('/import', express.text({ type: '*/*', limit: '2mb' }), (req, res) =
 
   if (subs.length === 0) return res.status(400).json({ error: 'No valid subscriptions found in file' });
 
-  db.upsertSubscriptions(req.session.userId, subs);
+  db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
+  invalidateSubCaches(req.session.userId);
   res.json({ imported: subs.length });
 });
 
@@ -205,4 +332,4 @@ router.delete('/:channelId', (req, res) => {
 });
 
 export default router;
-export { exportCookies };
+export { exportCookies, parseSubscriptionList, rankBrowserSpecsForRequest };

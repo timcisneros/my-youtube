@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { ensureAuth, createStreamToken } from '../auth.js';
-import { getVideoDetails, enrichFromNext } from '../youtube/index.js';
+import { getVideoDetails, enrichFromNext, getPlaylistDetails, sanitizePlaylistId } from '../youtube/index.js';
 import { buildMPD, bgDownloads } from './stream/index.js';
 import { mpdCache } from './stream/shared.js';
 import db from '../db.js';
@@ -15,10 +15,42 @@ function playerDrmServers(): Record<string, string> {
   return servers;
 }
 
+function isLocalPlaylistId(playlistId: string) {
+  return /^local_[A-Za-z0-9_-]{8,64}$/.test(playlistId);
+}
+
+async function getLocalPlaylistDetails(userId: string, playlistId: string) {
+  const saved = await Promise.resolve(db.getSavedPlaylist(userId, playlistId));
+  if (!saved || saved.playlist_type !== 'local') return null;
+  const rows = await Promise.resolve(db.getLocalPlaylistItems(userId, playlistId));
+  const items = rows.map((row, idx) => ({
+    videoId: row.video_id,
+    title: row.title || row.video_id,
+    channelTitle: row.channel_title || '',
+    channelId: row.channel_id || '',
+    lengthText: '',
+    index: idx + 1,
+    available: true,
+    unavailableReason: '',
+  }));
+  return {
+    playlistId,
+    title: saved.title,
+    channelTitle: '',
+    channelId: '',
+    itemCountText: `${items.length} ${items.length === 1 ? 'video' : 'videos'}`,
+    thumbnailVideoId: items[0]?.videoId || '',
+    items,
+    nextPageToken: null,
+  };
+}
+
 router.get('/', ensureAuth, async (req, res) => {
   const videoId = req.query.v as string;
   if (!videoId) return res.redirect('/');
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return res.status(400).end('Invalid video ID');
+  const playlistId = sanitizePlaylistId(req.query.list);
+  const requestedPlaylistIndex = Math.max(1, parseInt(String(req.query.index || '0'), 10) || 0);
   const tRaw = String(req.query.t || '0').replace(/s$/, '');
   const startTime = parseInt(tRaw, 10) || 0;
 
@@ -26,8 +58,8 @@ router.get('/', ensureAuth, async (req, res) => {
   const streamToken = createStreamToken(videoId);
 
   // Check L1 cache for a valid DASH MPD to inline into the HTML (skip manifest fetch).
-  // BaseURL paths must be fully qualified because Shaka can't resolve paths
-  // against data: URIs — rewrite them with the request origin server-side.
+  // BaseURL paths stay fully qualified so native and fallback parsers resolve
+  // them consistently when the manifest is passed as inline data.
   const cachedMpd = mpdCache.get(videoId);
   const origin = req.protocol + '://' + req.get('host');
   const inlineMPD = (cachedMpd && typeof cachedMpd.data === 'string' && Date.now() < cachedMpd.expires)
@@ -39,10 +71,15 @@ router.get('/', ensureAuth, async (req, res) => {
   buildMPD(videoId).catch(() => {});
 
   const videoP = getVideoDetails(videoId);
+  const playlistP = playlistId
+    ? (isLocalPlaylistId(playlistId)
+      ? getLocalPlaylistDetails(req.session.userId, playlistId).catch(() => null)
+      : getPlaylistDetails(playlistId).catch(() => null))
+    : Promise.resolve(null);
 
-  // Flush shell with native player + preload/prefetch in head — browser starts
-  // loading these resources immediately while getVideoDetails runs. Shaka is
-  // lazy-loaded only when native playback falls back.
+  // Flush shell with the native player + preload/prefetch in head. The browser
+  // starts loading these resources immediately while getVideoDetails runs.
+  // Shaka remains a lazy emergency fallback only.
   await res.flushShell({
     activeTab: null,
     mainClass: 'player-page',
@@ -59,6 +96,7 @@ router.get('/', ensureAuth, async (req, res) => {
     } catch {
       video = null;
     }
+    const fetchedPlaylist = await playlistP;
     if (!video || !video.title) {
       const dl = db.getDownload(videoId);
       if (dl) {
@@ -94,6 +132,26 @@ router.get('/', ensureAuth, async (req, res) => {
         if (h > downloadedHeight) downloadedHeight = h;
       }
     }
+    let playlist = null;
+    if (fetchedPlaylist && fetchedPlaylist.items.length > 0) {
+      const foundIndex = fetchedPlaylist.items.findIndex((item) => item.videoId === videoId);
+      const currentIndex = foundIndex >= 0 ? foundIndex + 1 : requestedPlaylistIndex;
+      const prev = currentIndex > 1
+        ? fetchedPlaylist.items.slice(0, currentIndex - 1).reverse().find((item) => item.available && item.videoId) || null
+        : null;
+      const next = currentIndex > 0
+        ? fetchedPlaylist.items.slice(currentIndex).find((item) => item.available && item.videoId) || null
+        : null;
+      const buildPlaylistWatchUrl = (item: { videoId: string; index: number } | null) => item
+        ? `/watch?v=${item.videoId}&list=${encodeURIComponent(fetchedPlaylist.playlistId)}&index=${item.index}`
+        : '';
+      playlist = {
+        ...fetchedPlaylist,
+        currentIndex,
+        prevUrl: buildPlaylistWatchUrl(prev),
+        nextUrl: buildPlaylistWatchUrl(next),
+      };
+    }
     await res.streamContent('player', {
       video,
       tags,
@@ -105,6 +163,7 @@ router.get('/', ensureAuth, async (req, res) => {
       inlineVia,
       downloadedHeight,
       playerDrmServers: playerDrmServers(),
+      playlist,
     });
   } catch (err) {
     console.error('Player error:', err.message);

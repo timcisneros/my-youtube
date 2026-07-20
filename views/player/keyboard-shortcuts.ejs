@@ -80,15 +80,15 @@
         }
       }
       // Clean up previous player's global listeners before adding new ones
-      if (window._shakaKeydown) {
-        document.removeEventListener('keydown', window._shakaKeydown);
+      if (window._playerKeydown) {
+        document.removeEventListener('keydown', window._playerKeydown);
       }
       if (window._stallTimer) {
         clearInterval(window._stallTimer);
         window._stallTimer = null;
       }
       document.addEventListener('keydown', onKeydown);
-      window._shakaKeydown = onKeydown;
+      window._playerKeydown = onKeydown;
       // Cleanup function for SPA navigation / player reinit
       window._cleanupPlayer = function () {
         document.removeEventListener('keydown', onKeydown);
@@ -106,5 +106,5 @@
         if (window._playerEngine) { window._playerEngine.destroy(); window._playerEngine = null; }
         window._playerSeekTo = null;
         window._player = null;
-        window._shakaPlayer = null;
+        window._playerKeydown = null;
       };

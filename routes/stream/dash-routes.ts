@@ -96,11 +96,13 @@ function mountDashRoutes(router) {
     res.status(404).json({ error: 'Progressive fixture not found' });
   });
 
-  router.get('/:videoId/tmpl/:formatId/:kind/:part?', (req, res) => {
+  const serveTemplateFixture = (req, res) => {
     const part = req.params.kind === 'init' ? 'init' : req.params.part;
     if (part && serveFixtureTemplatePart(req.params.videoId, req.params.formatId, part, req, res)) return;
     res.status(404).json({ error: 'Template fixture part not found' });
-  });
+  };
+  router.get('/:videoId/tmpl/:formatId/init', serveTemplateFixture);
+  router.get('/:videoId/tmpl/:formatId/:kind/:part', serveTemplateFixture);
 
   // DASH format proxy — streams individual adaptive format by format_id
   router.get('/:videoId/fmt/:formatId', async (req, res) => {

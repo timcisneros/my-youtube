@@ -3,34 +3,13 @@ import 'dotenv/config';
 import express from 'express';
 import compression from 'compression';
 import session from 'express-session';
-import createSqliteStore from 'better-sqlite3-session-store';
-const BetterSqlite3Store = createSqliteStore(session);
-import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { execFile } from 'child_process';
-
-import authRouter from './auth.js';
-import todayRouter from './routes/today.js';
-import subscriptionsRouter from './routes/subscriptions.js';
-import channelRouter from './routes/channel.js';
-import playerRouter from './routes/player.js';
-import tagsRouter from './routes/tags.js';
-import commentsRouter from './routes/comments.js';
-import streamRouter from './routes/stream/index.js';
-import subscriptionsApiRouter from './routes/subscriptions-api.js';
-import cookiesRouter from './routes/cookies.js';
-import downloadsRouter from './routes/downloads.js';
-import exploreRouter from './routes/explore.js';
-import dismissalsRouter from './routes/dismissals.js';
-import boostsRouter from './routes/boosts.js';
-import mutesRouter from './routes/mutes.js';
-import exploreEventsRouter from './routes/explore-events.js';
-import queueRouter from './routes/queue.js';
-import ratingsRouter from './routes/ratings.js';
-import topicFiltersRouter from './routes/topic-filters.js';
+import { YTDLP_BIN } from './ytdlp.js';
 
 const app = express();
+const fixtureMode = process.env.PLAYER_FIXTURES === '1';
 
 // --- Rate limiting (token bucket per IP) ---
 const rateBuckets = new Map();
@@ -143,7 +122,12 @@ app.set('views', path.join(import.meta.dirname, 'views'));
 app.get('/favicon.ico', (_req, res) => res.status(204).end());
 
 // Stream routes mounted early — skip compression, session, JSON parsing for max throughput
-app.use('/api/stream', streamRouter);
+if (fixtureMode) {
+  app.use('/api/stream', await createFixtureStreamRouter());
+} else {
+  const { default: streamRouter } = await import('./routes/stream/index.js');
+  app.use('/api/stream', streamRouter);
+}
 
 app.use(compression({
   level: 6,
@@ -169,13 +153,13 @@ app.post('/api/player-events', (req, res) => {
 });
 
 app.use(express.static(path.join(import.meta.dirname, 'public'), { maxAge: '1d' }));
-app.use('/vendor/shaka', express.static(path.join(import.meta.dirname, 'node_modules/shaka-player/dist'), { maxAge: '7d', immutable: true }));
 const dataDir = path.join(import.meta.dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
 
-// Session store — Redis when REDIS_URL is set, SQLite otherwise
+// Session store — Redis when REDIS_URL is set, SQLite otherwise. Player fixture
+// mode uses the default in-memory store so media tests do not require native DB bindings.
 let sessionStore;
-if (process.env.REDIS_URL) {
+if (!fixtureMode && process.env.REDIS_URL) {
   try {
     const { RedisStore } = await import('connect-redis');
     const { Redis } = await import('ioredis');
@@ -186,13 +170,18 @@ if (process.env.REDIS_URL) {
     console.warn('[session] Redis store failed, falling back to SQLite:', (err as Error).message);
   }
 }
-if (!sessionStore) {
+if (!fixtureMode && !sessionStore) {
+  const [{ default: createSqliteStore }, { default: Database }] = await Promise.all([
+    import('better-sqlite3-session-store'),
+    import('better-sqlite3'),
+  ]);
+  const BetterSqlite3Store = createSqliteStore(session);
   const sessionDb = new Database(path.join(dataDir, 'sessions.db'));
   sessionStore = new BetterSqlite3Store({ client: sessionDb, expired: { clear: true, intervalMs: 60 * 60 * 1000 } });
 }
 
 app.use(session({
-  store: sessionStore,
+  ...(sessionStore ? { store: sessionStore } : {}),
   secret: process.env.SESSION_SECRET || 'dev-secret',
   resave: false,
   saveUninitialized: false,
@@ -237,30 +226,132 @@ app.get('/offline', (_req, res) => {
   });
 });
 
-import db from './db.js';
+const db = fixtureMode ? null : (await import('./db.js')).default;
 
-// Mount route modules
-app.use('/downloads', downloadsRouter);
-app.use('/auth', authRouter);
-app.use('/', todayRouter);
-app.use('/explore', exploreRouter);
-app.use('/subscriptions', subscriptionsRouter);
-app.use('/channel', channelRouter);
-app.use('/watch', playerRouter);
-app.use('/api/tags', tagsRouter);
-app.use('/api/comments', commentsRouter);
-app.use('/api/subscriptions', subscriptionsApiRouter);
-app.use('/api/cookies', cookiesRouter);
-app.use('/api/dismissals', dismissalsRouter);
-app.use('/api/boosts', boostsRouter);
-app.use('/api/mutes', mutesRouter);
-app.use('/api/explore-events', exploreEventsRouter);
-app.use('/api/ratings', ratingsRouter);
-app.use('/api/topic-filters', topicFiltersRouter);
-app.use('/queue', queueRouter);
+if (fixtureMode) {
+  app.get('/auth/login', (_req, res) => res.status(200).send('<!doctype html><title>Fixture Login</title><form method="post" action="/auth/free"></form>'));
+  app.post('/auth/free', (req, res) => {
+    req.session.userId = 'fixture-user';
+    res.redirect('/');
+  });
+  app.get('/', (_req, res) => res.status(200).send('<!doctype html><title>Fixture Home</title>'));
+  app.get('/watch', (_req, res) => {
+    res.status(200).send(`<!doctype html>
+<html>
+<head><title>Fixture Watch</title></head>
+<body>
+<video id="player"></video>
+<script src="/native-player-engine.js"></script>
+<script>
+var playerDrmServers = {};
+player.configure({ drm: { servers: playerDrmServers } });
+player.beginSeek();
+player.commitSeek();
+player.endSeek();
+if (player.seekToLiveEdge) player.seekToLiveEdge();
+player.getStats ? player.getStats() : null;
+typeof stats.atLiveEdge === 'boolean';
+stats.liveLatency;
+function playerSeekTo(target, opts) {}
+window._playerSeekTo = playerSeekTo;
+navigator.mediaSession.setActionHandler('seekbackward', function () { playerSeekTo(Math.max(0, (engine.recovering ? engine.lastGoodTime : video.currentTime) - 5)); });
+navigator.mediaSession.setActionHandler('seekforward', function () { playerSeekTo(Math.min(video.duration || Infinity, (engine.recovering ? engine.lastGoodTime : video.currentTime) + 5)); });
+navigator.mediaSession.setActionHandler('seekto', function (d) { if (d.seekTime != null) playerSeekTo(d.seekTime); });
+playerSeekTo(dur * pct);
+playerSeekTo(chapters[idx].start_time);
+playerSeekTo(parseFloat(link.dataset.time));
+if (player.setPlaybackRate) player.setPlaybackRate(rate);
+if (player.setPlaybackRate) player.setPlaybackRate(savedSpeed);
+player.getPlaybackRate ? player.getPlaybackRate() : video.playbackRate;
+localStorage.getItem('player-speed');
+var previewSource = 'none';
+window._seekPreviewSource = previewSource;
+tooltip.dataset.previewSource = previewSource;
+function requestIFramePreview(time) {
+  return fetch('/api/stream/' + videoId + '/iframe').then(function () {
+    return player.getIFramePreview(time).then(function (preview) {
+      setPreviewSource(lastIframePreview ? 'iframe' : 'none');
+      setPreviewSource('storyboard');
+      tooltip.dataset.previewUrl = preview.url || '';
+    });
+  });
+}
+function runPlayerCleanupTasks() {}
+window._cleanupPlayer = function () {};
+if (window._detailsTimer) clearInterval(window._detailsTimer);
+runPlayerCleanupTasks();
+</script>
+</body>
+</html>`);
+  });
+} else {
+  const [
+    { default: authRouter },
+    { default: todayRouter },
+    { default: subscriptionsRouter },
+    { default: channelRouter },
+    { default: playerRouter },
+    { default: playlistRouter },
+    { default: tagsRouter },
+    { default: commentsRouter },
+    { default: subscriptionsApiRouter },
+    { default: cookiesRouter },
+    { default: downloadsRouter },
+    { default: exploreRouter },
+    { default: dismissalsRouter },
+    { default: boostsRouter },
+    { default: mutesRouter },
+    { default: exploreEventsRouter },
+    { default: queueRouter },
+    { default: ratingsRouter },
+    { default: topicFiltersRouter },
+  ] = await Promise.all([
+    import('./auth.js'),
+    import('./routes/today.js'),
+    import('./routes/subscriptions.js'),
+    import('./routes/channel.js'),
+    import('./routes/player.js'),
+    import('./routes/playlists.js'),
+    import('./routes/tags.js'),
+    import('./routes/comments.js'),
+    import('./routes/subscriptions-api.js'),
+    import('./routes/cookies.js'),
+    import('./routes/downloads.js'),
+    import('./routes/explore.js'),
+    import('./routes/dismissals.js'),
+    import('./routes/boosts.js'),
+    import('./routes/mutes.js'),
+    import('./routes/explore-events.js'),
+    import('./routes/queue.js'),
+    import('./routes/ratings.js'),
+    import('./routes/topic-filters.js'),
+  ]);
+
+  // Mount route modules
+  app.use('/downloads', downloadsRouter);
+  app.use('/auth', authRouter);
+  app.use('/', todayRouter);
+  app.use('/explore', exploreRouter);
+  app.use('/subscriptions', subscriptionsRouter);
+  app.use('/channel', channelRouter);
+  app.use('/watch', playerRouter);
+  app.use('/playlist', playlistRouter);
+  app.use('/playlists', playlistRouter);
+  app.use('/api/tags', tagsRouter);
+  app.use('/api/comments', commentsRouter);
+  app.use('/api/subscriptions', subscriptionsApiRouter);
+  app.use('/api/cookies', cookiesRouter);
+  app.use('/api/dismissals', dismissalsRouter);
+  app.use('/api/boosts', boostsRouter);
+  app.use('/api/mutes', mutesRouter);
+  app.use('/api/explore-events', exploreEventsRouter);
+  app.use('/api/ratings', ratingsRouter);
+  app.use('/api/topic-filters', topicFiltersRouter);
+  app.use('/queue', queueRouter);
+}
 
 // Clear yt-dlp cache on startup to avoid stale format data
-execFile('yt-dlp', ['--rm-cache-dir'], () => {});
+execFile(YTDLP_BIN, ['--rm-cache-dir'], () => {});
 
 // Initialize Redis for shared caches (non-blocking, falls back to in-memory)
 import { initRedis } from './lib/cache.js';
@@ -277,6 +368,7 @@ await initStorage();
 // Watch time — save/restore position for continue watching
 app.post('/api/watch-time/:videoId', (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
+  if (!db) return res.json({ ok: true });
   const { videoId } = req.params;
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return res.status(400).json({ error: 'Invalid video ID' });
   const { position, duration } = req.body;
@@ -292,6 +384,7 @@ app.post('/api/watch-time/:videoId', (req, res) => {
 
 app.post('/api/watch-times', async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
+  if (!db) return res.json({});
   const { ids } = req.body;
   if (!Array.isArray(ids) || !ids.length) return res.json({});
   const videoIds = ids.slice(0, 50).filter(id => /^[A-Za-z0-9_-]{11}$/.test(id));
@@ -302,11 +395,61 @@ app.post('/api/watch-times', async (req, res) => {
 
 app.get('/api/watch-time/:videoId', (req, res) => {
   if (!req.session.userId) return res.json({ position: 0 });
+  if (!db) return res.json({ position: 0 });
   const { videoId } = req.params;
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return res.json({ position: 0 });
   const wt = db.getWatchTime(req.session.userId, videoId);
   res.json({ position: wt ? wt.last_position : 0, duration: wt ? wt.duration : 0 });
 });
+
+async function createFixtureStreamRouter() {
+  const router = express.Router();
+  const {
+    buildFixtureHlsMaster,
+    buildFixtureHlsMedia,
+    buildFixtureMPD,
+    serveFixtureEncryptedHlsSegment,
+    serveFixtureFormat,
+    serveFixtureHlsKey,
+    serveFixtureProgressive,
+    serveFixtureTemplatePart,
+    serveFixtureTsSegment,
+  } = await import('./routes/stream/player-fixture.js');
+
+  router.get('/:videoId/dash.mpd', (req, res) => {
+    res.type('application/dash+xml').send(buildFixtureMPD(req.params.videoId, req.query));
+  });
+  router.get('/:videoId/hls.m3u8', (req, res) => {
+    res.type('application/vnd.apple.mpegurl').send(buildFixtureHlsMaster(req.params.videoId, req.query));
+  });
+  router.get('/:videoId/hls/:formatId.m3u8', (req, res) => {
+    res.type('application/vnd.apple.mpegurl').send(buildFixtureHlsMedia(req.params.videoId, req.params.formatId, req.query));
+  });
+  router.get('/:videoId/fmt/:formatId', (req, res) => {
+    if (!serveFixtureFormat(req.params.videoId, req.params.formatId, req, res)) res.status(404).end();
+  });
+  const serveTemplateFixture = (req: express.Request, res: express.Response) => {
+    const params = req.params as { videoId: string; formatId: string; kind: string; part?: string };
+    const part = params.kind === 'init' ? 'init' : params.part;
+    if (part && serveFixtureTemplatePart(params.videoId, params.formatId, part, req, res)) return;
+    res.status(404).json({ error: 'Template fixture part not found' });
+  };
+  router.get('/:videoId/tmpl/:formatId/init', serveTemplateFixture);
+  router.get('/:videoId/tmpl/:formatId/:kind/:part', serveTemplateFixture);
+  router.get('/:videoId/hls-ts/:formatId.ts', (req, res) => {
+    if (!serveFixtureTsSegment(req.params.videoId, req.params.formatId, req, res)) res.status(404).end();
+  });
+  router.get('/:videoId/hls-key/:keyId.key', (req, res) => {
+    if (!serveFixtureHlsKey(req.params.videoId, req.params.keyId, req, res)) res.status(404).end();
+  });
+  router.get('/:videoId/hls-aes/:formatId/:segmentId.:ext', (req, res) => {
+    if (!serveFixtureEncryptedHlsSegment(req.params.videoId, req.params.formatId, req.params.segmentId, req, res)) res.status(404).end();
+  });
+  router.get('/:videoId/progressive.mp4', (req, res) => {
+    if (!serveFixtureProgressive(req.params.videoId, req, res)) res.status(404).end();
+  });
+  return router;
+}
 
 function sanitizePlayerEvent(event: unknown) {
   if (!event || typeof event !== 'object') return null;
@@ -320,6 +463,8 @@ function sanitizePlayerEvent(event: unknown) {
     provider: clampText(src.provider, 40),
     mode: clampText(src.mode, 30),
     fallbackReason: clampText(src.fallbackReason, 120),
+    transmuxerProvider: clampText(src.transmuxerProvider, 40),
+    transmuxedSegmentCount: clampNumber(src.transmuxedSegmentCount, 0, 10_000),
     lastError: clampText(src.lastError, 120),
     lastHttpStatus: clampNumber(src.lastHttpStatus, 0, 599),
     activeHeight: clampNumber(src.activeHeight, 0, 4320),
