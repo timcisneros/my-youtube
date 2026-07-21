@@ -414,14 +414,18 @@
       // --- Volume (persisted to localStorage) ---
       (function restoreVolume() {
         var saved = localStorage.getItem('player-volume');
-        var savedMute = localStorage.getItem('player-muted');
+        // v1 could be polluted by the old autoplay fallback persisting its
+        // temporary policy mute as though the user had selected it.
+        var savedMute = localStorage.getItem('player-muted-v2');
         if (saved !== null) video.volume = parseFloat(saved);
         if (savedMute === '1') video.muted = true;
         volBar.value = video.muted ? 0 : Math.round(video.volume * 100);
       })();
       function _persistVolume() {
         localStorage.setItem('player-volume', video.volume);
-        localStorage.setItem('player-muted', video.muted ? '1' : '0');
+        // A policy-only autoplay mute belongs to this play attempt, not to
+        // the user's saved volume preference.
+        if (!autoplayPolicyMuted) localStorage.setItem('player-muted-v2', video.muted ? '1' : '0');
       }
       function updateMuteIcon() {
         var svg = muteBtn.querySelector('svg');
@@ -437,6 +441,7 @@
       updateMuteIcon();
       updateVolFill();
       muteBtn.addEventListener('click', function () {
+        autoplayPolicyMuted = false;
         video.muted = !video.muted;
       });
       video.addEventListener('volumechange', function () {
@@ -446,6 +451,7 @@
         _persistVolume();
       });
       volBar.addEventListener('input', function () {
+        autoplayPolicyMuted = false;
         video.volume = volBar.value / 100;
         if (video.muted && volBar.value > 0) video.muted = false;
         updateVolFill();

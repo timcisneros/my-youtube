@@ -5,7 +5,7 @@
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="manifest" href="/manifest.json">
 <link rel="stylesheet" href="/style.css">
-<link rel="prefetch" href="/native-player-engine.js" as="script" fetchpriority="low">
+<link rel="prefetch" href="/native-player-engine.js?v=12" as="script" fetchpriority="low">
 <script src="/idb-helpers.js"></script>
 <script src="/app.js"></script>
-<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('/sw.js');navigator.serviceWorker.addEventListener('controllerchange',function(){window.location.reload()})}</script>
+<script>if('serviceWorker' in navigator){var hadServiceWorkerController=!!navigator.serviceWorker.controller;navigator.serviceWorker.register('/sw.js');navigator.serviceWorker.addEventListener('controllerchange',function(){if(hadServiceWorkerController)window.location.reload()})}</script>

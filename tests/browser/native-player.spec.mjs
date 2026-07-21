@@ -3103,6 +3103,119 @@ test('native buffer scheduler prioritizes the current playback window', async ({
   expect(shakaRequests).toHaveLength(0);
 });
 
+test('native buffer scheduler closes VOD after the terminal DASH and HLS segments', async ({ page }) => {
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    function mediaSourceState() {
+      return {
+        readyState: 'open',
+        ended: 0,
+        endOfStream() { this.ended++; this.readyState = 'ended'; },
+      };
+    }
+    const dashMediaSource = mediaSourceState();
+    const dash = {
+      live: false,
+      duration: 6,
+      mediaSource: dashMediaSource,
+      videoSb: { updating: false },
+      audioSb: { updating: false },
+      activeVideo: {
+        segments: [
+          { start: 0, end: 2, state: 'pending', appended: false },
+          { start: 2, end: 4, state: 'pending', appended: false },
+          { start: 4, end: 6, state: 'appended', appended: true },
+        ],
+      },
+      audio: {
+        segments: [
+          { start: 0, end: 2, state: 'pending', appended: false },
+          { start: 2, end: 4, state: 'pending', appended: false },
+          { start: 4, end: 6, state: 'appended', appended: true },
+        ],
+      },
+      vodEndOfStreamCount: 0,
+    };
+    const dashClosed = window.NativeDashProviderForTest._maybeEndVodStream.call(dash);
+
+    const hlsMediaSource = mediaSourceState();
+    const hls = {
+      live: false,
+      duration: 6,
+      mediaSource: hlsMediaSource,
+      sb: { updating: false },
+      audioSb: null,
+      segments: [
+        { start: 0, end: 2, state: 'pending', appended: false },
+        { start: 2, end: 4, state: 'pending', appended: false },
+        { start: 4, end: 6, state: 'appended', appended: true },
+      ],
+      activeAudio: null,
+      audioSegments: [],
+      vodEndOfStreamCount: 0,
+    };
+    const hlsClosed = window.NativeHlsProviderForTest._maybeEndVodStream.call(hls);
+
+    return {
+      dashClosed,
+      dashEnded: dashMediaSource.ended,
+      dashCount: dash.vodEndOfStreamCount,
+      hlsClosed,
+      hlsEnded: hlsMediaSource.ended,
+      hlsCount: hls.vodEndOfStreamCount,
+    };
+  });
+
+  expect(state).toEqual({
+    dashClosed: true,
+    dashEnded: 1,
+    dashCount: 1,
+    hlsClosed: true,
+    hlsEnded: 1,
+    hlsCount: 1,
+  });
+});
+
+test('watch page renders centralized autoplay retry and end buffering cleanup', () => {
+  const player = readFileSync('views/player.ejs', 'utf8');
+  const controls = readFileSync('views/player/controls-setup.ejs', 'utf8');
+
+  expect(player).toContain("var blocked = err && err.name === 'NotAllowedError';");
+  expect(player).not.toContain("err.name === 'NotAllowedError' || err.name === 'AbortError'");
+  expect(player).toContain('autoplayRetryTimer = setPlayerTimeout(retry, 250);');
+  expect(player).toContain("video.addEventListener('ended', function () {");
+  expect(player).toContain("container.classList.remove('player-buffering');");
+  expect(controls).toContain("localStorage.getItem('player-muted-v2')");
+  expect(controls).toContain("if (!autoplayPolicyMuted) localStorage.setItem('player-muted-v2'");
+});
+
+test('service-worker segment cache keeps the current player runtime ahead of cached JavaScript', () => {
+  const worker = readFileSync('public/sw.js', 'utf8');
+  const route = readFileSync('routes/player.ts', 'utf8');
+  const head = readFileSync('views/partials/head.ejs', 'utf8');
+
+  expect(worker).toContain("var STATIC_CACHE = 'my-youtube-static-v12';");
+  expect(worker).toContain("var NETWORK_FIRST_STATIC = [\n  '/idb-helpers.js',\n  '/app.js',\n  '/native-player-engine.js'\n];");
+  expect(worker).toContain('if (NETWORK_FIRST_STATIC.indexOf(url.pathname) !== -1)');
+  expect(route).toContain('/native-player-engine.js?v=12');
+  expect(head).toContain('/native-player-engine.js?v=12');
+});
+
+test('service-worker segment cache leaves the first streamed Today page intact during install', () => {
+  const head = readFileSync('views/partials/head.ejs', 'utf8');
+  const shell = readFileSync('views/partials/shell-start.ejs', 'utf8');
+  const today = readFileSync('views/today.ejs', 'utf8');
+  const route = readFileSync('routes/today.ts', 'utf8');
+
+  expect(head).toContain('var hadServiceWorkerController=!!navigator.serviceWorker.controller');
+  expect(head).toContain('if(hadServiceWorkerController)window.location.reload()');
+  expect(shell).toContain('id="today-loading"');
+  expect(shell).toContain('Checking your subscriptions for new videos');
+  expect(today).toContain("document.getElementById('today-loading')");
+  expect(route).toContain("showTodayLoading: true");
+});
+
 test('native buffer milestones emit startup and seek readiness telemetry', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {

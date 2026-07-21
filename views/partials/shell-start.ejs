@@ -7,3 +7,18 @@
 <body>
   <%- include('nav') %>
   <main class="container<%= typeof mainClass !== 'undefined' && mainClass ? ' ' + mainClass : '' %>">
+<% if (typeof showTodayLoading !== 'undefined' && showTodayLoading) { %>
+    <section id="today-loading" class="today-loading" aria-busy="true" aria-live="polite">
+      <h1>Today's Videos</h1>
+      <p>Checking your subscriptions for new videos…</p>
+      <div class="video-grid today-skeleton-grid" aria-hidden="true">
+        <% for (let i = 0; i < 6; i++) { %>
+          <div class="today-skeleton-card">
+            <div class="today-skeleton-thumb"></div>
+            <div class="today-skeleton-line today-skeleton-title"></div>
+            <div class="today-skeleton-line today-skeleton-meta"></div>
+          </div>
+        <% } %>
+      </div>
+    </section>
+<% } %>

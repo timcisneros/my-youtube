@@ -1,6 +1,6 @@
 importScripts('/idb-helpers.js');
 // Service Worker — cache-first for static assets, segment caching for video proxy
-var STATIC_CACHE = 'my-youtube-static-v11';
+var STATIC_CACHE = 'my-youtube-static-v12';
 var SEGMENT_CACHE = 'my-youtube-segments-v5';
 var IMAGE_CACHE = 'my-youtube-images-v1';
 var APP_SHELL_CACHE = 'my-youtube-shell-v1';
@@ -16,6 +16,11 @@ var STATIC_ASSETS = [
   '/fonts/roboto-latin.woff2',
   '/manifest.json',
   '/favicon.svg'
+];
+var NETWORK_FIRST_STATIC = [
+  '/idb-helpers.js',
+  '/app.js',
+  '/native-player-engine.js'
 ];
 
 // Strip auth token from URL so cached content is token-agnostic.
@@ -184,7 +189,7 @@ function buildOfflineWatchPage(bundle) {
     + '    <div class="video-channel">' + channelTitle + '</div>\n'
     + '  </div>\n'
     + '</main>\n'
-    + '<script src="/native-player-engine.js"><\/script>\n'
+    + '<script src="/native-player-engine.js?v=12"><\/script>\n'
     + '<script src="/idb-helpers.js"><\/script>\n'
     + '<script src="/app.js"><\/script>\n'
     + '<script>\n'
@@ -551,6 +556,25 @@ self.addEventListener('fetch', function (event) {
     || url.pathname.startsWith('/vendor/');
 
   if (isStatic) {
+    // Runtime JavaScript must update on the first online reload. Cache-first
+    // here used to execute the previous player for one or more navigations,
+    // even after a playback fix had been deployed.
+    if (NETWORK_FIRST_STATIC.indexOf(url.pathname) !== -1) {
+      event.respondWith(
+        fetch(event.request).then(function (response) {
+          if (response.ok) {
+            var clone = response.clone();
+            caches.open(STATIC_CACHE).then(function (cache) {
+              cache.put(event.request, clone);
+            });
+          }
+          return response;
+        }).catch(function () {
+          return caches.match(event.request);
+        })
+      );
+      return;
+    }
     event.respondWith(
       caches.match(event.request).then(function (cached) {
         if (cached) {

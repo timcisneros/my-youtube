@@ -7368,15 +7368,18 @@
 
   function segmentsAppendedThroughEnd(segments, duration) {
     if (!segments || !segments.length) return false;
-    var expectedEnd = isFinite(duration) && duration > 0 ? duration : segments[segments.length - 1].end;
-    var appendedEnd = 0;
+    var terminal = null;
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
       if (seg.end < 0.05) continue;
-      if (!seg.appended && seg.state !== 'appended') return false;
-      appendedEnd = Math.max(appendedEnd, seg.end || 0);
+      if (!terminal || seg.end > terminal.end) terminal = seg;
     }
-    return appendedEnd >= expectedEnd - 0.25;
+    if (!terminal || (!terminal.appended && terminal.state !== 'appended')) return false;
+    // A finite VOD manifest is authoritative about its final segment. Earlier
+    // segments may legitimately be absent after a seek or an ABR switch, and
+    // requiring them all prevents MediaSource.endOfStream() forever. Keep the
+    // duration check only as protection against a genuinely incomplete index.
+    return !(isFinite(duration) && duration > 0 && terminal.end < duration - Math.max(1, duration * 0.01));
   }
 
   function segmentPriority(seg, currentTime, readyGoal) {
@@ -8758,6 +8761,7 @@
     getActiveAudioTrack: NativeUrlProvider.prototype.getActiveAudioTrack
   };
   window.NativeDashProviderForTest = {
+    _maybeEndVodStream: NativeDashProvider.prototype._maybeEndVodStream,
     _candidateVideos: NativeDashProvider.prototype._candidateVideos,
     _chooseForBudget: NativeDashProvider.prototype._chooseForBudget,
     _appendSegmentData: NativeDashProvider.prototype._appendSegmentData,
@@ -8838,6 +8842,7 @@
     compareAudioReps: compareAudioReps
   };
   window.NativeHlsProviderForTest = {
+    _maybeEndVodStream: NativeHlsProvider.prototype._maybeEndVodStream,
     _appendSegmentData: NativeHlsProvider.prototype._appendSegmentData,
     _recoverQuota: NativeHlsProvider.prototype._recoverQuota,
     _handleAppendFailure: NativeHlsProvider.prototype._handleAppendFailure,

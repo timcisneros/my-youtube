@@ -85,7 +85,7 @@ router.get('/', ensureAuth, async (req, res) => {
     mainClass: 'player-page',
     extraHead: `<link rel="preload" href="/api/stream/${videoId}/poster" as="image" fetchpriority="high">\n` +
       (inlineMPD ? '' : `  <link rel="preload" href="/api/stream/${videoId}/dash.mpd?token=${streamToken}" as="fetch" crossorigin fetchpriority="high">\n`) +
-      `  <script src="/native-player-engine.js" defer><\/script>\n` +
+      `  <script src="/native-player-engine.js?v=12" defer><\/script>\n` +
       `  <script>fetch('/api/stream/${videoId}/prefetch')<\/script>`
   });
 

@@ -241,7 +241,7 @@ if (fixtureMode) {
 <head><title>Fixture Watch</title></head>
 <body>
 <video id="player"></video>
-<script src="/native-player-engine.js"></script>
+<script src="/native-player-engine.js?v=12"></script>
 <script>
 var playerDrmServers = {};
 player.configure({ drm: { servers: playerDrmServers } });

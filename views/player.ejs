@@ -234,7 +234,10 @@
       var wantsAutoplay = localStorage.getItem('autoplay') !== '0';
       var isServerLive = <%= video.liveStatus === 'is_live' ? 'true' : 'false' %>;
       var autoplayRetryAttached = false;
+      var autoplayRetryTimer = 0;
+      var autoplayRequestPending = false;
       var autoplayAttemptedMuted = false;
+      var autoplayPolicyMuted = false;
       var autoplaySettled = false;
       var playlistPrevUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.prevUrl : '') %>;
       var playlistNextUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.nextUrl : '') %>;
@@ -253,6 +256,10 @@
           video.removeEventListener('canplay', retry);
           video.removeEventListener('loadeddata', retry);
           video.removeEventListener('playing', retry);
+          if (autoplayRetryTimer) {
+            clearPlayerTimeout(autoplayRetryTimer);
+            autoplayRetryTimer = 0;
+          }
           autoplayRetryAttached = false;
           requestAutoplay('media-ready');
         };
@@ -260,28 +267,40 @@
         video.addEventListener('canplay', retry, { once: true });
         video.addEventListener('loadeddata', retry, { once: true });
         video.addEventListener('playing', retry, { once: true });
+        // A play() request can be aborted after all readiness events have
+        // already fired (for example while MSE finishes attaching). Do not
+        // leave autoplay waiting for an event that will never fire.
+        autoplayRetryTimer = setPlayerTimeout(retry, 250);
         addPlayerCleanup(function () {
           video.removeEventListener('loadedmetadata', retry);
           video.removeEventListener('canplay', retry);
           video.removeEventListener('loadeddata', retry);
           video.removeEventListener('playing', retry);
+          if (autoplayRetryTimer) {
+            clearPlayerTimeout(autoplayRetryTimer);
+            autoplayRetryTimer = 0;
+          }
         });
       }
 
       function requestAutoplay(reason) {
-        if (!wantsAutoplay || autoplaySettled || !video.paused) return Promise.resolve();
+        if (!wantsAutoplay || autoplaySettled || autoplayRequestPending || !video.paused) return Promise.resolve();
+        autoplayRequestPending = true;
         try {
           var playPromise = video.play();
           return Promise.resolve(playPromise).then(function () {
+            autoplayRequestPending = false;
             if (!video.paused) autoplaySettled = true;
             else scheduleAutoplayRetry();
           }).catch(function (err) {
-            var blocked = err && (err.name === 'NotAllowedError' || err.name === 'AbortError');
+            autoplayRequestPending = false;
+            // AbortError means the media request changed while play() was
+            // pending. It is transient, not an autoplay-policy rejection.
+            var blocked = err && err.name === 'NotAllowedError';
             if (blocked && !autoplayAttemptedMuted) {
               autoplayAttemptedMuted = true;
+              autoplayPolicyMuted = true;
               video.muted = true;
-              video.defaultMuted = true;
-              video.setAttribute('muted', '');
               try {
                 return Promise.resolve(video.play()).then(function () {
                   autoplaySettled = true;
@@ -296,6 +315,7 @@
             if (reason !== 'media-ready') scheduleAutoplayRetry();
           });
         } catch {
+          autoplayRequestPending = false;
           scheduleAutoplayRetry();
           return Promise.resolve();
         }
@@ -407,6 +427,7 @@
       // Show spinner during rebuffering (debounced to avoid flash on quick seeks)
       var bufferTimer = 0;
       video.addEventListener('waiting', function () {
+        if (video.ended) return;
         if (engine.isRecovering()) {
           var buf = video.buffered;
           var ct = video.currentTime;
@@ -430,6 +451,10 @@
       video.addEventListener('seeked', function () {
         clearTimeout(bufferTimer); bufferTimer = 0;
         if (!engine.isRecovering() && !video.paused) container.classList.remove('player-buffering');
+      });
+      video.addEventListener('ended', function () {
+        clearTimeout(bufferTimer); bufferTimer = 0;
+        container.classList.remove('player-buffering');
       });
 
       // --- Chapter markers ---

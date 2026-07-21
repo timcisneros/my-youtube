@@ -1,8 +1,11 @@
+    <script>(function(){var loading=document.getElementById('today-loading');if(loading)loading.remove();})();</script>
     <h1>Today's Videos</h1>
     <% if (typeof error !== 'undefined' && error) { %>
-      <p class="error"><%= error %></p>
-    <% } %>
-    <% if (videos.length === 0) { %>
+      <div class="today-error" role="alert">
+        <p class="error"><%= error %></p>
+        <button type="button" onclick="window.location.reload()">Try again</button>
+      </div>
+    <% } else if (videos.length === 0) { %>
       <p class="empty" id="empty-msg">No new videos from your subscriptions today.</p>
       <script>
         (function() {
