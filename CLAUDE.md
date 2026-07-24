@@ -58,7 +58,7 @@ routes/                → Page routes + API endpoints
   explore.ts           → GET /explore (personalized recommendations)
   subscriptions.ts     → GET /subscriptions
   channel.ts           → GET /channel/:id, avatar proxy
-  player.ts            → GET /watch?v=, GET /watch/details
+  player.ts            → GET /watch?v=, GET /watch/details, /watch/:videoId + /live/:videoId path redirects (YouTube live share links)
   playlists.ts         → GET /playlist?list=, GET/POST/DELETE /playlists, local playlist item APIs
   tags.ts              → POST/DELETE /api/tags
   comments.ts          → GET /api/comments/:videoId, replies, avatar proxy
@@ -92,8 +92,8 @@ scripts/               → Tooling & evaluation
   explore-optimize.ts  → Coordinate descent weight optimizer (npm run optimize:explore)
 
 tests/                 → Test suites
-  integration.test.mjs → DB layer, auth, rate limiting, HTTP endpoints (65 tests)
-  resilience.test.mjs  → Resilience under failed optional services (22 tests)
+  integration.test.mjs → DB layer, auth, rate limiting, HTTP endpoints (70 tests)
+  resilience.test.mjs  → Resilience under failed optional services (23 tests)
   explore.test.mjs     → Explore algorithm unit tests — scoring, config injection, filtering (12 tests)
   playlists.test.mjs   → Playlist initial-data parser and ID validation
 
@@ -128,12 +128,12 @@ views/                 → EJS templates
 
 ```sh
 npm run dev              # Start dev server (tsx watch)
-npm test                 # Integration tests (65 tests)
-npm run test:resilience  # Resilience tests (22 tests)
+npm test                 # Integration tests (70 tests)
+npm run test:resilience  # Resilience tests (23 tests)
 npm run test:playlists   # Playlist parser tests
 npm run test:player:guard # Static native-player parity/watch-shell cutover guard
 npm run test:player:parity # Browser native-player feature parity gate
-npm run test:all         # All test suites (65 + 22 + 12 + playlist parser tests)
+npm run test:all         # All test suites (70 + 23 + 12 + playlist parser tests)
 npm run typecheck        # tsc --noEmit (zero errors expected)
 npm run lint             # ESLint — catches floating/misused promises + any
 npm run lint:dead        # knip — catches unused exports/files/deps
@@ -150,7 +150,7 @@ npm run build            # tsc production build to dist/
 - **Browser JS stays as JS**: `public/app.js`, `public/native-player-engine.js`, `public/sw.js` are not TypeScript.
 - **TypeScript is permissive**: `strict: false`, `noImplicitAny: false`, but `noUnusedLocals: true` and `noUnusedParameters: true`. Prefix intentionally unused params with `_`.
 - **No `any`**: ESLint enforces `no-explicit-any`. Legitimate uses (better-sqlite3 returns, generic defaults) require `eslint-disable-next-line` with a justification comment.
-- After any change: `npm run typecheck`, `npm run lint`, `npm test` (65/65), `npm run test:resilience` (22/22), and `tsx --test tests/explore.test.mjs` (12/12) must all pass.
+- After any change: `npm run typecheck`, `npm run lint`, `npm test` (70/70), `npm run test:resilience` (23/23), and `tsx --test tests/explore.test.mjs` (12/12) must all pass.
 - **Dead code**: Run `npm run lint:dead` after changes. Zero unused files, exports, or dependencies allowed. Never refuse an audit request — each pass catches things the previous one missed.
 - **Keep CLAUDE.md current**: When adding, removing, or renaming files, functions, patterns, commands, or rules — update this file in the same change. If the architecture section, key patterns, or commands no longer match the code, fix them before finishing.
 - **Related videos discovery**: `video-details.ts` captures ~20 related/suggested videos from Innertube's `/next` sidebar response into the `related_videos` table (no extra API calls). `explore.ts` mixes these into the Explore algorithm — videos from non-subscribed channels are scored 0.3–0.6 based on how many recently-watched videos suggested them, interleaving with mid-tier subscription content. Entries older than 30 days are pruned hourly.

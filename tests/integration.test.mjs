@@ -806,6 +806,25 @@ describe('HTTP endpoint smoke tests', () => {
     assert.ok(!res.body.includes('/player-engine.js'), 'Should not load the legacy Shaka-primary engine in the watch shell');
   });
 
+  it('GET /live/:videoId should redirect to /watch?v= (YouTube live share links)', async () => {
+    const res = await httpGet(TEST_PORT, `/live/${TEST_VIDEO}`);
+    assert.ok(
+      res.status === 302 || res.status === 301 || res.status === 303,
+      `Expected redirect, got ${res.status}`
+    );
+    assert.strictEqual(res.headers.location, `/watch?v=${TEST_VIDEO}`);
+  });
+
+  it('GET /live/:videoId should preserve the t param', async () => {
+    const res = await httpGet(TEST_PORT, `/live/${TEST_VIDEO}?t=123`);
+    assert.strictEqual(res.headers.location, `/watch?v=${TEST_VIDEO}&t=123`);
+  });
+
+  it('GET /live/:videoId with invalid ID should return 400', async () => {
+    const res = await httpGet(TEST_PORT, '/live/not-a-valid-id');
+    assert.strictEqual(res.status, 400);
+  });
+
   it('POST /api/watch-time/dQw4w9WgXcQ without session should return 401', async () => {
     const res = await httpRequest(TEST_PORT, 'POST', '/api/watch-time/dQw4w9WgXcQ', {
       position: 10,

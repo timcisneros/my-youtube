@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, Request, Response } from 'express';
 import { ensureAuth, createStreamToken } from '../auth.js';
 import { getVideoDetails, enrichFromNext, getPlaylistDetails, sanitizePlaylistId } from '../youtube/index.js';
 import { buildMPD, bgDownloads } from './stream/index.js';
@@ -198,12 +198,17 @@ router.get('/token', ensureAuth, (req, res) => {
   res.json({ token: createStreamToken(videoId) });
 });
 
-// Legacy path-based URLs: /watch/:videoId → /watch?v=videoId
-router.get('/:videoId', (req, res) => {
+// Path-based video URLs → /watch?v=videoId
+// Used for legacy /watch/:videoId links and YouTube /live/:videoId share links
+// (the latter is mounted at /live in server.ts).
+export function redirectPathVideoId(req: Request<{ videoId: string }>, res: Response) {
   const videoId = req.params.videoId;
   if (!/^[A-Za-z0-9_-]{11}$/.test(videoId)) return res.status(400).end();
   const t = parseInt(req.query.t as string, 10) || 0;
   res.redirect('/watch?v=' + videoId + (t ? '&t=' + t : ''));
-});
+}
+
+// Legacy path-based URLs: /watch/:videoId → /watch?v=videoId
+router.get('/:videoId', redirectPathVideoId);
 
 export default router;

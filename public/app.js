@@ -888,6 +888,7 @@ function ytUrlToLocal(url) {
       if (u.pathname.startsWith('/channel/')) return u.pathname;
       if (u.pathname.startsWith('/@')) return '/channel/' + u.pathname.slice(1);
       if (u.pathname.startsWith('/shorts/')) return '/watch?v=' + u.pathname.slice(8);
+      if (u.pathname.startsWith('/live/') && u.pathname.length > 6) return '/watch?v=' + u.pathname.slice(6) + (u.searchParams.get('t') ? '&t=' + u.searchParams.get('t') : '');
     }
     if (host === 'youtu.be') {
       var id = u.pathname.slice(1);

@@ -290,7 +290,7 @@ runPlayerCleanupTasks();
     { default: todayRouter },
     { default: subscriptionsRouter },
     { default: channelRouter },
-    { default: playerRouter },
+    { default: playerRouter, redirectPathVideoId },
     { default: playlistRouter },
     { default: tagsRouter },
     { default: commentsRouter },
@@ -335,6 +335,8 @@ runPlayerCleanupTasks();
   app.use('/subscriptions', subscriptionsRouter);
   app.use('/channel', channelRouter);
   app.use('/watch', playerRouter);
+  // YouTube /live/:videoId share links → /watch?v=videoId
+  app.get('/live/:videoId', redirectPathVideoId);
   app.use('/playlist', playlistRouter);
   app.use('/playlists', playlistRouter);
   app.use('/api/tags', tagsRouter);
