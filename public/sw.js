@@ -1,6 +1,6 @@
 importScripts('/idb-helpers.js');
 // Service Worker — cache-first for static assets, segment caching for video proxy
-var STATIC_CACHE = 'my-youtube-static-v12';
+var STATIC_CACHE = 'my-youtube-static-v13';
 var SEGMENT_CACHE = 'my-youtube-segments-v5';
 var IMAGE_CACHE = 'my-youtube-images-v1';
 var APP_SHELL_CACHE = 'my-youtube-shell-v1';
@@ -48,6 +48,22 @@ function withSourceHeaders(response, source, offline) {
     statusText: response.statusText,
     headers: headers
   });
+}
+
+// Synthetic 503 for network-unreachable cache misses. X-SW-Offline is only stamped
+// when the browser itself is offline — when the server is down but the browser is
+// online, the player must see a plain server error so its network-hold/probe
+// recovery engages (an X-SW-Offline stamp would veto the hold and stall playback).
+function networkMissResponse() {
+  // Do not claim the browser is offline unless the worker can positively observe it.
+  // Older worker implementations may not expose Navigator.onLine.
+  var offline = !!(self.navigator && 'onLine' in self.navigator && self.navigator.onLine === false);
+  var headers = {
+    'X-SW-Cached': '0',
+    'X-SW-Source': 'miss'
+  };
+  if (offline) headers['X-SW-Offline'] = '1';
+  return new Response('', { status: 503, headers: headers });
 }
 
 function putHlsProxyResponse(cache, cacheKey, response) {
@@ -189,7 +205,7 @@ function buildOfflineWatchPage(bundle) {
     + '    <div class="video-channel">' + channelTitle + '</div>\n'
     + '  </div>\n'
     + '</main>\n'
-    + '<script src="/native-player-engine.js?v=12"><\/script>\n'
+    + '<script src="/native-player-engine.js?v=13"><\/script>\n'
     + '<script src="/idb-helpers.js"><\/script>\n'
     + '<script src="/app.js"><\/script>\n'
     + '<script>\n'
@@ -317,14 +333,7 @@ self.addEventListener('fetch', function (event) {
           return response;
         }).catch(function () {
           return cache.match(hlsPlaylistCacheKey).then(function (cached) {
-            if (!cached) return new Response('', {
-              status: 503,
-              headers: {
-                'X-SW-Cached': '0',
-                'X-SW-Offline': '1',
-                'X-SW-Source': 'miss'
-              }
-            });
+            if (!cached) return networkMissResponse();
             var online = self.navigator && 'onLine' in self.navigator ? self.navigator.onLine : false;
             return withSourceHeaders(cached, 'app-shell', !online);
           });
@@ -375,14 +384,7 @@ self.addEventListener('fetch', function (event) {
             return response;
           }).catch(function () {
             return cache.match(hlsProxyCacheKey).then(function (retry) {
-              return retry ? withSourceHeaders(retry, 'segment-cache', true) : new Response('', {
-                status: 503,
-                headers: {
-                  'X-SW-Cached': '0',
-                  'X-SW-Offline': '1',
-                  'X-SW-Source': 'miss'
-                }
-              });
+              return retry ? withSourceHeaders(retry, 'segment-cache', true) : networkMissResponse();
             });
           });
         });
@@ -407,7 +409,7 @@ self.addEventListener('fetch', function (event) {
             }
             return response;
           }).catch(function () {
-            return new Response('', { status: 503 });
+            return networkMissResponse();
           });
         });
       })
@@ -518,14 +520,7 @@ self.addEventListener('fetch', function (event) {
                 return response;
               }).catch(function () {
                 return cache.match(fmtCacheKey).then(function (retry) {
-                  return retry ? withSourceHeaders(retry, 'segment-cache', true) : new Response('', {
-                    status: 503,
-                    headers: {
-                      'X-SW-Cached': '0',
-                      'X-SW-Offline': '1',
-                      'X-SW-Source': 'miss'
-                    }
-                  });
+                  return retry ? withSourceHeaders(retry, 'segment-cache', true) : networkMissResponse();
                 });
               });
             });
@@ -534,14 +529,7 @@ self.addEventListener('fetch', function (event) {
         .catch(function () {
           // IDB error — fall through to network
           return fetch(event.request).catch(function () {
-            return new Response('', {
-              status: 503,
-              headers: {
-                'X-SW-Cached': '0',
-                'X-SW-Offline': '1',
-                'X-SW-Source': 'miss'
-              }
-            });
+            return networkMissResponse();
           });
         })
     );

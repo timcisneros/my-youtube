@@ -754,6 +754,12 @@ describe('HTTP endpoint smoke tests', () => {
     assert.strictEqual(res.status, 204);
   });
 
+  it('GET /native-player-engine.js should always revalidate the player runtime', async () => {
+    const res = await httpGet(TEST_PORT, '/native-player-engine.js?v=13');
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers['cache-control'] || '', /no-cache/);
+  });
+
   it('GET /auth/login should return 200', async () => {
     const res = await httpGet(TEST_PORT, '/auth/login');
     assert.strictEqual(res.status, 200);

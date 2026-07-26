@@ -417,12 +417,14 @@
       }
 
       // Resume playback when restored from browser bfcache (back from external site)
-      window.addEventListener('pageshow', function (e) {
+      var onPlayerPageShow = function (e) {
         if (e.persisted && wantsAutoplay && video.paused) {
           video.currentTime = 0;
           video.play().catch(function () {});
         }
-      });
+      };
+      window.addEventListener('pageshow', onPlayerPageShow);
+      addPlayerCleanup(function () { window.removeEventListener('pageshow', onPlayerPageShow); });
 
       // Show spinner during rebuffering (debounced to avoid flash on quick seeks)
       var bufferTimer = 0;
@@ -767,8 +769,7 @@
                   stopStatusPoll();
                   finalVia = (data.via || 'yt-dlp') + '/progressive';
                   setStreamVia('buffering...');
-                  video.src = data.progressive;
-                  return requestAutoplay('progressive-fallback');
+                  return player.load(data.progressive, undefined, 'video/mp4');
                 }
                 stopStatusPoll();
                 var err = new Error(data.error || 'No suitable formats found');

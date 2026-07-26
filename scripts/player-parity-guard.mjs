@@ -181,10 +181,10 @@ const nativeEngine = readText('public/native-player-engine.js');
   ['NativeHlsProvider.prototype._schedulerTime = function ()', 'first-party HLS scheduler must use pending startup/seek targets while buffers fill'],
   ['NativeHlsProvider.prototype._alignHlsBufferedTarget = function ()', 'first-party HLS must realign the playhead once live target media is buffered'],
   ['function hlsSeekTargetInsideSegment(provider, target)', 'first-party HLS live seek targets must land inside playable segment ranges'],
-  ['function hlsFmp4TimestampOffset(provider, track, seg)', 'first-party HLS fMP4 appends must map live fragments onto the provider timeline'],
+  ['function hlsFmp4TimestampOffset()', 'first-party HLS fMP4 appends must preserve the CMAF tfdt timeline'],
   ['function hlsLiveTimestampOffset(provider, track, seg)', 'first-party HLS TS transmuxed appends must map live fragments onto the provider timeline'],
   ['appendBuffer(sb, output.data, null, hlsLiveTimestampOffset(self, track, seg))', 'first-party HLS transmuxed media appends must pass timestamp offsets'],
-  ['appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset(self, track, seg))', 'first-party HLS fMP4 media appends must pass timestamp offsets'],
+  ['appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset())', 'first-party HLS fMP4 media appends must preserve embedded timestamps'],
   ['SOURCEBUFFER_WATCHDOG_MS', 'native SourceBuffer append watchdog must be centralized and short enough for live playback'],
   ['SEGMENT_BUSY_WATCHDOG_MS', 'native HLS append ordering must not remain blocked behind stale busy segments'],
   ["reject(new Error('sourcebuffer-timeout'))", 'native SourceBuffer appends must not leave live HLS queues permanently stuck'],
@@ -207,6 +207,13 @@ const nativeEngine = readText('public/native-player-engine.js');
   ['/(range|manifest)-http-(403|404|410|416|5\\d\\d)|Failed to fetch|Load failed|network/i', 'refreshable HLS request classification must include media playlist HTTP failures'],
   ['new NativeUrlProvider(self, progressiveUrl, \'progressive\')', 'progressive URL provider must receive the stamped progressive URL'],
 ].forEach(([needle, message]) => assertIncludes('public/native-player-engine.js', nativeEngine, needle, message));
+
+assertNoAssetReference(
+  'public/native-player-engine.js',
+  nativeEngine,
+  'hlsFmp4TimestampOffset(self, track, seg)',
+  'first-party HLS fMP4 must not add playlist time on top of embedded tfdt timestamps'
+);
 
 const hlsRoutes = readText('routes/stream/hls.ts');
 [

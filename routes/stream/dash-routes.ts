@@ -97,7 +97,7 @@ function mountDashRoutes(router) {
   });
 
   const serveTemplateFixture = (req, res) => {
-    const part = req.params.kind === 'init' ? 'init' : req.params.part;
+    const part = req.params.part || 'init';
     if (part && serveFixtureTemplatePart(req.params.videoId, req.params.formatId, part, req, res)) return;
     res.status(404).json({ error: 'Template fixture part not found' });
   };

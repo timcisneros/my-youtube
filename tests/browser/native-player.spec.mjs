@@ -2141,6 +2141,46 @@ test('native adapter unload clears provider state and stays reusable', async ({ 
   expect(shakaRequests).toHaveLength(0);
 });
 
+test('native adapter unload clears stale overlapping loads', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const engine = new window.PlayerEngine(document.getElementById('player'), {
+      videoId: 'TESTVIDEO01',
+      streamToken: 'test-token',
+    });
+    const player = engine.getPlayer();
+    const pending = {};
+    engine._loadNative = function (url) {
+      return new Promise(resolve => { pending[url] = resolve; });
+    };
+
+    const first = player.load('/slow.mpd').then(
+      () => ({ ok: true }),
+      err => ({ ok: false, name: err.name, message: err.message })
+    );
+    await Promise.resolve();
+    const second = player.load('/current.mpd');
+    await Promise.resolve();
+    pending['/current.mpd']();
+    await second;
+    pending['/slow.mpd']();
+
+    return {
+      first: await first,
+      state: engine._state,
+      generation: engine._loadGeneration,
+      pendingStartTime: engine._pendingLoadStartTime,
+    };
+  });
+
+  expect(state.first).toMatchObject({ ok: false, name: 'AbortError' });
+  expect(state.state).toBe('loading');
+  expect(state.generation).toBe(2);
+  expect(state.pendingStartTime).toBe(null);
+});
+
 test('native load honors startTime and HLS MIME hints', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -3186,6 +3226,8 @@ test('watch page renders centralized autoplay retry and end buffering cleanup', 
   expect(player).toContain('autoplayRetryTimer = setPlayerTimeout(retry, 250);');
   expect(player).toContain("video.addEventListener('ended', function () {");
   expect(player).toContain("container.classList.remove('player-buffering');");
+  expect(player).toContain("return player.load(data.progressive, undefined, 'video/mp4')");
+  expect(player).not.toContain('video.src = data.progressive');
   expect(controls).toContain("localStorage.getItem('player-muted-v2')");
   expect(controls).toContain("if (!autoplayPolicyMuted) localStorage.setItem('player-muted-v2'");
 });
@@ -3195,11 +3237,11 @@ test('service-worker segment cache keeps the current player runtime ahead of cac
   const route = readFileSync('routes/player.ts', 'utf8');
   const head = readFileSync('views/partials/head.ejs', 'utf8');
 
-  expect(worker).toContain("var STATIC_CACHE = 'my-youtube-static-v12';");
+  expect(worker).toContain("var STATIC_CACHE = 'my-youtube-static-v13';");
   expect(worker).toContain("var NETWORK_FIRST_STATIC = [\n  '/idb-helpers.js',\n  '/app.js',\n  '/native-player-engine.js'\n];");
   expect(worker).toContain('if (NETWORK_FIRST_STATIC.indexOf(url.pathname) !== -1)');
-  expect(route).toContain('/native-player-engine.js?v=12');
-  expect(head).toContain('/native-player-engine.js?v=12');
+  expect(route).toContain('/native-player-engine.js?v=13');
+  expect(head).toContain('/native-player-engine.js?v=13');
 });
 
 test('service-worker segment cache leaves the first streamed Today page intact during install', () => {
@@ -3736,6 +3778,289 @@ test('native networking holds transient server errors and resumes the same reque
   expect(shakaRequests).toHaveLength(0);
 });
 
+test('native networking holds transient online service-worker offline 503 responses', async ({ page }) => {
+  let segmentAttempts = 0;
+  let probeAttempts = 0;
+
+  await page.route('**/sw-network-miss-segment.m4s', route => {
+    segmentAttempts++;
+    route.fulfill({
+      status: segmentAttempts === 1 ? 503 : 200,
+      contentType: 'application/octet-stream',
+      headers: segmentAttempts === 1 ? {
+        'X-SW-Cached': '0',
+        'X-SW-Offline': '1',
+        'X-SW-Source': 'miss',
+      } : {},
+      body: segmentAttempts === 1 ? '' : 'ok',
+    });
+  });
+  await page.route('**/api/stream/SWHOLDTEST/dash.mpd**', route => {
+    probeAttempts++;
+    route.fulfill({ status: 200, contentType: 'application/dash+xml', body: '' });
+  });
+  await page.route('**/api/player-events', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }));
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'SWHOLDTEST', streamToken: 'test-token' });
+    await engine.init();
+    engine._setState('ready');
+    const events = [];
+    engine.on('server-down', reason => events.push({ type: 'server-down', reason }));
+    engine.on('server-up', () => events.push({ type: 'server-up' }));
+    const networking = engine.getPlayer().getNetworkingEngine();
+    const response = await networking.request(
+      networking.RequestType.SEGMENT,
+      { uris: ['/sw-network-miss-segment.m4s'] },
+      { forceNetworkHold: true }
+    );
+    return {
+      status: response.status,
+      body: new TextDecoder().decode(response.data),
+      events,
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(segmentAttempts).toBe(2);
+  expect(probeAttempts).toBeGreaterThan(0);
+  expect(state.status).toBe(200);
+  expect(state.body).toBe('ok');
+  expect(state.events).toEqual([{ type: 'server-down', reason: 'server-error' }, { type: 'server-up' }]);
+  expect(state.stats.networkHoldCount).toBe(1);
+  expect(state.stats.networkResumeCount).toBe(1);
+  expect(state.stats.networkHeldRequestCount).toBe(0);
+});
+
+test('native networking holds transient errors without looping forever on persistent failures', async ({ page }) => {
+  let segmentAttempts = 0;
+  let probeAttempts = 0;
+
+  await page.route('**/persistent-server-error.m4s', route => {
+    segmentAttempts++;
+    route.fulfill({ status: 503, contentType: 'text/plain', body: 'still unavailable' });
+  });
+  await page.route('**/api/stream/HOLDBUDGET1/dash.mpd**', route => {
+    probeAttempts++;
+    route.fulfill({ status: 200, contentType: 'application/dash+xml', body: '' });
+  });
+  await page.route('**/api/player-events', route => route.fulfill({ status: 200, contentType: 'application/json', body: '{"ok":true}' }));
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'HOLDBUDGET1', streamToken: 'test-token' });
+    await engine.init();
+    engine._setState('ready');
+    const networking = engine.getPlayer().getNetworkingEngine();
+    const response = await networking.request(
+      networking.RequestType.SEGMENT,
+      { uris: ['/persistent-server-error.m4s'] },
+      { forceNetworkHold: true }
+    );
+    return {
+      status: response.status,
+      recovering: engine.isRecovering(),
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(segmentAttempts).toBe(3);
+  expect(probeAttempts).toBe(2);
+  expect(state.status).toBe(503);
+  expect(state.recovering).toBe(false);
+  expect(state.stats.networkHoldCount).toBe(2);
+  expect(state.stats.networkResumeCount).toBe(2);
+  expect(state.stats.networkHeldRequestCount).toBe(0);
+});
+
+test('native networking does not hold a service-worker 503 while the browser is offline', async ({ page }) => {
+  let segmentAttempts = 0;
+  let probeAttempts = 0;
+
+  await page.route('**/sw-offline-segment.m4s', route => {
+    segmentAttempts++;
+    route.fulfill({
+      status: 503,
+      headers: {
+        'X-SW-Cached': '0',
+        'X-SW-Offline': '1',
+        'X-SW-Source': 'miss',
+      },
+      body: '',
+    });
+  });
+  await page.route('**/api/stream/SWOFFLINE/dash.mpd**', route => {
+    probeAttempts++;
+    route.fulfill({ status: 200, contentType: 'application/dash+xml', body: '' });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, get: () => false });
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'SWOFFLINE', streamToken: 'test-token' });
+    await engine.init();
+    engine._setState('ready');
+    const networking = engine.getPlayer().getNetworkingEngine();
+    const response = await networking.request(
+      networking.RequestType.SEGMENT,
+      { uris: ['/sw-offline-segment.m4s'] },
+      { forceNetworkHold: true }
+    );
+    return {
+      status: response.status,
+      stats: engine.getPlayer().getStats(),
+    };
+  });
+
+  expect(segmentAttempts).toBe(1);
+  expect(probeAttempts).toBe(0);
+  expect(state.status).toBe(503);
+  expect(state.stats.networkHoldCount).toBe(0);
+  expect(state.stats.networkResumeCount).toBe(0);
+});
+
+test('native networking holds transient hung server probes with bounded timeouts', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const originalFetch = window.fetch;
+    let abortCount = 0;
+    window.fetch = function (_url, opts) {
+      return new Promise((_resolve, reject) => {
+        opts.signal.addEventListener('abort', () => {
+          abortCount++;
+          const err = new Error('probe-aborted');
+          err.name = 'AbortError';
+          reject(err);
+        }, { once: true });
+      });
+    };
+    try {
+      const video = document.getElementById('player');
+      const engine = new window.PlayerEngine(video, {
+        videoId: 'PROBETIMEOUT',
+        streamToken: 'test-token',
+        serverProbeTimeoutMs: 100,
+      });
+      await engine.init();
+      engine._enterServerDown('network-error');
+      await new Promise(resolve => setTimeout(resolve, 160));
+      const result = {
+        abortCount,
+        recovering: engine.isRecovering(),
+        activeProbe: !!engine._serverProbeController,
+        retryScheduled: !!engine._serverProbeTimer,
+      };
+      engine.destroy();
+      return result;
+    } finally {
+      window.fetch = originalFetch;
+    }
+  });
+
+  expect(state.abortCount).toBe(1);
+  expect(state.recovering).toBe(true);
+  expect(state.activeProbe).toBe(false);
+  expect(state.retryScheduled).toBe(true);
+});
+
+test('native networking refreshes token without expiring transient server failures', async ({ page }) => {
+  await page.route('**/watch/token**', route => {
+    route.fulfill({ status: 503, contentType: 'application/json', body: '{"error":"restarting"}' });
+  });
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TOKENRETRY1', streamToken: 'old-token' });
+    await engine.init();
+    engine._startServerProbe = function () {};
+    engine._serverDown = true;
+    engine.networkTrouble = true;
+    let authExpired = 0;
+    engine.on('auth-expired', () => { authExpired++; });
+    const held = engine._waitForServerRecovery().catch(() => {});
+    await engine._refreshToken();
+    const result = {
+      authExpired,
+      recovering: engine.isRecovering(),
+      networkTrouble: engine.networkTrouble,
+      heldRequests: engine._heldRequests.length,
+      refreshingToken: engine._refreshingToken,
+    };
+    engine.destroy();
+    await held;
+    return result;
+  });
+
+  expect(state.authExpired).toBe(0);
+  expect(state.recovering).toBe(true);
+  expect(state.networkTrouble).toBe(true);
+  expect(state.heldRequests).toBe(1);
+  expect(state.refreshingToken).toBe(false);
+});
+
+test('native URL runtime error enters server recovery and reloads with a fresh token', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    let loadCount = 0;
+    video.load = function () { loadCount++; };
+    Object.defineProperty(video, 'error', { configurable: true, get: () => ({ code: 2 }) });
+    const engine = new window.PlayerEngine(video, { videoId: 'URLRECOVERY', streamToken: 'old-token' });
+    await engine.init();
+    engine._startServerProbe = function () {};
+    const native = window.NativeUrlProviderForTest;
+    const provider = {
+      engine,
+      video,
+      url: '/api/stream/URLRECOVERY/proxy/18?token=old-token',
+      mode: 'progressive',
+      retryCount: 0,
+      recoveryCount: 0,
+      lastError: '',
+      assetUri: '',
+      isLive: native.isLive,
+      resumeAfterServerRecovery: native.resumeAfterServerRecovery,
+    };
+    engine._provider = provider;
+    native._onRuntimeError.call(provider);
+    const enteredRecovery = engine.isRecovering();
+    engine.streamToken = 'fresh-token';
+    engine._exitServerDown();
+    return {
+      enteredRecovery,
+      recoveringAfterExit: engine.isRecovering(),
+      loadCount,
+      recoveryCount: provider.recoveryCount,
+      lastError: provider.lastError,
+      assetUri: provider.assetUri,
+    };
+  });
+
+  expect(state.enteredRecovery).toBe(true);
+  expect(state.recoveringAfterExit).toBe(false);
+  expect(state.loadCount).toBe(1);
+  expect(state.recoveryCount).toBe(1);
+  expect(state.lastError).toBe('server-recovery');
+  expect(state.assetUri).toContain('token=fresh-token');
+  expect(state.assetUri).not.toContain('token=old-token');
+});
+
 test('native networking refreshes token before resuming held 401 requests', async ({ page }) => {
   let segmentAttempts = 0;
   let tokenRequests = 0;
@@ -3796,6 +4121,142 @@ test('native networking refreshes token before resuming held 401 requests', asyn
   expect(state.stats.networkHoldReason).toBe('token-expired');
   expect(state.stats.fallbackReason || '').toBe('');
   expect(shakaRequests).toHaveLength(0);
+});
+
+test('native networking holds transient server restart during DASH playback and resumes media', async ({ page }) => {
+  let serverDown = false;
+  await page.route('**/api/stream/PLAYERTEST1/**', route => {
+    if (!serverDown) return route.continue();
+    return route.fulfill({
+      status: 503,
+      contentType: 'text/plain',
+      body: 'server restarting',
+    });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline></video>');
+
+  await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    const engine = new window.PlayerEngine(video, {
+      videoId: 'PLAYERTEST1',
+      streamToken: '',
+      serverProbeTimeoutMs: 500,
+    });
+    const events = [];
+    engine.on('server-down', () => events.push('down'));
+    engine.on('server-up', () => events.push('up'));
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__recoveryEvents = events;
+    window.__player.configure({
+      streaming: { bufferingGoal: 1, startupBufferGoal: 0.5, maxConcurrentRequests: 1 },
+    });
+    await engine.init();
+    await window.__player.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureTemplate=timeline');
+    await video.play();
+  });
+
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0.15);
+  const before = await page.evaluate(() => document.getElementById('player').currentTime);
+  serverDown = true;
+
+  await expect.poll(
+    () => page.evaluate(() => window.__engine.isRecovering()),
+    { timeout: 10_000 }
+  ).toBe(true);
+  await expect.poll(
+    () => page.evaluate(() => window.__recoveryEvents.includes('down'))
+  ).toBe(true);
+
+  serverDown = false;
+  await expect.poll(
+    () => page.evaluate(() => window.__recoveryEvents.includes('up')),
+    { timeout: 12_000 }
+  ).toBe(true);
+  await page.waitForFunction(
+    target => document.getElementById('player').currentTime > target + 1,
+    before,
+    { timeout: 12_000 }
+  );
+
+  const state = await page.evaluate(() => ({
+    recovering: window.__engine.isRecovering(),
+    events: window.__recoveryEvents,
+    stats: window.__player.getStats(),
+  }));
+  expect(state.recovering).toBe(false);
+  expect(state.events).toEqual(['down', 'up']);
+  expect(state.stats.networkHoldCount).toBeGreaterThan(0);
+  expect(state.stats.networkResumeCount).toBeGreaterThan(0);
+  expect(state.stats.fallbackReason).toBe('');
+});
+
+test('native networking holds transient server restart during HLS playback and resumes media', async ({ page }) => {
+  let serverDown = false;
+  await page.route('**/api/stream/PLAYERTEST1/**', route => {
+    if (!serverDown) return route.continue();
+    return route.fulfill({ status: 503, contentType: 'text/plain', body: 'server restarting' });
+  });
+
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline></video>');
+
+  await page.evaluate(async () => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, {
+      videoId: 'PLAYERTEST1',
+      streamToken: '',
+      serverProbeTimeoutMs: 500,
+    });
+    const events = [];
+    engine.on('server-down', () => events.push('down'));
+    engine.on('server-up', () => events.push('up'));
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__recoveryEvents = events;
+    window.__player.configure({
+      streaming: { bufferingGoal: 1, startupBufferGoal: 0.5, maxConcurrentRequests: 1 },
+    });
+    await engine.init();
+    await window.__player.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=1');
+    await video.play();
+  });
+
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0.15);
+  const before = await page.evaluate(() => document.getElementById('player').currentTime);
+  serverDown = true;
+
+  await expect.poll(
+    () => page.evaluate(() => window.__engine.isRecovering()),
+    { timeout: 10_000 }
+  ).toBe(true);
+  serverDown = false;
+  await expect.poll(
+    () => page.evaluate(() => window.__recoveryEvents.includes('up')),
+    { timeout: 12_000 }
+  ).toBe(true);
+  await page.waitForFunction(
+    target => document.getElementById('player').currentTime > target + 1,
+    before,
+    { timeout: 12_000 }
+  );
+
+  const state = await page.evaluate(() => ({
+    recovering: window.__engine.isRecovering(),
+    events: window.__recoveryEvents,
+    stats: window.__player.getStats(),
+  }));
+  expect(state.recovering).toBe(false);
+  expect(state.events).toEqual(['down', 'up']);
+  expect(state.stats.provider).toBe('native-hls');
+  expect(state.stats.networkHoldCount).toBeGreaterThan(0);
+  expect(state.stats.networkResumeCount).toBeGreaterThan(0);
+  expect(state.stats.fallbackReason).toBe('');
 });
 
 test('native networking does not hold permanent media statuses', async ({ page }) => {
@@ -7356,10 +7817,10 @@ test('native live adapters expose live range and seek to live edge through lifec
   expect(state.dash.ticked).toBe(true);
 
   expect(state.hls.range).toEqual({ start: 50, end: 80 });
-  expect(state.hls.currentTime).toBe(74);
+  expect(state.hls.currentTime).toBe(74.05);
   expect(state.hls.seekCount).toBe(1);
   expect(state.hls.seekBufferPending).toBe(true);
-  expect(state.hls.lastSeekTarget).toBe(74);
+  expect(state.hls.lastSeekTarget).toBe(74.05);
   expect(state.hls.states).toContain('seeking');
   expect(state.hls.ticked).toBe(true);
   expect(shakaRequests).toHaveLength(0);

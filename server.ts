@@ -152,7 +152,21 @@ app.post('/api/player-events', (req, res) => {
   res.json({ ok: true });
 });
 
-app.use(express.static(path.join(import.meta.dirname, 'public'), { maxAge: '1d' }));
+app.use(express.static(path.join(import.meta.dirname, 'public'), {
+  maxAge: '1d',
+  setHeaders(res, filePath) {
+    const runtimeAsset = path.basename(filePath);
+    if (runtimeAsset === 'sw.js'
+      || runtimeAsset === 'app.js'
+      || runtimeAsset === 'native-player-engine.js'
+      || runtimeAsset === 'idb-helpers.js') {
+      // These files coordinate persistent browser state. Revalidate them on each
+      // navigation so an otherwise-fresh HTTP cache cannot pin an old player or
+      // service worker after a playback fix is deployed.
+      res.setHeader('Cache-Control', 'no-cache');
+    }
+  },
+}));
 const dataDir = path.join(import.meta.dirname, 'data');
 if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir);
 
@@ -241,7 +255,7 @@ if (fixtureMode) {
 <head><title>Fixture Watch</title></head>
 <body>
 <video id="player"></video>
-<script src="/native-player-engine.js?v=12"></script>
+<script src="/native-player-engine.js?v=13"></script>
 <script>
 var playerDrmServers = {};
 player.configure({ drm: { servers: playerDrmServers } });
@@ -431,8 +445,8 @@ async function createFixtureStreamRouter() {
     if (!serveFixtureFormat(req.params.videoId, req.params.formatId, req, res)) res.status(404).end();
   });
   const serveTemplateFixture = (req: express.Request, res: express.Response) => {
-    const params = req.params as { videoId: string; formatId: string; kind: string; part?: string };
-    const part = params.kind === 'init' ? 'init' : params.part;
+    const params = req.params as { videoId: string; formatId: string; part?: string };
+    const part = params.part || 'init';
     if (part && serveFixtureTemplatePart(params.videoId, params.formatId, part, req, res)) return;
     res.status(404).json({ error: 'Template fixture part not found' });
   };

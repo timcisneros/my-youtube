@@ -26,6 +26,7 @@
   var MAX_CONCURRENT_MEDIA_REQUESTS = 3;
   var SOURCEBUFFER_WATCHDOG_MS = 1200;
   var SEGMENT_BUSY_WATCHDOG_MS = 2500;
+  var MAX_NETWORK_HOLD_CYCLES = 2;
 
   function PlayerEngine(videoElement, opts) {
     this.video = videoElement;
@@ -42,6 +43,9 @@
     this._recovering = false;
     this._heldRequests = [];
     this._networkHoldStartedAt = 0;
+    this._serverProbeController = null;
+    this._serverProbeTimeoutMs = Math.max(100, Number(opts.serverProbeTimeoutMs) || 5000);
+    this._refreshTokenPromise = null;
     this._cleanups = [];
     this._initialized = false;
     this._provider = null;
@@ -51,6 +55,7 @@
     this._fallbackReason = '';
     this._nativeTerminalReason = '';
     this._loadStartedAt = 0;
+    this._loadGeneration = 0;
     this._offlinePlayback = false;
     this._manifestFromServiceWorker = false;
     this._lastOfflineError = '';
@@ -153,6 +158,8 @@
 
   PlayerEngine.prototype.load = function (url, startTime, mimeType) {
     var self = this;
+    if (this.destroyed) return Promise.reject(new Error('player-destroyed'));
+    var generation = ++this._loadGeneration;
     url = url || this.manifestUrl;
     this._pendingLoadStartTime = isFinite(Number(startTime)) && Number(startTime) >= 0 ? Number(startTime) : null;
     this.setLive(false);
@@ -161,23 +168,29 @@
     this._telemetry.record('load-start');
     this._setState('loading');
     return Promise.resolve().then(function () {
-      return self._loadNative(url, mimeType);
+      return self._loadNative(url, mimeType, generation);
     }).then(function () {
+      if (generation !== self._loadGeneration) throw abortError();
       return seekToStartTime(self, startTime);
     }).catch(function (err) {
+      if (generation !== self._loadGeneration || err && err.name === 'AbortError') throw abortError();
       if (err && err.serverError) throw err;
       if (self._shouldKeepNativeOffline(err)) throw err;
       if (isNativeTerminalError(err)) return self._completeNativeTerminalError(err);
       if (isNativeLoadTerminalError(err)) return self._completeNativeTerminalError(nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed'));
       return self._completeNativeTerminalError(nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed'));
     }).then(function (value) {
-      self._pendingLoadStartTime = null;
+      if (generation === self._loadGeneration) self._pendingLoadStartTime = null;
       return value;
+    }, function (err) {
+      if (generation === self._loadGeneration) self._pendingLoadStartTime = null;
+      throw err;
     });
   };
 
-  PlayerEngine.prototype._loadNative = function (url, mimeType) {
+  PlayerEngine.prototype._loadNative = function (url, mimeType, generation) {
     var self = this;
+    if (generation != null && generation !== this._loadGeneration) return Promise.reject(abortError());
     this._destroyProvider();
     if (isLikelyNativeUrl(url) || isHlsMimeType(mimeType)) {
       if ((/\.m3u8(\?|$)/i.test(url) || isHlsMimeType(mimeType)) && shouldUseFirstPartyHls(url)) {
@@ -202,6 +215,7 @@
       return this._provider.load();
     }
     return fetchManifest(self, url).then(function (manifest) {
+      if (generation != null && generation !== self._loadGeneration) throw abortError();
       self._recordManifestSource(manifest);
       self._finalVia = manifest.via || self._finalVia;
       if (manifest.via) self.emit('via', manifest.via);
@@ -358,7 +372,10 @@
     }, 1000);
     function probe() {
       if (!self._serverDown || self.destroyed) return;
-      fetch(self.manifestUrl, { method: 'HEAD' })
+      var controller = new AbortController();
+      self._serverProbeController = controller;
+      var probeTimeout = setTimeout(function () { controller.abort(); }, self._serverProbeTimeoutMs);
+      fetch(self.manifestUrl, { method: 'HEAD', signal: controller.signal })
         .then(function (r) {
           if (!self._serverDown) return;
           if (r.status === 401) {
@@ -369,6 +386,8 @@
         })
         .catch(function () {})
         .then(function () {
+          clearTimeout(probeTimeout);
+          if (self._serverProbeController === controller) self._serverProbeController = null;
           if (!self._serverDown || self.destroyed) return;
           self._serverProbeTimer = setTimeout(probe, 3000 + Math.random() * 2000);
         });
@@ -379,6 +398,10 @@
   PlayerEngine.prototype._stopServerProbe = function () {
     if (this._serverProbeTimer) { clearTimeout(this._serverProbeTimer); this._serverProbeTimer = null; }
     if (this._serverElapsedTimer) { clearInterval(this._serverElapsedTimer); this._serverElapsedTimer = null; }
+    if (this._serverProbeController) {
+      try { this._serverProbeController.abort(); } catch (e) {}
+      this._serverProbeController = null;
+    }
   };
 
   PlayerEngine.prototype._exitServerDown = function () {
@@ -388,6 +411,11 @@
     this._stopServerProbe();
     this.lastGoodTime = Math.max(this.lastGoodTime, this.video.currentTime || 0);
     console.log('[player-engine] server back, releasing ' + this._heldRequests.length + ' held requests');
+    if (this._provider && this._provider.resumeAfterServerRecovery) {
+      try { this._provider.resumeAfterServerRecovery(); } catch (e) {
+        console.warn('[player-engine] provider server recovery failed:', e);
+      }
+    }
     var held = this._heldRequests;
     this._heldRequests = [];
     for (var i = 0; i < held.length; i++) held[i]();
@@ -414,12 +442,19 @@
   };
 
   PlayerEngine.prototype._refreshToken = function () {
-    if (this._refreshingToken) return;
+    if (this._refreshingToken) return this._refreshTokenPromise || Promise.resolve();
     this._refreshingToken = true;
     var self = this;
-    fetch('/watch/token?v=' + encodeURIComponent(this.videoId))
+    var authFailure = false;
+    this._refreshTokenPromise = fetch('/watch/token?v=' + encodeURIComponent(this.videoId))
       .then(function (r) {
+        var contentType = r.headers.get('Content-Type') || '';
+        var redirectedToLogin = r.redirected && /\/auth\/login(?:\?|$)/.test(r.url || '');
+        if (r.status === 401 || r.status === 403 || redirectedToLogin || (r.ok && contentType.indexOf('json') === -1)) {
+          authFailure = true;
+        }
         if (!r.ok) throw new Error('Token refresh failed: ' + r.status);
+        if (authFailure) throw new Error('Token refresh requires authentication');
         return r.json();
       })
       .then(function (data) {
@@ -430,12 +465,25 @@
         self.emit('token-refreshed', data.token);
         if (self._serverDown) self._exitServerDown();
       })
-      .catch(function () {
+      .catch(function (err) {
         self._refreshingToken = false;
-        self._stopServerProbe();
-        self._serverDown = false;
-        self.emit('auth-expired');
+        if (self.destroyed) return;
+        if (authFailure) {
+          self._stopServerProbe();
+          self._serverDown = false;
+          self.networkTrouble = false;
+          self._clearHeldRequests('auth-expired');
+          self.emit('auth-expired');
+          return;
+        }
+        // A restarting or temporarily unavailable server is not an expired
+        // browser session. Keep the request held and let the probe retry.
+        console.warn('[player-engine] token refresh deferred:', err && err.message ? err.message : err);
+      })
+      .then(function () {
+        self._refreshTokenPromise = null;
       });
+    return this._refreshTokenPromise;
   };
 
   PlayerEngine.prototype._getBufferAhead = function () {
@@ -443,6 +491,8 @@
   };
 
   PlayerEngine.prototype.unload = function () {
+    this._loadGeneration++;
+    this._pendingLoadStartTime = null;
     this._stopServerProbe();
     this._clearHeldRequests('player-unloaded');
     this._serverDown = false;
@@ -466,6 +516,8 @@
 
   PlayerEngine.prototype.destroy = function () {
     if (this.destroyed) return;
+    this._loadGeneration++;
+    this._pendingLoadStartTime = null;
     this._telemetry.record('unload-summary');
     this._telemetry.flush();
     this.destroyed = true;
@@ -647,7 +699,10 @@
     this.config = {
       abr: {
         enabled: true,
-        useNetworkInformation: true,
+        // Start conservatively and promote from measured segment throughput.
+        // Navigator.connection is frequently coarse or reports the host link
+        // rather than the effective path to the media origin.
+        useNetworkInformation: false,
         defaultBandwidthEstimate: 3000000,
         bandwidthUpgradeTarget: 0.85,
         bandwidthDowngradeTarget: 0.95,
@@ -1067,6 +1122,7 @@
   NativeNetworkingEngine.prototype._holdAndRetry = function (type, request, opts, started, reason, status) {
     var self = this;
     var holdStarted = performance.now();
+    opts.__networkHoldAttempts = (opts.__networkHoldAttempts || 0) + 1;
     this._recordNetworkHold(reason, status);
     if (status === 401 && this.engine && this.engine._refreshToken) this.engine._refreshToken();
     if (this.engine && this.engine._enterServerDown) this.engine._enterServerDown(reason);
@@ -1262,6 +1318,13 @@
   };
 
   NativeUrlProvider.prototype._onRuntimeError = function () {
+    var mediaError = this.video.error;
+    if (mediaError && mediaError.code === 2 && isOnline() && this.engine && !this.engine._serverDown) {
+      this.lastError = 'native-url-network-error';
+      this.engine._enterServerDown(this.lastError);
+      return;
+    }
+    if (this.engine && this.engine._serverDown) return;
     if (this.retryCount < 1) {
       this.retryCount++;
       this.recoveryCount++;
@@ -1278,6 +1341,25 @@
     if (this.engine && this.engine._completeNativeTerminalError) {
       this.engine._completeNativeTerminalError(nativeTerminalError(this, 'native-url-error'));
     }
+  };
+
+  NativeUrlProvider.prototype.resumeAfterServerRecovery = function () {
+    if (!this.engine || this.engine.destroyed) return;
+    var position = this.engine.lastGoodTime || this.video.currentTime || 0;
+    var wasLive = this.isLive();
+    var shouldResume = !this.video.paused;
+    var self = this;
+    this.recoveryCount++;
+    this.lastError = 'server-recovery';
+    this.assetUri = stampUri(this.engine, this.url);
+    this.video.addEventListener('loadedmetadata', function restoreAfterServerRecovery() {
+      if (!wasLive && position > 0) {
+        try { self.video.currentTime = position; } catch (e) {}
+      }
+      if (shouldResume) self.video.play().catch(function () {});
+    }, { once: true });
+    this.video.src = this.assetUri;
+    this.video.load();
   };
 
   function NativeHlsProvider(engine, playlistUrl) {
@@ -1692,6 +1774,7 @@
     this.video.addEventListener('playing', this._boundPlaying = function () { self._onPlaying(); });
     this.video.addEventListener('timeupdate', this._boundTick = function () { self._tick(); });
     this.video.addEventListener('seeking', this._boundSeeking = function () {
+      if (self._applyingInitialStart) return;
       self._onSeek();
     });
     var initPromise = this.initSegment
@@ -1717,9 +1800,11 @@
       self.startupBufferStartedAt = performance.now();
       if (self.live) self._schedulePlaylistRefresh();
       self._tick(true);
-      self.engine._player.emit('loaded');
-      self.engine._player.emit('trackschanged');
-      self.engine._setState('ready');
+      return applyPendingLoadStartTime(self).then(function () {
+        self.engine._player.emit('loaded');
+        self.engine._player.emit('trackschanged');
+        self.engine._setState('ready');
+      });
     });
   };
 
@@ -1930,7 +2015,7 @@
       self._alignHlsBufferedTarget();
       self.engine._player.emit('adaptation');
       self._drainAppendQueue(track);
-      self._maybeEndVodStream();
+      if (self._maybeEndVodStream) self._maybeEndVodStream();
       self._tick();
     }).catch(function (err) {
       track._appending = false;
@@ -1973,7 +2058,7 @@
         ? this._transmuxTsSegment(track, seg, data, 'audio').then(function (output) {
           return self._appendTransmuxedOutput(track.sb, output, track, seg);
         })
-        : appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset(self, track, seg)));
+        : appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset()));
     }.bind(this));
     return appendPromise.catch(function (err) {
       if (!isQuotaExceeded(err)) throw err;
@@ -2039,6 +2124,8 @@
   };
 
   NativeHlsProvider.prototype._schedulerTime = function () {
+    var pendingStart = pendingLoadStartTime(this);
+    if (!this.startupBufferComplete && pendingStart != null) return pendingStart;
     if (this.live && this.liveWindow) {
       if (this.seekBufferPending && isFinite(this.lastSeekTarget)) return this._clampSeekTarget(this.lastSeekTarget);
       if (!this.startupBufferComplete && isFinite(this.startupLiveTarget)) return this._clampSeekTarget(this.startupLiveTarget);
@@ -2250,7 +2337,10 @@
   };
 
   NativeHlsProvider.prototype._maybeRefreshLiveLowBuffer = function (ahead) {
-    if (!this.live || !this.liveWindow || this.destroyed || this.liveRefreshInFlight) return;
+    // The scheduled refresh owns manifest updates until startup buffering is ready.
+    // Refreshing here during the initial tick can immediately consume TTL=0 content
+    // steering responses and replace the selected startup pathway before it is used.
+    if (!this.startupBufferComplete || !this.live || !this.liveWindow || this.destroyed || this.liveRefreshInFlight) return;
     var currentTime = this.video.currentTime || 0;
     var nearEdge = this.liveWindow.end - currentTime <= Math.max(MIN_BUFFER_AHEAD, LIVE_TARGET_LATENCY + 2);
     if (!nearEdge || ahead >= MIN_BUFFER_AHEAD) return;
@@ -2316,7 +2406,10 @@
 
   NativeHlsProvider.prototype._checkBufferMilestones = function () {
     var goal = this.seekBufferPending ? this._seekBufferGoal() : this._startupBufferGoal();
-    var ready = getBufferAhead(this.video) >= Math.min(goal, this._bufferAheadGoal());
+    // Encoded segment boundaries commonly land a few microseconds before their
+    // declared EXTINF duration. Treat a 50ms margin as satisfying the goal so
+    // startup does not remain pinned to the first live segment forever.
+    var ready = getBufferAhead(this.video) + 0.05 >= Math.min(goal, this._bufferAheadGoal());
     if (ready && !this.startupBufferComplete) {
       this.startupBufferComplete = true;
       this.liveStartupCandidate = false;
@@ -2397,7 +2490,10 @@
   };
 
   NativeHlsProvider.prototype.seekRange = function () {
-    return this.getLiveRange() || mediaSeekRange(this.video);
+    var liveRange = this.getLiveRange();
+    if (liveRange) return liveRange;
+    if (isFinite(this.duration) && this.duration > 0) return { start: 0, end: this.duration };
+    return mediaSeekRange(this.video);
   };
 
   NativeHlsProvider.prototype.seekToLiveEdge = function () {
@@ -2681,7 +2777,7 @@
     var sample = (byteLength * 8 * 1000) / Math.max(1, elapsedMs);
     if (!isFinite(sample) || sample <= 0) return;
     this.lastBandwidthSample = sample;
-    this.bandwidthSamples++;
+    this.bandwidthSamples = (this.bandwidthSamples || 0) + 1;
     this.bandwidth = this.bandwidth ? (this.bandwidth * 0.7 + sample * 0.3) : sample;
   };
 
@@ -3549,6 +3645,7 @@
     this.audioSb.mode = 'segments';
     this.video.addEventListener('timeupdate', this._boundTick = function () { self._tick(); });
     this.video.addEventListener('seeking', this._boundSeek = function () {
+      if (self._applyingInitialStart) return;
       self._onSeek();
     });
     this.video.addEventListener('waiting', this._boundWaiting = function () { self._onWaiting(); });
@@ -3565,8 +3662,10 @@
       self.audio._appendedInitKey = self.audio.generationKey || generationKeyForRep(self.audio);
       if (self.live) self._startNearLiveEdge();
       self._tick(true);
-      self.fillTimer = setInterval(function () { self._tick(); }, 1000);
-      self._scheduleManifestRefresh();
+      return applyPendingLoadStartTime(self).then(function () {
+        self.fillTimer = setInterval(function () { self._tick(); }, 1000);
+        self._scheduleManifestRefresh();
+      });
     });
   };
 
@@ -3814,7 +3913,7 @@
     var sample = (byteLength * 8 * 1000) / Math.max(1, elapsedMs);
     if (!isFinite(sample) || sample <= 0) return;
     this.lastBandwidthSample = sample;
-    this.bandwidthSamples++;
+    this.bandwidthSamples = (this.bandwidthSamples || 0) + 1;
     this.bandwidth = this.bandwidth ? (this.bandwidth * 0.7 + sample * 0.3) : sample;
   };
 
@@ -3893,7 +3992,8 @@
   };
 
   NativeDashProvider.prototype._buildSegmentCandidates = function (windowGoal, tracks) {
-    var ct = this.video.currentTime || 0;
+    var pendingStart = pendingLoadStartTime(this);
+    var ct = !this.startupBufferComplete && pendingStart != null ? pendingStart : (this.video.currentTime || 0);
     if (this.live && this.liveWindow && ct < this.liveWindow.start) ct = this.liveWindow.start;
     var target = ct + (windowGoal || this._bufferAheadGoal());
     var readyGoal = Math.min(windowGoal || this._bufferAheadGoal(), this._bufferAheadGoal());
@@ -4030,7 +4130,7 @@
         schedulerQueueDepth: self._schedulerQueueDepth()
       });
       self._drainAppendQueue(rep, sb);
-      self._maybeEndVodStream();
+      if (self._maybeEndVodStream) self._maybeEndVodStream();
       self._tick();
     }).catch(function (err) {
       rep._appending = false;
@@ -4357,7 +4457,10 @@
       var manual = candidates.find(function (rep) { return rep.id === this.manualTrackId; }, this);
       if (manual) return manual;
     }
-    return this._chooseForBudget(candidates, 0.8);
+    // Startup has no measured throughput yet. Use a conservative fraction of
+    // the estimate, then let normal ABR promote once playback has real samples
+    // and enough buffered media.
+    return this._chooseForBudget(candidates, this.bandwidthSamples ? 0.8 : 0.35);
   };
 
   NativeDashProvider.prototype._lowerVideoRep = function () {
@@ -4662,7 +4765,10 @@
   };
 
   NativeDashProvider.prototype.seekRange = function () {
-    return this.getLiveRange() || mediaSeekRange(this.video);
+    var liveRange = this.getLiveRange();
+    if (liveRange) return liveRange;
+    if (isFinite(this.duration) && this.duration > 0) return { start: 0, end: this.duration };
+    return mediaSeekRange(this.video);
   };
 
   NativeDashProvider.prototype.getBufferedInfo = function () {
@@ -4983,7 +5089,7 @@
     var readyGoal = this.seekBufferPending
       ? (this._seekBufferGoal ? this._seekBufferGoal() : STARTUP_BUFFER_GOAL)
       : (this._startupBufferGoal ? this._startupBufferGoal() : STARTUP_BUFFER_GOAL);
-    var ready = getBufferAhead(this.video) >= Math.min(readyGoal, this._bufferAheadGoal());
+    var ready = getBufferAhead(this.video) + 0.05 >= Math.min(readyGoal, this._bufferAheadGoal());
     if (ready && !this.startupBufferComplete) {
       this.startupBufferComplete = true;
       this.startupBufferMs = this.startupBufferStartedAt ? performance.now() - this.startupBufferStartedAt : 0;
@@ -5793,7 +5899,10 @@
     if (!response || opts && opts.disableNetworkHold) return false;
     if (!(response.status === 401 || response.status === 403 || response.status >= 500)) return false;
     var swInfo = readServiceWorkerSource(response);
-    if (swInfo && swInfo.offline) return false;
+    // Older service workers stamped every synthetic network-miss response as offline.
+    // Trust that hint only when the window also reports offline; otherwise hold the
+    // request so the server-down probe can resume it after a server restart.
+    if (swInfo && swInfo.offline && !isOnline()) return false;
     return shouldHoldNetworkRequest(engine, type, opts);
   }
 
@@ -5806,6 +5915,7 @@
   function shouldHoldNetworkRequest(engine, type, opts) {
     if (!engine || engine.destroyed || !engine._waitForServerRecovery || !isOnline()) return false;
     if (type !== NativeNetworkingEngine.RequestType.MANIFEST && type !== NativeNetworkingEngine.RequestType.SEGMENT && type !== NativeNetworkingEngine.RequestType.KEY && type !== NativeNetworkingEngine.RequestType.LICENSE) return false;
+    if (opts && opts.__networkHoldAttempts >= MAX_NETWORK_HOLD_CYCLES) return false;
     return !!(opts && opts.forceNetworkHold) || !!engine._serverDown;
   }
 
@@ -7200,6 +7310,63 @@
     return clamp(start, range.start || 0, range.end || Math.max(0, duration || 0));
   }
 
+  function pendingLoadStartTime(provider) {
+    if (!provider || !provider.engine) return null;
+    var pending = provider.engine._pendingLoadStartTime;
+    if (pending == null) return null;
+    var target = Number(pending);
+    if (!isFinite(target) || target < 0) return null;
+    var range = provider.seekRange ? provider.seekRange() : null;
+    if (range && isFinite(range.start) && isFinite(range.end) && range.end >= range.start) {
+      target = clamp(target, range.start, range.end);
+    }
+    return target;
+  }
+
+  function applyPendingLoadStartTime(provider) {
+    var target = pendingLoadStartTime(provider);
+    if (target == null || !provider.video) return Promise.resolve();
+    var video = provider.video;
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timeout = 0;
+      var retryTimer = 0;
+      provider._applyingInitialStart = true;
+      function cleanup() {
+        video.removeEventListener('loadedmetadata', attempt);
+        video.removeEventListener('durationchange', attempt);
+        video.removeEventListener('loadeddata', attempt);
+        video.removeEventListener('progress', attempt);
+        if (timeout) clearTimeout(timeout);
+        if (retryTimer) clearInterval(retryTimer);
+        provider._applyingInitialStart = false;
+      }
+      function finish() {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      }
+      function attempt() {
+        if (settled || provider.destroyed) return finish();
+        try { video.currentTime = target; } catch (e) {}
+        if (Math.abs((video.currentTime || 0) - target) <= 0.05) finish();
+      }
+      video.addEventListener('loadedmetadata', attempt);
+      video.addEventListener('durationchange', attempt);
+      video.addEventListener('loadeddata', attempt);
+      video.addEventListener('progress', attempt);
+      attempt();
+      if (!settled) {
+        retryTimer = setInterval(attempt, 25);
+        timeout = setTimeout(function () {
+          attempt();
+          finish();
+        }, 2000);
+      }
+    });
+  }
+
   function seekToStartTime(engine, startTime) {
     var target = Number(startTime);
     if (!isFinite(target) || target < 0) return Promise.resolve();
@@ -8343,9 +8510,12 @@
     return (seg.url || String(seg.start)) + range + hlsSeq + hlsPart;
   }
 
-  function hlsFmp4TimestampOffset(provider, track, seg) {
-    if (!provider || !provider.live || provider.isTsPlaylist || !track || track.isTsPlaylist || !seg) return NaN;
-    return hlsLiveTimestampOffset(provider, track, seg);
+  function hlsFmp4TimestampOffset() {
+    // CMAF/fMP4 fragments carry their media timeline in tfdt. Applying the HLS
+    // playlist start again doubles timestamps (0, 2, 4... for 1s fragments) and
+    // creates permanent playback gaps. MPEG-TS is different: our transmuxed
+    // output is rebased and still uses hlsLiveTimestampOffset below.
+    return NaN;
   }
 
   function hlsLiveTimestampOffset(provider, track, seg) {
@@ -8753,6 +8923,7 @@
     load: NativeUrlProvider.prototype.load,
     getStats: NativeUrlProvider.prototype.getStats,
     _onRuntimeError: NativeUrlProvider.prototype._onRuntimeError,
+    resumeAfterServerRecovery: NativeUrlProvider.prototype.resumeAfterServerRecovery,
     isLive: NativeUrlProvider.prototype.isLive,
     getBufferedInfo: NativeUrlProvider.prototype.getBufferedInfo,
     getVariantTracks: NativeUrlProvider.prototype.getVariantTracks,
