@@ -11,19 +11,23 @@
   var BUFFER_BEHIND = 60;
   var MIN_BUFFER_AHEAD = 12;
   var ABR_SWITCH_COOLDOWN_MS = 4000;
-  var ABR_UPGRADE_BUFFER = 14;
   var ABR_DOWNGRADE_BUFFER = 4;
+  var BANDWIDTH_FAST_HALF_LIFE = 3;
+  var BANDWIDTH_SLOW_HALF_LIFE = 9;
+  var MIN_BANDWIDTH_SAMPLE_MS = 50;
+  var DEFAULT_TIME_TO_FIRST_BYTE_MS = 100;
+  var FRAME_SAMPLE_INTERVAL_MS = 2000;
+  var FRAME_DROP_RATIO_THRESHOLD = 0.08;
+  var FRAME_DROP_MIN_COUNT = 6;
   var LIVE_TARGET_LATENCY = 6;
   var LIVE_MAX_LATENCY = 18;
-  var LIVE_STABLE_START_LATENCY = 60;
-  var LIVE_BUFFER_AHEAD = 36;
-  var LIVE_STARTUP_ABR_FACTOR = 0.35;
-  var LIVE_STABLE_ABR_FACTOR = 0.55;
-  var LIVE_STARTUP_MAX_HEIGHT = 480;
-  var LIVE_UPGRADE_HOLDOFF_MS = 180000;
+  var LIVE_BUFFER_AHEAD = 30;
+  var LIVE_BUFFER_BEHIND = 8;
+  var LOW_LATENCY_BUFFER_AHEAD = 4;
   var MAX_GAP_JUMP = 0.75;
   var STARTUP_BUFFER_GOAL = 4;
   var MAX_CONCURRENT_MEDIA_REQUESTS = 3;
+  var DEFAULT_BANDWIDTH_ESTIMATE = 500000;
   var SOURCEBUFFER_WATCHDOG_MS = 1200;
   var SEGMENT_BUSY_WATCHDOG_MS = 2500;
   var MAX_NETWORK_HOLD_CYCLES = 2;
@@ -552,9 +556,21 @@
     this.attached = false;
     this.flushTimer = 0;
     this.firstFrameAt = 0;
+    this.playIntentAt = 0;
+    this.firstPlayingAt = 0;
+    this.seekStartedAt = 0;
+    this.lastSeekLatencyMs = 0;
+    this.firstFrameMeasurementStarted = false;
+    this.firstFrameBaselineTime = 0;
+    this.firstFrameCallbackId = 0;
+    this.firstFrameAnimationId = 0;
     this.destroyed = false;
     this.unloadSummaryRecorded = false;
     this._onLoadedData = null;
+    this._onPlay = null;
+    this._onPlaying = null;
+    this._onSeeking = null;
+    this._onSeeked = null;
     this._onError = null;
     this._onPageHide = null;
     this._onBeforeUnload = null;
@@ -566,10 +582,26 @@
     var self = this;
     var video = this.engine.video;
     this._onLoadedData = function () {
-      if (!self.firstFrameAt) {
-        self.firstFrameAt = performance.now();
-        self.record('first-frame');
+      if (self.playIntentAt) self._startFirstFrameMeasurement();
+    };
+    this._onPlay = function () {
+      if (!self.playIntentAt) self.playIntentAt = performance.now();
+      self._startFirstFrameMeasurement();
+    };
+    this._onPlaying = function () {
+      if (!self.firstPlayingAt) {
+        self.firstPlayingAt = performance.now();
+        self.record('playback-started');
       }
+    };
+    this._onSeeking = function () {
+      if (!self.seekStartedAt) self.seekStartedAt = performance.now();
+    };
+    this._onSeeked = function () {
+      if (!self.seekStartedAt) return;
+      self.lastSeekLatencyMs = Math.max(0, performance.now() - self.seekStartedAt);
+      self.seekStartedAt = 0;
+      self.record('seek-complete', { seekLatencyMs: self.lastSeekLatencyMs });
     };
     this._onError = function () {
       var err = video.error;
@@ -580,9 +612,55 @@
       self.flush();
     };
     video.addEventListener('loadeddata', this._onLoadedData);
+    video.addEventListener('play', this._onPlay);
+    video.addEventListener('playing', this._onPlaying);
+    video.addEventListener('seeking', this._onSeeking);
+    video.addEventListener('seeked', this._onSeeked);
     video.addEventListener('error', this._onError);
     window.addEventListener('pagehide', this._onPageHide);
     window.addEventListener('beforeunload', this._onBeforeUnload);
+  };
+
+  PlayerTelemetry.prototype._startFirstFrameMeasurement = function () {
+    if (this.destroyed || this.firstFrameAt || this.firstFrameMeasurementStarted) return;
+    var video = this.engine && this.engine.video;
+    if (!video || !this.playIntentAt) return;
+    var self = this;
+    this.firstFrameMeasurementStarted = true;
+    this.firstFrameBaselineTime = Number(video.currentTime) || 0;
+
+    function frameHasAdvanced(metadata) {
+      var mediaTime = metadata && Number(metadata.mediaTime);
+      return !video.paused && (
+        (isFinite(mediaTime) && mediaTime > self.firstFrameBaselineTime + 0.001)
+        || Number(video.currentTime) > self.firstFrameBaselineTime + 0.001
+      );
+    }
+
+    function finish(now, metadata) {
+      self.firstFrameCallbackId = 0;
+      self.firstFrameAnimationId = 0;
+      if (self.destroyed || self.firstFrameAt) return;
+      if (!frameHasAdvanced(metadata)) {
+        schedule();
+        return;
+      }
+      self.firstFrameAt = isFinite(now) ? now : performance.now();
+      self.record('first-frame');
+    }
+
+    function schedule() {
+      if (self.destroyed || self.firstFrameAt) return;
+      if (video.requestVideoFrameCallback) {
+        self.firstFrameCallbackId = video.requestVideoFrameCallback(finish);
+        return;
+      }
+      self.firstFrameAnimationId = requestAnimationFrame(function (now) {
+        finish(now, { mediaTime: Number(video.currentTime) || 0 });
+      });
+    }
+
+    schedule();
   };
 
   PlayerTelemetry.prototype.record = function (type, extra) {
@@ -631,6 +709,11 @@
       totalFrames: stats.totalFrames || 0,
       startupMs: engine._loadStartedAt ? Math.round(performance.now() - engine._loadStartedAt) : 0,
       firstFrameMs: this.firstFrameAt && engine._loadStartedAt ? Math.round(this.firstFrameAt - engine._loadStartedAt) : 0,
+      videoStartupMs: this.firstFrameAt && this.playIntentAt ? Math.round(this.firstFrameAt - this.playIntentAt) : 0,
+      playToPlayingMs: this.firstPlayingAt && this.playIntentAt ? Math.round(this.firstPlayingAt - this.playIntentAt) : 0,
+      pageToFirstFrameMs: this.firstFrameAt ? Math.round(this.firstFrameAt) : 0,
+      startupBufferMs: stats.startupBufferMs || 0,
+      seekLatencyMs: this.lastSeekLatencyMs || 0,
       at: engine.video && isFinite(engine.video.currentTime) ? engine.video.currentTime : 0,
       ts: Date.now()
     };
@@ -681,11 +764,25 @@
       this.flushTimer = 0;
     }
     var video = this.engine && this.engine.video;
+    if (video && this.firstFrameCallbackId && video.cancelVideoFrameCallback) {
+      try { video.cancelVideoFrameCallback(this.firstFrameCallbackId); } catch (e) {}
+    }
+    if (this.firstFrameAnimationId) cancelAnimationFrame(this.firstFrameAnimationId);
+    this.firstFrameCallbackId = 0;
+    this.firstFrameAnimationId = 0;
     if (video && this._onLoadedData) video.removeEventListener('loadeddata', this._onLoadedData);
+    if (video && this._onPlay) video.removeEventListener('play', this._onPlay);
+    if (video && this._onPlaying) video.removeEventListener('playing', this._onPlaying);
+    if (video && this._onSeeking) video.removeEventListener('seeking', this._onSeeking);
+    if (video && this._onSeeked) video.removeEventListener('seeked', this._onSeeked);
     if (video && this._onError) video.removeEventListener('error', this._onError);
     if (this._onPageHide) window.removeEventListener('pagehide', this._onPageHide);
     if (this._onBeforeUnload) window.removeEventListener('beforeunload', this._onBeforeUnload);
     this._onLoadedData = null;
+    this._onPlay = null;
+    this._onPlaying = null;
+    this._onSeeking = null;
+    this._onSeeked = null;
     this._onError = null;
     this._onPageHide = null;
     this._onBeforeUnload = null;
@@ -703,9 +800,13 @@
         // Navigator.connection is frequently coarse or reports the host link
         // rather than the effective path to the media origin.
         useNetworkInformation: false,
-        defaultBandwidthEstimate: 3000000,
+        // Match the mature Hls.js cold-start prior: a slow first connection is
+        // much more expensive than one early conservative rendition, and real
+        // segment samples promote quality immediately after playback begins.
+        defaultBandwidthEstimate: DEFAULT_BANDWIDTH_ESTIMATE,
         bandwidthUpgradeTarget: 0.85,
         bandwidthDowngradeTarget: 0.95,
+        capLevelOnFPSDrop: true,
         restrictions: {}
       },
       streaming: {
@@ -1085,6 +1186,7 @@
     var self = this;
     var uri = request.uris && request.uris.length ? request.uris[0] : "";
     var fetchUri = stampUri(this.engine, uri);
+    var attemptStarted = performance.now();
     var init = {
       method: request.method || "GET",
       headers: request.headers || {}
@@ -1092,15 +1194,19 @@
     if (opts.signal) init.signal = opts.signal;
     if (request.body != null) init.body = request.body;
     return fetch(fetchUri, init).then(function (resp) {
+      var responseStarted = performance.now();
       return resp.arrayBuffer().then(function (data) {
-        var elapsed = Math.max(0, performance.now() - started);
+        var completed = performance.now();
+        var elapsed = Math.max(0, completed - started);
         var response = {
           uri: resp.url || fetchUri,
           originalUri: uri,
           data: data,
           status: resp.status,
           headers: headersToObject(resp.headers),
-          timeMs: elapsed
+          timeMs: Math.max(0, completed - attemptStarted),
+          timeToFirstByteMs: Math.max(0, responseStarted - attemptStarted),
+          downloadTimeMs: Math.max(0, completed - responseStarted)
         };
         self._recordResponse(type, resp.status, elapsed);
         if (shouldHoldNetworkResponse(self.engine, type, response, opts)) {
@@ -1386,9 +1492,26 @@
     this.activeRanges = {};
     this.controllers = [];
     this.destroyed = false;
-    this.bandwidth = engine._player.config.abr.defaultBandwidthEstimate || 3000000;
+    this.bandwidth = engine._player.config.abr.defaultBandwidthEstimate || DEFAULT_BANDWIDTH_ESTIMATE;
     this.bandwidthSamples = 0;
     this.lastBandwidthSample = 0;
+    this.bandwidthFast = 0;
+    this.bandwidthSlow = 0;
+    this.bandwidthFastAccumulator = 0;
+    this.bandwidthSlowAccumulator = 0;
+    this.bandwidthFastWeight = 0;
+    this.bandwidthSlowWeight = 0;
+    this.bandwidthTtfbEstimate = DEFAULT_TIME_TO_FIRST_BYTE_MS;
+    this.bandwidthTtfbAccumulator = 0;
+    this.bandwidthTtfbWeight = 0;
+    this.lastSwitchAt = 0;
+    this.variantSwitchInFlight = false;
+    this.pendingManualVariantSwitch = null;
+    this.lastFrameSampleAt = 0;
+    this.lastDroppedFrames = 0;
+    this.lastTotalFrames = 0;
+    this.frameDropDownswitchCount = 0;
+    this.lastFrameDropRatio = 0;
     this.rebufferCount = 0;
     this.rebufferStartedAt = 0;
     this.rebufferDuration = 0;
@@ -1410,6 +1533,10 @@
     this.liveLowBufferRefreshCount = 0;
     this.liveRefreshInFlight = false;
     this.lastLiveRefreshStartedAt = 0;
+    this.lastPlaylistRefreshAdvanced = false;
+    this.blockingReloadRequestCount = 0;
+    this.blockingReloadResponseCount = 0;
+    this.blockingReloadFallbackCount = 0;
     this.mediaFetchCompletedCount = 0;
     this.mediaFetchRetryCount = 0;
     this.mediaFetchTotalMs = 0;
@@ -1426,6 +1553,7 @@
     this.startupBufferMs = 0;
     this.seekBufferPending = false;
     this.seekBufferReadyCount = 0;
+    this.bufferedSeekCount = 0;
     this.seekCount = 0;
     this.seekCancelCount = 0;
     this.seekAbortCount = 0;
@@ -1439,8 +1567,6 @@
     this.liveLatency = 0;
     this.atLiveEdge = false;
     this.startupLiveTarget = null;
-    this.liveStartupCandidate = false;
-    this.liveStableSince = 0;
     this.liveWindowDriftRecoveryCount = 0;
     this.vodEndOfStreamCount = 0;
     this.mediaSequence = 0;
@@ -1491,8 +1617,11 @@
     this.partialSegmentRequestCount = 0;
     this.partialSegmentAppendCount = 0;
     this.partialSegmentFallbackCount = 0;
+    this.partialSegmentGapCount = 0;
     this.preloadHintRequestCount = 0;
     this.preloadHintCount = 0;
+    this.preloadHintReuseCount = 0;
+    this.preloadHintDiscardCount = 0;
     this.renditionReportCount = 0;
     this.skippedSegmentCount = 0;
     this.iframeVariantCount = 0;
@@ -1534,7 +1663,6 @@
       self.manifestCompatibilityWarnings = mergeUnique(self.manifestCompatibilityWarnings, parsed.warnings || []);
       var chapterPromise = self._loadHlsChapters(parsed);
       if (parsed.variants.length) {
-        self.liveStartupCandidate = true;
         self.audioRenditions = parsed.audioRenditions;
         self.subtitleRenditions = parsed.subtitleRenditions.concat(parsed.closedCaptionRenditions || []);
         self.variants = parsed.variants.map(function (variant) {
@@ -1598,11 +1726,13 @@
     var isTs = hasMpegTsSegments(parsed.segments);
     if (!parsed.map && !isTs) throw new Error('hls-playlist-unsupported');
     if (!parsed.segments.length) throw new Error('hls-playlist-unsupported');
+    reconcileHlsPreloadHints(this, this, parsed);
     this.segments = mergeSegmentState(this.segments, parsed.segments) || parsed.segments;
     this.initSegment = parsed.map;
     this.isTsPlaylist = isTs;
     this.lowLatencyPlaylist = !!parsed.lowLatencyPlaylist;
     this.partialSegmentCount = parsed.partialSegmentCount || 0;
+    this.partialSegmentGapCount = parsed.partialSegmentGapCount || 0;
     this.partTargetDuration = parsed.partTargetDuration || 0;
     this.preloadHints = parsed.preloadHints || [];
     this.serverControl = parsed.serverControl || null;
@@ -1612,7 +1742,6 @@
     this.manifestCompatibilityWarnings = mergeUnique(this.manifestCompatibilityWarnings, parsed.warnings || []);
     this.duration = parsed.duration;
     this.live = !parsed.endList;
-    this.liveStartupCandidate = this.live && !this.startupBufferComplete;
     this.manifestStartTime = manifestStartTimeFor(parsed.start, this.liveWindow || (parsed.segments.length ? { start: parsed.segments[0].start, end: parsed.segments[parsed.segments.length - 1].end } : null), parsed.duration);
     this.mediaSequence = parsed.mediaSequence || 0;
     this.discontinuitySequence = parsed.discontinuitySequence || 0;
@@ -1625,6 +1754,7 @@
     } : null;
     this.manifestStartTime = manifestStartTimeFor(parsed.start, this.liveWindow, parsed.duration);
     this._addTimelineRegions(hlsRegionsForDateRanges(parsed.dateRanges || [], this.segments));
+    if (this.playlistRefreshCount === 0) this.lastPlaylistRefreshAdvanced = true;
     this.playlistRefreshCount++;
     this.playlistRefreshFailed = false;
     var rawCodecs = (this.activeVariant && (this.activeVariant.rawCodecs || this.activeVariant.codecs)) || parsed.codecs || 'avc1.42c01f';
@@ -1638,9 +1768,12 @@
       if (!MediaSource.isTypeSupported(this.audioMimeType)) throw new Error('hls-audio-codec-unsupported');
     }
     if (isTs) {
-      return this._ensureTsTransmuxer('video', codecs).then(function () {
-        return this.muxedTsAudio ? this._ensureTsTransmuxer('audio', this.activeVariant.audioCodecs || audioCodecsOnly(rawCodecs) || 'mp4a.40.2') : Promise.resolve();
-      }.bind(this));
+      return Promise.all([
+        this._ensureTsTransmuxer('video', codecs),
+        this.muxedTsAudio
+          ? this._ensureTsTransmuxer('audio', this.activeVariant.audioCodecs || audioCodecsOnly(rawCodecs) || 'mp4a.40.2')
+          : Promise.resolve()
+      ]).then(function () {});
     }
   };
 
@@ -1650,11 +1783,13 @@
     var isTs = hasMpegTsSegments(parsed.segments);
     if ((!parsed.map && !isTs) || !parsed.segments.length) throw new Error(isTs ? 'hls-mpegts-unsupported' : 'hls-audio-playlist-unsupported');
     if (!this.activeAudio) throw new Error('hls-audio-unavailable');
+    reconcileHlsPreloadHints(this, this.activeAudio, parsed);
     this.activeAudio.segments = mergeSegmentState(this.activeAudio.segments, parsed.segments) || parsed.segments;
     this.activeAudio.initSegment = parsed.map;
     this.activeAudio.isTsPlaylist = isTs;
     this.activeAudio.lowLatencyPlaylist = !!parsed.lowLatencyPlaylist;
     this.activeAudio.partialSegmentCount = parsed.partialSegmentCount || 0;
+    this.activeAudio.partialSegmentGapCount = parsed.partialSegmentGapCount || 0;
     this.activeAudio.partTargetDuration = parsed.partTargetDuration || 0;
     this.activeAudio.preloadHints = parsed.preloadHints || [];
     this.activeAudio.serverControl = parsed.serverControl || null;
@@ -1682,12 +1817,16 @@
     function attempt() {
       if (!self.activeVariant) throw nativeTerminalError(self, 'hls-no-supported-video');
       attempts++;
-      return self._fetchPlaylistText(self.activeVariant.url).then(function (mediaText) {
-        return self._loadMediaPlaylist(mediaText, self.activeVariant.url);
-      }).then(function () {
-        if (!self.activeAudio || !self.activeAudio.url) return;
-        return self._fetchPlaylistText(self.activeAudio.url).then(function (audioText) {
-          return self._loadAudioPlaylist(audioText, self.activeAudio.url);
+      var selectedVariant = self.activeVariant;
+      var selectedAudio = self.activeAudio;
+      var videoPlaylist = self._fetchPlaylistText(selectedVariant.url);
+      var audioPlaylist = selectedAudio && selectedAudio.url
+        ? self._fetchPlaylistText(selectedAudio.url)
+        : Promise.resolve(null);
+      return Promise.all([videoPlaylist, audioPlaylist]).then(function (playlists) {
+        return Promise.resolve(self._loadMediaPlaylist(playlists[0], selectedVariant.url)).then(function () {
+          if (playlists[1] == null) return;
+          return self._loadAudioPlaylist(playlists[1], selectedAudio.url);
         });
       }).catch(function (err) {
         if (!isRefreshableRequestError(err)) throw err;
@@ -1774,28 +1913,38 @@
     this.video.addEventListener('playing', this._boundPlaying = function () { self._onPlaying(); });
     this.video.addEventListener('timeupdate', this._boundTick = function () { self._tick(); });
     this.video.addEventListener('seeking', this._boundSeeking = function () {
-      if (self._applyingInitialStart) return;
+      if (self._applyingInitialStart || isInternalMediaSeek(self)) return;
       self._onSeek();
     });
-    var initPromise = this.initSegment
+    this.video.addEventListener('seeked', this._boundSeeked = function () {
+      if (self._applyingInitialStart || isInternalMediaSeek(self)) return;
+      self.endSeek();
+    });
+    // Video and audio have independent SourceBuffers, so their init requests and
+    // appends do not need to sit on the same startup critical path.
+    var videoInitPromise = this.initSegment
       ? this._fetchRange(this.initSegment.url, this.initSegment.range, { phase: 'metadata' }).then(function (initData) {
-        return appendBuffer(self.sb, initData);
+        return appendBuffer(self.sb, initData).then(function () {
+          self._appendedVideoInitKey = hlsInitSegmentKey(self.initSegment);
+        });
       })
       : Promise.resolve();
-    return initPromise.then(function () {
-      if (!self.audioInitSegment || !self.audioSb) return;
-      return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
-        return appendBuffer(self.audioSb, initData);
-      });
-    }).then(function () {
+    var audioInitPromise = this.audioInitSegment && this.audioSb
+      ? this._fetchRange(this.audioInitSegment.url, this.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
+        return appendBuffer(self.audioSb, initData).then(function () {
+          self._appendedAudioInitKey = hlsInitSegmentKey(self.audioInitSegment);
+        });
+      })
+      : Promise.resolve();
+    return Promise.all([videoInitPromise, audioInitPromise]).then(function () {
       if (self.live && self.liveWindow) {
         self.startupLiveTarget = self._defaultLiveStartTime();
         if (self.video.currentTime < self.liveWindow.start || self.video.currentTime < self.startupLiveTarget - 0.5) {
-          try { self.video.currentTime = self.startupLiveTarget; } catch (e) {}
+          assignInternalMediaTime(self, self.startupLiveTarget);
         }
       }
       if (self.engine._pendingLoadStartTime == null && isFinite(self.manifestStartTime)) {
-        try { self.video.currentTime = self.manifestStartTime; } catch (e) {}
+        assignInternalMediaTime(self, self.manifestStartTime);
       }
       self.startupBufferStartedAt = performance.now();
       if (self.live) self._schedulePlaylistRefresh();
@@ -1815,8 +1964,10 @@
     var ahead = getBufferAhead(this.video);
     this._maybeRefreshLiveLowBuffer(ahead);
     if (this._recoverLiveWindowDrift(ahead)) return;
-    if (!force && ahead >= this._bufferAheadGoal()) return;
+    if (this.variantSwitchInFlight) return;
     if (!this.manualTrackId) this._maybeSwitchAuto();
+    if (this.variantSwitchInFlight) return;
+    if (!force && ahead >= this._bufferAheadGoal()) return;
     this._scheduleMediaRequests(!this.startupBufferComplete ? this._startupBufferGoal() : this._bufferAheadGoal());
     this._trim();
     this._checkBufferMilestones();
@@ -1856,16 +2007,33 @@
     var ct = this._schedulerTime();
     if (this.live && this.liveWindow && ct < this.liveWindow.start) ct = this.liveWindow.start;
     var goal = windowGoal || this._bufferAheadGoal();
-    var target = ct + goal;
     var readyGoal = Math.min(goal, this._bufferAheadGoal());
+    // Do not let future media divide the connection with the only video/audio
+    // fragments capable of producing the first frame. Once the current
+    // playhead is buffered, normal concurrent look-ahead resumes.
+    var startupCriticalOnly = (!this.startupBufferComplete || this.seekBufferPending)
+      && getBufferAhead(this.video) < 0.1;
     var candidates = [];
     tracks = tracks || this._mediaTracks();
     for (var i = 0; i < tracks.length; i++) {
       var track = tracks[i];
+      // LL-HLS parts after the selected playhead can depend on the nearest
+      // preceding independent part. Keep that dependency in the request
+      // window even when PART-HOLD-BACK places it more than 500ms behind.
+      var trackStart = this.live && this.lowLatencyPlaylist
+        ? hlsIndependentPartStart(track.segments, ct)
+        : ct;
+      trackStart = hlsNextPlayableStart(track.segments, trackStart);
+      var trackTarget = trackStart + goal;
       for (var j = 0; j < track.segments.length; j++) {
         var seg = track.segments[j];
-        if (seg.state === 'expired' || seg.end <= ct - 0.5 || seg.start >= target || isSegmentBusyOrDone(seg)) continue;
-        candidates.push({ track: track, seg: seg, priority: segmentPriority(seg, ct, readyGoal) });
+        if (seg.gap || seg.state === 'expired' || seg.end <= trackStart - 0.05 || seg.start >= trackTarget || isSegmentBusyOrDone(seg)) continue;
+        var priority = segmentPriority(seg, trackStart, readyGoal);
+        var startupDependency = this.live && this.lowLatencyPlaylist
+          ? seg.start <= ct + 0.05 && seg.end > trackStart - 0.05
+          : priority === 0;
+        if (startupCriticalOnly && !startupDependency) continue;
+        candidates.push({ track: track, seg: seg, priority: priority });
       }
     }
     return candidates.sort(function (a, b) {
@@ -1883,18 +2051,35 @@
     this.activeRanges[rangeKey] = true;
     seg.state = 'fetching';
     seg._fetchStartedAt = performance.now();
+    var networkTiming = null;
     if (seg._hlsPart) this.partialSegmentRequestCount++;
     if (seg._hlsPreloadHint) this.preloadHintRequestCount++;
-    this._fetchRange(seg.url, seg.range, { phase: 'media' }).then(function (data) {
+    this._fetchRange(seg.url, seg.range, {
+      phase: 'media',
+      onTiming: function (timing) { networkTiming = timing; }
+    }).then(function (data) {
       return self._decryptSegmentIfNeeded(seg, data).then(function (plainData) {
         delete self.activeRanges[rangeKey];
+        if (seg._hlsPreloadHintStale) {
+          seg.state = 'expired';
+          seg.appended = false;
+          delete seg._data;
+          return;
+        }
         seg.state = 'fetched';
         seg._data = plainData;
         var elapsed = Math.max(1, performance.now() - (seg._fetchStartedAt || performance.now()));
         self.mediaFetchCompletedCount++;
         self.mediaFetchTotalMs += elapsed;
-        if (seg.duration > 0 && elapsed > 0) {
-          self._recordBandwidthSample(plainData.byteLength || 0, elapsed);
+        // Match mature HLS ABR semantics: alternate-audio requests do not
+        // influence the video rendition estimator, and request latency is
+        // separated from transfer time before throughput is sampled.
+        if (track.kind === 'video' && seg.duration > 0 && networkTiming) {
+          self._recordBandwidthSample(
+            networkTiming.byteLength || plainData.byteLength || 0,
+            networkTiming.timeMs,
+            networkTiming.timeToFirstByteMs
+          );
         }
         self._drainAppendQueue(track);
         self._tick();
@@ -2005,6 +2190,7 @@
       next.state = 'appended';
       next.appended = true;
       if (next._hlsPart || next._hlsPreloadHint) self.partialSegmentAppendCount++;
+      if (next._parentSegment) markCompletedHlsParent(next._parentSegment, null);
       delete next._appendStartedAt;
       delete next._fetchStartedAt;
       track._appending = false;
@@ -2038,28 +2224,43 @@
     var isTsAudioTrack = track.kind === 'audio' && track.isTsPlaylist;
     var prepareDiscontinuity = this._prepareDiscontinuityAppend || function () { return Promise.resolve(); };
     var appendPromise = prepareDiscontinuity.call(this, track, seg).then(function () {
-      return self.isTsPlaylist && track.kind === 'video'
-      ? this._transmuxTsSegment(track, seg, data, 'video').then(function (output) {
-        var chain = self._appendTransmuxedOutput(track.sb, output, track, seg);
+      if (self.isTsPlaylist && track.kind === 'video') {
         if (self.muxedTsAudio && self.audioSb) {
-          chain = chain.then(function () {
-            self._muxedAudioTrack = self._muxedAudioTrack || { id: 'muxed-audio', kind: 'audio', sb: self.audioSb };
-            self._muxedAudioTrack.sb = self.audioSb;
-            return self._prepareDiscontinuityAppend(self._muxedAudioTrack, seg);
-          }).then(function () {
-            return self._transmuxTsSegment(track, seg, data, 'audio').then(function (audioOutput) {
-              return self._appendTransmuxedOutput(self.audioSb, audioOutput, self._muxedAudioTrack, seg);
+          self._muxedAudioTrack = self._muxedAudioTrack || { id: 'muxed-audio', kind: 'audio', sb: self.audioSb };
+          self._muxedAudioTrack.sb = self.audioSb;
+          return Promise.all([
+            self._transmuxTsSegment(track, seg, data, 'video'),
+            self._prepareDiscontinuityAppend(self._muxedAudioTrack, seg).then(function () {
+              return self._transmuxTsSegment(track, seg, data, 'audio');
+            })
+          ]).then(function (outputs) {
+            // Keep the first displayed video frame from racing ahead of muxed
+            // audio readiness. Appending video first can expose a deceptively
+            // fast first frame and then make the media clock pause while the
+            // audio SourceBuffer catches up. Prepare both outputs together,
+            // append audio first, and expose video only when both tracks can
+            // advance continuously.
+            return self._appendTransmuxedOutput(
+              self.audioSb,
+              outputs[1],
+              self._muxedAudioTrack,
+              seg
+            ).then(function () {
+              return self._appendTransmuxedOutput(track.sb, outputs[0], track, seg);
             });
           });
         }
-        return chain;
-      })
-      : (isTsAudioTrack
-        ? this._transmuxTsSegment(track, seg, data, 'audio').then(function (output) {
+        return self._transmuxTsSegment(track, seg, data, 'video').then(function (output) {
           return self._appendTransmuxedOutput(track.sb, output, track, seg);
-        })
-        : appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset()));
-    }.bind(this));
+        });
+      }
+      if (isTsAudioTrack) {
+        return self._transmuxTsSegment(track, seg, data, 'audio').then(function (output) {
+          return self._appendTransmuxedOutput(track.sb, output, track, seg);
+        });
+      }
+      return appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset());
+    });
     return appendPromise.catch(function (err) {
       if (!isQuotaExceeded(err)) throw err;
       self.quotaRecoveries++;
@@ -2119,7 +2320,7 @@
     if (!this.isTsPlaylist || this.startupBufferComplete || !this.video || !this.video.buffered.length) return;
     var start = this.video.buffered.start(0);
     if (start > 0 && (this.video.currentTime || 0) < start - 0.05) {
-      try { this.video.currentTime = start; } catch (e) {}
+      assignInternalMediaTime(this, start);
     }
   };
 
@@ -2135,12 +2336,18 @@
 
   NativeHlsProvider.prototype._alignHlsBufferedTarget = function () {
     if (!this.live || !this.video || !this.video.buffered || !this.video.buffered.length) return;
-    var target = this.seekBufferPending && isFinite(this.lastSeekTarget)
+    var pendingSeek = this.seekBufferPending && isFinite(this.lastSeekTarget);
+    var target = pendingSeek
       ? this._clampSeekTarget(this.lastSeekTarget)
       : (!this.startupBufferComplete && isFinite(this.startupLiveTarget) ? this._clampSeekTarget(this.startupLiveTarget) : NaN);
     if (!isFinite(target) || !bufferedContains(this.video.buffered, target)) return;
-    if (Math.abs((this.video.currentTime || 0) - target) > 0.25) {
-      try { this.video.currentTime = target; } catch (e) {}
+    var currentTime = this.video.currentTime || 0;
+    // The live-start target is a lower bound for an uninitialized playhead,
+    // not a clock to keep re-applying. Rewinding active playback here emits a
+    // synthetic seeking event, aborts useful in-flight media, and can turn an
+    // ABR boundary into a visible stall.
+    if ((pendingSeek && Math.abs(currentTime - target) > 0.25) || (!pendingSeek && currentTime < target - 0.25)) {
+      assignInternalMediaTime(this, target);
     }
   };
 
@@ -2157,7 +2364,7 @@
     var target = this._defaultLiveStartTime();
     target = this._clampSeekTarget ? this._clampSeekTarget(target) : clamp(target, windowStart, this.liveWindow.end || windowStart);
     if (!isFinite(target)) target = windowStart;
-    try { this.video.currentTime = target; } catch (e) {}
+    assignInternalMediaTime(this, target);
     this.liveWindowDriftRecoveryCount++;
     this.seekBufferPending = true;
     this.lastSeekTarget = target;
@@ -2284,14 +2491,18 @@
       if (self.initSegment && self.sb) {
         initChain = initChain.then(function () {
           return self._fetchRange(self.initSegment.url, self.initSegment.range, { phase: 'metadata' }).then(function (initData) {
-            return appendBuffer(self.sb, initData);
+            return appendBuffer(self.sb, initData).then(function () {
+              self._appendedVideoInitKey = hlsInitSegmentKey(self.initSegment);
+            });
           });
         });
       }
       if (self.audioInitSegment && self.audioSb) {
         initChain = initChain.then(function () {
           return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
-            return appendBuffer(self.audioSb, initData);
+            return appendBuffer(self.audioSb, initData).then(function () {
+              self._appendedAudioInitKey = hlsInitSegmentKey(self.audioInitSegment);
+            });
           });
         });
       }
@@ -2320,18 +2531,45 @@
     return this._refreshMediaPlaylist('media-error');
   };
 
-  NativeHlsProvider.prototype._refreshMediaPlaylist = function () {
+  NativeHlsProvider.prototype._fetchReloadPlaylist = function (url, track, useDeliveryDirectives) {
+    var self = this;
+    var requestUrl = useDeliveryDirectives ? hlsBlockingReloadUrl(url, track) : url;
+    if (requestUrl === url) return this._fetchPlaylistText(url);
+    this.blockingReloadRequestCount++;
+    return this._fetchPlaylistText(requestUrl).then(function (text) {
+      self.blockingReloadResponseCount++;
+      return text;
+    }).catch(function (err) {
+      if (self.destroyed || (err && err.name === 'AbortError')) throw err;
+      // A CDN can strip or reject delivery directives even when the origin
+      // advertised them. Recover with an ordinary reload in the same cycle.
+      self.blockingReloadFallbackCount++;
+      return self._fetchPlaylistText(url);
+    });
+  };
+
+  NativeHlsProvider.prototype._refreshMediaPlaylist = function (reason) {
     var self = this;
     if (!this.activeVariant || !this.activeVariant.url) return Promise.reject(new Error('hls-refresh-unavailable'));
     return this._refreshContentSteering('refresh').then(function () {
       self._applyContentSteeringToActiveVariant();
-      return self._fetchPlaylistText(self.activeVariant.url);
-    }).then(function (mediaText) {
-      return self._loadMediaPlaylist(mediaText, self.activeVariant.url);
-    }).then(function () {
-      if (!self.activeAudio || !self.activeAudio.url) return;
-      return self._fetchPlaylistText(self.activeAudio.url).then(function (audioText) {
-        return self._loadAudioPlaylist(audioText, self.activeAudio.url);
+      var selectedVariant = self.activeVariant;
+      var selectedAudio = self.activeAudio;
+      var beforeVideo = hlsDeliveryCursor(self);
+      var beforeAudio = hlsDeliveryCursor(selectedAudio);
+      var blockingRefresh = self.live && (reason === 'live' || reason === 'live-low-buffer');
+      var videoPlaylist = self._fetchReloadPlaylist(selectedVariant.url, self, blockingRefresh);
+      var audioPlaylist = selectedAudio && selectedAudio.url
+        ? self._fetchReloadPlaylist(selectedAudio.url, selectedAudio, blockingRefresh)
+        : Promise.resolve(null);
+      return Promise.all([videoPlaylist, audioPlaylist]).then(function (playlists) {
+        return Promise.resolve(self._loadMediaPlaylist(playlists[0], selectedVariant.url)).then(function () {
+          if (playlists[1] == null) return;
+          return self._loadAudioPlaylist(playlists[1], selectedAudio.url);
+        }).then(function () {
+          self.lastPlaylistRefreshAdvanced = hlsCursorAdvanced(beforeVideo, hlsDeliveryCursor(self));
+          self.lastAudioPlaylistRefreshAdvanced = hlsCursorAdvanced(beforeAudio, hlsDeliveryCursor(selectedAudio));
+        });
       });
     });
   };
@@ -2342,7 +2580,7 @@
     // steering responses and replace the selected startup pathway before it is used.
     if (!this.startupBufferComplete || !this.live || !this.liveWindow || this.destroyed || this.liveRefreshInFlight) return;
     var currentTime = this.video.currentTime || 0;
-    var nearEdge = this.liveWindow.end - currentTime <= Math.max(MIN_BUFFER_AHEAD, LIVE_TARGET_LATENCY + 2);
+    var nearEdge = this.liveWindow.end - currentTime <= Math.max(MIN_BUFFER_AHEAD, this._targetLiveLatency() + 2);
     if (!nearEdge || ahead >= MIN_BUFFER_AHEAD) return;
     var now = performance.now();
     var minInterval = Math.max(500, (this.targetDuration || 2) * 500);
@@ -2368,16 +2606,44 @@
     if (this.destroyed || !this.live) return;
     clearTimeout(this.playlistRefreshTimer);
     this.playlistRefreshTimer = setTimeout(function () {
+      if (self.destroyed) return;
+      if (self.liveRefreshInFlight) {
+        clearTimeout(self.playlistRefreshTimer);
+        self.playlistRefreshTimer = setTimeout(function () {
+          self._schedulePlaylistRefresh();
+        }, 100);
+        return;
+      }
+      self.liveRefreshInFlight = true;
+      self.lastLiveRefreshStartedAt = performance.now();
       self._refreshMediaPlaylist('live').then(function () {
         self._evictExpiredLiveSegmentState();
+        self.playlistRefreshFailed = false;
+        self.liveRefreshInFlight = false;
         self._tick(true);
         self._schedulePlaylistRefresh();
       }).catch(function (err) {
         self.lastError = err && err.message ? err.message : 'hls-live-refresh-failed';
         self.playlistRefreshFailed = true;
+        self.liveRefreshInFlight = false;
         self._schedulePlaylistRefresh();
       });
-    }, Math.max(1000, (this.targetDuration || 2) * 1000));
+    }, this._playlistRefreshDelay());
+  };
+
+  NativeHlsProvider.prototype._playlistRefreshDelay = function () {
+    var targetMs = Math.max(500, (this.targetDuration || 2) * 1000);
+    if (this.lowLatencyPlaylist && this.serverControl && this.serverControl.canBlockReload) {
+      // A successful blocking response already contains the requested future
+      // part, so immediately issue the next blocking request. If a server
+      // ignored the directive and returned an unchanged Playlist, honor the
+      // standard half-Target-Duration retry floor.
+      return this.lastPlaylistRefreshAdvanced ? 0 : Math.max(500, targetMs / 2);
+    }
+    if (!this.lastPlaylistRefreshAdvanced) return Math.max(500, targetMs / 2);
+    var tail = this.segments && this.segments.length ? this.segments[this.segments.length - 1] : null;
+    var tailMs = tail && tail.duration > 0 ? tail.duration * 1000 : targetMs;
+    return Math.max(250, Math.min(targetMs, tailMs));
   };
 
   NativeHlsProvider.prototype._evictExpiredLiveSegmentState = function () {
@@ -2412,7 +2678,6 @@
     var ready = getBufferAhead(this.video) + 0.05 >= Math.min(goal, this._bufferAheadGoal());
     if (ready && !this.startupBufferComplete) {
       this.startupBufferComplete = true;
-      this.liveStartupCandidate = false;
       this.startupBufferMs = this.startupBufferStartedAt ? performance.now() - this.startupBufferStartedAt : 0;
       if (this.engine && this.engine._telemetry) this.engine._telemetry.record('startup-buffer-ready', { startupBufferMs: this.startupBufferMs });
     }
@@ -2446,12 +2711,14 @@
   NativeHlsProvider.prototype._bufferAheadGoal = function () {
     var cfg = this.engine._player.config.streaming || {};
     var goal = Math.max(1, cfg.bufferingGoal || BUFFER_AHEAD);
+    if (this.live && this.lowLatencyPlaylist) return goal === BUFFER_AHEAD ? LOW_LATENCY_BUFFER_AHEAD : goal;
     return this.live ? Math.max(goal, LIVE_BUFFER_AHEAD) : goal;
   };
 
   NativeHlsProvider.prototype._startupBufferGoal = function () {
     var cfg = this.engine._player.config.streaming || {};
-    return Math.max(1, cfg.startupBufferGoal || STARTUP_BUFFER_GOAL);
+    var goal = Math.max(1, cfg.startupBufferGoal || STARTUP_BUFFER_GOAL);
+    return this.live && this.lowLatencyPlaylist && goal === STARTUP_BUFFER_GOAL ? 1 : goal;
   };
 
   NativeHlsProvider.prototype._seekBufferGoal = function () {
@@ -2466,13 +2733,24 @@
 
   NativeHlsProvider.prototype._bufferBehindGoal = function () {
     var cfg = this.engine._player.config.streaming || {};
-    return Math.max(0, cfg.bufferBehind == null ? BUFFER_BEHIND : cfg.bufferBehind);
+    var goal = Math.max(0, cfg.bufferBehind == null ? BUFFER_BEHIND : cfg.bufferBehind);
+    return this.live && goal === BUFFER_BEHIND ? LIVE_BUFFER_BEHIND : goal;
+  };
+
+  NativeHlsProvider.prototype._targetLiveLatency = function () {
+    var advertised = this.serverControl && Number(
+      this.lowLatencyPlaylist ? this.serverControl.partHoldBack : this.serverControl.holdBack
+    );
+    if (isFinite(advertised) && advertised > 0) return advertised;
+    var partTarget = Number(this.partTargetDuration) || 0;
+    if (this.lowLatencyPlaylist && partTarget > 0) return partTarget * 3;
+    var targetDuration = Number(this.targetDuration) || 0;
+    return targetDuration > 0 ? targetDuration * 3 : LIVE_TARGET_LATENCY;
   };
 
   NativeHlsProvider.prototype._defaultLiveStartTime = function () {
     if (!this.liveWindow) return this.video.currentTime || 0;
-    var goal = Math.max(LIVE_STABLE_START_LATENCY, LIVE_MAX_LATENCY, this._bufferAheadGoal ? this._bufferAheadGoal() + 30 : LIVE_BUFFER_AHEAD + 30);
-    return Math.max(this.liveWindow.start, this.liveWindow.end - goal);
+    return Math.max(this.liveWindow.start, this.liveWindow.end - this._targetLiveLatency());
   };
 
   NativeHlsProvider.prototype._updateLivePositionStats = function () {
@@ -2482,7 +2760,7 @@
       return;
     }
     this.liveLatency = Math.max(0, this.liveWindow.end - (this.video.currentTime || 0));
-    this.atLiveEdge = this.liveLatency <= LIVE_TARGET_LATENCY + 1;
+    this.atLiveEdge = this.liveLatency <= this._targetLiveLatency() + 1;
   };
 
   NativeHlsProvider.prototype.getLiveRange = function () {
@@ -2498,7 +2776,7 @@
 
   NativeHlsProvider.prototype.seekToLiveEdge = function () {
     if (!this.liveWindow) return;
-    this.commitSeek(Math.max(this.liveWindow.start, this.liveWindow.end - LIVE_TARGET_LATENCY));
+    this.commitSeek(Math.max(this.liveWindow.start, this.liveWindow.end - this._targetLiveLatency()));
   };
 
   NativeHlsProvider.prototype._clampSeekTarget = function (targetTime) {
@@ -2521,7 +2799,12 @@
   };
 
   NativeHlsProvider.prototype.commitSeek = function (targetTime) {
-    var target = this.beginSeek(targetTime);
+    var target = this._clampSeekTarget(targetTime);
+    if (!this.seekBufferPending
+      || !this.lastSeekStartedAt
+      || Math.abs(target - this.lastSeekTarget) > 0.05) {
+      this.beginSeek(target);
+    }
     this.seekCount++;
     try { this.video.currentTime = target; } catch (e) {}
     this._onSeek(target);
@@ -2538,6 +2821,7 @@
   NativeHlsProvider.prototype.endSeek = function () {
     if (this.lastSeekStartedAt) this.lastSeekMs = performance.now() - this.lastSeekStartedAt;
     this.lastSeekStartedAt = 0;
+    this.seekBufferPending = false;
     if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
   };
 
@@ -2558,7 +2842,20 @@
     this.lastSeekTarget = target;
     this.seekBufferPending = true;
     if (this.engine && this.engine._setState) this.engine._setState('seeking');
-    var cancelled = this._abortRequests();
+    if (bufferedContains(this.video.buffered, target)) {
+      this.seekBufferPending = false;
+      this.seekBufferReadyCount++;
+      this.bufferedSeekCount++;
+      if (this.engine && this.engine._telemetry) {
+        this.engine._telemetry.record('seek-buffer-ready', { buffered: true });
+      }
+      return;
+    }
+    // A seek may arrive immediately after the first frame while an automatic
+    // rendition switch is fetching its playlist/init segment. Let that
+    // metadata transition finish; the post-switch scheduler will use
+    // lastSeekTarget and request only the sought media.
+    var cancelled = this.variantSwitchInFlight ? 0 : this._abortRequests();
     if (cancelled > 0) this.seekAbortCount += cancelled;
     markSegmentsForTime(this, target, Math.max(2, this._seekBufferGoal()));
     if (this.activeAudio) markSegmentsForTime(this.activeAudio, target, Math.max(2, this._seekBufferGoal()));
@@ -2573,7 +2870,7 @@
     var gap = nextBufferedGap(this.video);
     if (!gap || gap.size <= 0 || gap.size > MAX_GAP_JUMP) return false;
     try {
-      this.video.currentTime = gap.start + 0.01;
+      assignInternalMediaTime(this, gap.start + 0.01);
       this.gapJumpCount++;
       this.lastGapSize = gap.size;
       this.lastError = 'gap-jump';
@@ -2645,6 +2942,14 @@
         if (swInfo.offline) self._recordOfflineHttpError(resp.status);
         throw rangeHttpError(resp.status);
       }
+      if (opts.onTiming) {
+        opts.onTiming({
+          byteLength: resp.data ? resp.data.byteLength : 0,
+          timeMs: resp.timeMs,
+          timeToFirstByteMs: resp.timeToFirstByteMs,
+          downloadTimeMs: resp.downloadTimeMs
+        });
+      }
       return resp.data;
     }).catch(function (err) {
       removeItem(self.controllers, controller);
@@ -2656,6 +2961,7 @@
         return wait(retryDelay(retry, attempt)).then(function () {
           return self._fetchRange(url, range, {
             phase: opts.phase,
+            onTiming: opts.onTiming,
             attempts: attempts,
             attempt: attempt + 1
           });
@@ -2773,12 +3079,13 @@
     return cap.supported !== false && cap.smooth !== false;
   };
 
-  NativeHlsProvider.prototype._recordBandwidthSample = function (byteLength, elapsedMs) {
-    var sample = (byteLength * 8 * 1000) / Math.max(1, elapsedMs);
+  NativeHlsProvider.prototype._recordBandwidthSample = function (byteLength, elapsedMs, timeToFirstByteMs) {
+    var sampleDuration = bandwidthSampleDuration(this, elapsedMs, timeToFirstByteMs);
+    var sample = (byteLength * 8 * 1000) / sampleDuration;
     if (!isFinite(sample) || sample <= 0) return;
     this.lastBandwidthSample = sample;
     this.bandwidthSamples = (this.bandwidthSamples || 0) + 1;
-    this.bandwidth = this.bandwidth ? (this.bandwidth * 0.7 + sample * 0.3) : sample;
+    updateBandwidthEstimate(this, sample, sampleDuration);
   };
 
   NativeHlsProvider.prototype._candidateVariants = function () {
@@ -2849,12 +3156,7 @@
       var manual = candidates.find(function (variant) { return variant.id === this.manualTrackId; }, this);
       if (manual) return manual;
     }
-    var conservativeLiveStartup = this.live || this.liveStartupCandidate;
-    if (conservativeLiveStartup) {
-      var capped = candidates.filter(function (variant) { return !variant.height || variant.height <= LIVE_STARTUP_MAX_HEIGHT; });
-      if (capped.length) candidates = capped;
-    }
-    var chosen = this._chooseForBudget(candidates, conservativeLiveStartup ? LIVE_STARTUP_ABR_FACTOR : 0.8);
+    var chosen = this._chooseForBudget(candidates, 0.8);
     for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === chosen;
     return chosen;
   };
@@ -2894,12 +3196,14 @@
   };
 
   NativeHlsProvider.prototype._switchVariant = function (variant, clearBuffer, reason) {
-    if (!variant || this.destroyed || this.activeVariant === variant) return;
+    if (!variant || this.destroyed || this.activeVariant === variant || this.variantSwitchInFlight) return;
     var self = this;
     var previousVariant = this.activeVariant;
     var previousAudio = this.activeAudio;
     this._abortRequests();
+    this.variantSwitchInFlight = true;
     this.activeVariant = variant;
+    this.lastSwitchAt = performance.now();
     for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === variant;
     this.activeAudio = this._chooseAudioRendition(variant) || this.activeAudio;
     this.lastSwitchReason = reason || (clearBuffer ? 'manual' : 'auto');
@@ -2907,66 +3211,106 @@
     this._refreshMediaPlaylist('variant-switch').then(function () {
       if (clearBuffer) {
         markSegmentsUnappended(self);
-        return resetSourceBuffer(self.sb, self.video.currentTime).then(function () {
+        if (self.activeAudio) markSegmentsUnappended(self.activeAudio);
+      }
+      var videoInitKey = hlsInitSegmentKey(self.initSegment);
+      var audioInitKey = hlsInitSegmentKey(self.audioInitSegment);
+      var videoReady = clearBuffer
+        ? resetSourceBuffer(self.sb, self.video.currentTime)
+        : Promise.resolve(self.sb._nativeQueue).catch(function () {}).then(function () {
+          return waitForSourceBufferIdle(self.sb);
+        }).then(function () {
+          // The old rendition may already cover one or more timeline
+          // intervals. Treat those intervals as satisfied in the new playlist
+          // so the switch starts at the next boundary rather than downloading
+          // overlapping media that the decoder may continue to ignore.
+          markSegmentsCoveredByBuffer(self, self.video);
+        });
+      var audioReady = clearBuffer && self.audioSb
+        ? resetSourceBuffer(self.audioSb, self.video.currentTime)
+        : Promise.resolve();
+      if (self.initSegment && (clearBuffer || videoInitKey !== self._appendedVideoInitKey)) {
+        videoReady = videoReady.then(function () {
           return self._fetchRange(self.initSegment.url, self.initSegment.range, { phase: 'metadata' });
         }).then(function (initData) {
           return appendBuffer(self.sb, initData);
         }).then(function () {
-          if (!self.audioInitSegment || !self.audioSb) return;
-          return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
-            return appendBuffer(self.audioSb, initData);
-          });
+          self._appendedVideoInitKey = videoInitKey;
         });
       }
+      if (self.audioInitSegment && self.audioSb && (clearBuffer || audioInitKey !== self._appendedAudioInitKey)) {
+        audioReady = audioReady.then(function () {
+          return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' });
+        }).then(function (initData) {
+          return appendBuffer(self.audioSb, initData);
+        }).then(function () {
+          self._appendedAudioInitKey = audioInitKey;
+        });
+      }
+      return Promise.all([videoReady, audioReady]);
     }).then(function () {
+      self.variantSwitchInFlight = false;
+      if (self._flushPendingVariantSwitch()) return;
       self._tick(true);
     }).catch(function (err) {
+      self.variantSwitchInFlight = false;
       self._restoreVariantState(previousVariant, previousAudio);
       self.lastError = err && err.message ? err.message : 'hls-variant-switch-failed';
+      if (self._flushPendingVariantSwitch()) return;
       if (reason === 'quota-recovery' || reason === 'append-recovery' || reason === 'stall-recovery') self._handleFatal(err);
       else self._tick(true);
     });
   };
 
+  NativeHlsProvider.prototype._flushPendingVariantSwitch = function () {
+    var pending = this.pendingManualVariantSwitch;
+    if (!pending || this.destroyed || this.variantSwitchInFlight) return false;
+    this.pendingManualVariantSwitch = null;
+    var variant = this.variants.find(function (item) { return item.id === pending.variantId; });
+    if (!variant || !variantSelectable(this, variant)) return false;
+    if (this.activeVariant === variant) {
+      this.lastSwitchReason = 'manual';
+      for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === variant;
+      return false;
+    }
+    this._switchVariant(variant, pending.clearBuffer, 'manual');
+    return this.variantSwitchInFlight;
+  };
+
   NativeHlsProvider.prototype._maybeSwitchAuto = function () {
-    if (!this.engine._player.config.abr.enabled || this.variants.length < 2 || !this.activeVariant) return;
+    if (!this.engine._player.config.abr.enabled || this.variantSwitchInFlight || this.variants.length < 2 || !this.activeVariant) return;
     var now = performance.now();
-    if (this.lastSwitchAt && now - this.lastSwitchAt < ABR_SWITCH_COOLDOWN_MS) return;
+    if (sampleFramePressure(this, now)) {
+      var smootherVariant = this._lowerVariant();
+      if (smootherVariant) {
+        this.frameDropDownswitchCount++;
+        this._switchVariant(smootherVariant, false, 'dropped-frames');
+        return;
+      }
+    }
     var ahead = getBufferAhead(this.video);
     var previous = this.activeVariant;
-    var previousBandwidth = this.bandwidth;
-    if (this.bandwidthSamples < 2 && ahead >= ABR_DOWNGRADE_BUFFER) {
-      this.bandwidth = Math.max(this.bandwidth || 0, this.engine._player.config.abr.defaultBandwidthEstimate || 3000000);
-    }
-    var stableLiveCandidate = this.live && ahead >= Math.min(this._bufferAheadGoal(), LIVE_BUFFER_AHEAD) * 0.75 && this.liveLatency >= LIVE_STABLE_START_LATENCY * 0.5;
-    if (stableLiveCandidate) {
-      if (!this.liveStableSince) this.liveStableSince = now;
-    } else {
-      this.liveStableSince = 0;
-    }
-    var stableLive = stableLiveCandidate && this.liveStableSince && now - this.liveStableSince >= LIVE_UPGRADE_HOLDOFF_MS;
-    var normalFactor = this.live ? (stableLive ? LIVE_STABLE_ABR_FACTOR : LIVE_STARTUP_ABR_FACTOR) : 0.8;
+    var abr = this.engine._player.config.abr || {};
+    var upgradeFactor = this.live
+      ? Math.min(0.7, abr.bandwidthUpgradeTarget || 0.85)
+      : (abr.bandwidthUpgradeTarget || 0.85);
+    var downgradeFactor = abr.bandwidthDowngradeTarget || 0.95;
     var candidates = this._candidateVariants();
-    if (this.live && !stableLive) {
-      var capped = candidates.filter(function (variant) { return !variant.height || variant.height <= LIVE_STARTUP_MAX_HEIGHT; });
-      if (capped.length) candidates = capped;
-    }
-    var chosen = this._chooseForBudget(candidates, this.bandwidthSamples < 2 || ahead >= MIN_BUFFER_AHEAD ? normalFactor : 0.55);
-    var reason = 'bandwidth';
-    if (ahead < ABR_DOWNGRADE_BUFFER && this.bandwidthSamples >= 2) {
-      this.bandwidth = previousBandwidth;
-      var lowBufferCandidates = this._candidateVariants();
-      if (this.live) {
-        var lowBufferCapped = lowBufferCandidates.filter(function (variant) { return !variant.height || variant.height <= LIVE_STARTUP_MAX_HEIGHT; });
-        if (lowBufferCapped.length) lowBufferCandidates = lowBufferCapped;
-      }
-      chosen = this._chooseForBudget(lowBufferCandidates, 0.35);
-      reason = 'low-buffer';
-    }
-    this.bandwidth = previousBandwidth;
+    var upgradeChoice = this._chooseForBudget(candidates, upgradeFactor);
+    var sustainChoice = this._chooseForBudget(candidates, downgradeFactor);
+    var currentSustainable = (previous.bandwidth || 0)
+      <= effectiveBandwidthEstimate(this) * downgradeFactor;
+    var chosen = currentSustainable
+      ? ((upgradeChoice.height || 0) > (previous.height || 0) ? upgradeChoice : previous)
+      : sustainChoice;
     if (!chosen || chosen === previous) return;
-    this.lastSwitchAt = now;
-    if (chosen.height < previous.height || ahead >= ABR_UPGRADE_BUFFER) this._switchVariant(chosen, false, reason);
+    var isUpgrade = (chosen.height || 0) > (previous.height || 0);
+    var reason = !isUpgrade && ahead < ABR_DOWNGRADE_BUFFER ? 'low-buffer' : 'bandwidth';
+    var upgradeCooldownComplete = !this.lastSwitchAt || now - this.lastSwitchAt >= ABR_SWITCH_COOLDOWN_MS;
+    if (!isUpgrade || (
+      upgradeCooldownComplete
+      && abrUpgradeIsSafe(this, chosen, ahead)
+    )) this._switchVariant(chosen, false, reason);
   };
 
   NativeHlsProvider.prototype.selectVariantTrack = function (track, clearBuffer) {
@@ -2975,6 +3319,17 @@
     this.manualTrackId = variant.id;
     this.engine._player.config.abr.enabled = false;
     this.lastSwitchAt = performance.now();
+    this.lastSwitchReason = 'manual';
+    if (this.variantSwitchInFlight) {
+      // A viewer choice must win over an automatic transition already
+      // preparing another rendition. Queue only the latest manual intent and
+      // apply it before the completed auto switch can schedule more media.
+      this.pendingManualVariantSwitch = {
+        variantId: variant.id,
+        clearBuffer: clearBuffer !== false
+      };
+      return;
+    }
     this._switchVariant(variant, clearBuffer !== false, 'manual');
   };
 
@@ -3339,6 +3694,10 @@
       lastHttpStatus: this.lastHttpStatus,
       playlistRefreshCount: this.playlistRefreshCount,
       liveLowBufferRefreshCount: this.liveLowBufferRefreshCount || 0,
+      blockingReloadRequestCount: this.blockingReloadRequestCount || 0,
+      blockingReloadResponseCount: this.blockingReloadResponseCount || 0,
+      blockingReloadFallbackCount: this.blockingReloadFallbackCount || 0,
+      lastPlaylistRefreshAdvanced: !!this.lastPlaylistRefreshAdvanced,
       liveWindowDriftRecoveryCount: this.liveWindowDriftRecoveryCount || 0,
       vodEndOfStreamCount: this.vodEndOfStreamCount || 0,
       liveRefreshInFlight: !!this.liveRefreshInFlight,
@@ -3353,6 +3712,11 @@
       lastServiceWorkerSource: this.lastServiceWorkerSource,
       bandwidthSamples: this.bandwidthSamples,
       lastBandwidthSample: Math.round(this.lastBandwidthSample || 0),
+      bandwidthFastEstimate: Math.round(this.bandwidthFast || 0),
+      bandwidthSlowEstimate: Math.round(this.bandwidthSlow || 0),
+      bandwidthTimeToFirstByteEstimateMs: Math.round(this.bandwidthTtfbEstimate || 0),
+      frameDropDownswitchCount: this.frameDropDownswitchCount || 0,
+      lastFrameDropRatio: this.lastFrameDropRatio || 0,
       mediaUrlRefreshCount: this.mediaUrlRefreshCount,
       playlistMediaSequence: this.mediaSequence || 0,
       discontinuitySequence: this.discontinuitySequence || 0,
@@ -3366,6 +3730,7 @@
       startupBufferMs: this.startupBufferMs,
       seekBufferPending: !!this.seekBufferPending,
       seekBufferReadyCount: this.seekBufferReadyCount || 0,
+      bufferedSeekCount: this.bufferedSeekCount || 0,
       seekCount: this.seekCount || 0,
       seekCancelCount: this.seekCancelCount || 0,
       seekAbortCount: this.seekAbortCount || 0,
@@ -3373,6 +3738,8 @@
       lastSeekMs: this.lastSeekMs || 0,
       effectiveSeekBufferGoal: this._seekBufferGoal ? this._seekBufferGoal() : STARTUP_BUFFER_GOAL,
       lastSwitchReason: this.lastSwitchReason,
+      variantSwitchInFlight: !!this.variantSwitchInFlight,
+      pendingManualVariantId: this.pendingManualVariantSwitch ? this.pendingManualVariantSwitch.variantId : '',
       transmuxedSegmentCount: this.transmuxedSegmentCount,
       transmuxedVideoSegmentCount: this.transmuxedVideoSegmentCount,
       transmuxedAudioSegmentCount: this.transmuxedAudioSegmentCount,
@@ -3401,8 +3768,11 @@
       partialSegmentRequestCount: this.partialSegmentRequestCount || 0,
       partialSegmentAppendCount: this.partialSegmentAppendCount || 0,
       partialSegmentFallbackCount: this.partialSegmentFallbackCount || 0,
+      partialSegmentGapCount: this.partialSegmentGapCount || 0,
       preloadHintRequestCount: this.preloadHintRequestCount || 0,
       preloadHintCount: this.preloadHintCount || 0,
+      preloadHintReuseCount: this.preloadHintReuseCount || 0,
+      preloadHintDiscardCount: this.preloadHintDiscardCount || 0,
       renditionReportCount: this.renditionReportCount || 0,
       skippedSegmentCount: this.skippedSegmentCount || 0,
       iframeVariantCount: this.iframeVariantCount || 0,
@@ -3458,6 +3828,7 @@
       this.video.removeEventListener('seeking', this._boundNativeTextCueUpdate);
     }
     if (this._boundSeeking) this.video.removeEventListener('seeking', this._boundSeeking);
+    if (this._boundSeeked) this.video.removeEventListener('seeked', this._boundSeeked);
     this.controllers.forEach(function (controller) { try { controller.abort(); } catch (e) {} });
     this.controllers = [];
     try { if (this.mediaSource && this.mediaSource.readyState === 'open') this.mediaSource.endOfStream(); } catch (e) {}
@@ -3482,16 +3853,32 @@
     this.destroyed = false;
     this.fillTimer = null;
     this.pendingSeek = 0;
-    this.bandwidth = engine._player.config.abr.defaultBandwidthEstimate || 3000000;
+    this.bandwidth = engine._player.config.abr.defaultBandwidthEstimate || DEFAULT_BANDWIDTH_ESTIMATE;
     this.manualTrackId = null;
     this.controllers = [];
     this.requestGeneration = 0;
     this.appendFailures = 0;
     this.activeRanges = {};
+    this.videoSwitchInFlight = false;
+    this.pendingManualVideoSwitch = null;
     this.lastSwitchAt = 0;
     this.lastSwitchReason = 'startup';
     this.lastBandwidthSample = 0;
     this.bandwidthSamples = 0;
+    this.bandwidthFast = 0;
+    this.bandwidthSlow = 0;
+    this.bandwidthFastAccumulator = 0;
+    this.bandwidthSlowAccumulator = 0;
+    this.bandwidthFastWeight = 0;
+    this.bandwidthSlowWeight = 0;
+    this.bandwidthTtfbEstimate = DEFAULT_TIME_TO_FIRST_BYTE_MS;
+    this.bandwidthTtfbAccumulator = 0;
+    this.bandwidthTtfbWeight = 0;
+    this.lastFrameSampleAt = 0;
+    this.lastDroppedFrames = 0;
+    this.lastTotalFrames = 0;
+    this.frameDropDownswitchCount = 0;
+    this.lastFrameDropRatio = 0;
     this.recoveryCount = 0;
     this.rebufferCount = 0;
     this.rebufferStartedAt = 0;
@@ -3521,6 +3908,7 @@
     this.firstPlayableRange = null;
     this.seekBufferPending = false;
     this.seekBufferReadyCount = 0;
+    this.bufferedSeekCount = 0;
     this.seekCount = 0;
     this.seekCancelCount = 0;
     this.seekAbortCount = 0;
@@ -3645,8 +4033,12 @@
     this.audioSb.mode = 'segments';
     this.video.addEventListener('timeupdate', this._boundTick = function () { self._tick(); });
     this.video.addEventListener('seeking', this._boundSeek = function () {
-      if (self._applyingInitialStart) return;
+      if (self._applyingInitialStart || isInternalMediaSeek(self)) return;
       self._onSeek();
+    });
+    this.video.addEventListener('seeked', this._boundSeeked = function () {
+      if (self._applyingInitialStart || isInternalMediaSeek(self)) return;
+      self.endSeek();
     });
     this.video.addEventListener('waiting', this._boundWaiting = function () { self._onWaiting(); });
     this.video.addEventListener('playing', this._boundPlaying = function () { self._onPlaying(); });
@@ -3654,12 +4046,17 @@
       this._prepareRep(this.activeVideo),
       this._prepareRep(this.audio)
     ]).then(function () {
-      return appendBuffer(self.videoSb, self.activeVideo.initData);
+      // The SourceBuffers are independent. Append both init segments together
+      // so slower devices do not pay two updateend waits before media can start.
+      return Promise.all([
+        appendBuffer(self.videoSb, self.activeVideo.initData).then(function () {
+          self.activeVideo._appendedInitKey = self.activeVideo.generationKey || generationKeyForRep(self.activeVideo);
+        }),
+        appendBuffer(self.audioSb, self.audio.initData).then(function () {
+          self.audio._appendedInitKey = self.audio.generationKey || generationKeyForRep(self.audio);
+        })
+      ]);
     }).then(function () {
-      self.activeVideo._appendedInitKey = self.activeVideo.generationKey || generationKeyForRep(self.activeVideo);
-      return appendBuffer(self.audioSb, self.audio.initData);
-    }).then(function () {
-      self.audio._appendedInitKey = self.audio.generationKey || generationKeyForRep(self.audio);
       if (self.live) self._startNearLiveEdge();
       self._tick(true);
       return applyPendingLoadStartTime(self).then(function () {
@@ -3870,8 +4267,11 @@
       var buf = resp.data;
       if (generation !== self.requestGeneration) throw abortError();
       if (opts.measureBandwidth !== false) {
-        var elapsed = Math.max(1, performance.now() - started);
-        self._recordBandwidthSample(buf.byteLength, elapsed);
+        self._recordBandwidthSample(
+          buf.byteLength,
+          resp.timeMs || Math.max(1, performance.now() - started),
+          resp.timeToFirstByteMs
+        );
       }
       return buf;
     }).catch(function (err) {
@@ -3909,12 +4309,13 @@
     if (err && err.status) this.lastHttpStatus = err.status;
   };
 
-  NativeDashProvider.prototype._recordBandwidthSample = function (byteLength, elapsedMs) {
-    var sample = (byteLength * 8 * 1000) / Math.max(1, elapsedMs);
+  NativeDashProvider.prototype._recordBandwidthSample = function (byteLength, elapsedMs, timeToFirstByteMs) {
+    var sampleDuration = bandwidthSampleDuration(this, elapsedMs, timeToFirstByteMs);
+    var sample = (byteLength * 8 * 1000) / sampleDuration;
     if (!isFinite(sample) || sample <= 0) return;
     this.lastBandwidthSample = sample;
     this.bandwidthSamples = (this.bandwidthSamples || 0) + 1;
-    this.bandwidth = this.bandwidth ? (this.bandwidth * 0.7 + sample * 0.3) : sample;
+    updateBandwidthEstimate(this, sample, sampleDuration);
   };
 
   NativeDashProvider.prototype._probeCapabilities = function (reps) {
@@ -3948,9 +4349,11 @@
     if (this.destroyed || !this.activeVideo || !this.audio) return;
     if (this.live) this._updateLivePositionStats();
     this._jumpSmallGap();
+    if (this.videoSwitchInFlight) return;
     var ahead = getBufferAhead(this.video);
-    if (!force && ahead >= this._bufferAheadGoal()) return;
     this._maybeSwitchAuto();
+    if (this.videoSwitchInFlight) return;
+    if (!force && ahead >= this._bufferAheadGoal()) return;
     if (!this.startupBufferComplete || this.seekBufferPending) {
       this._scheduleMediaRequests(this.seekBufferPending ? this._seekBufferGoal() : this._startupBufferGoal());
     } else {
@@ -3997,6 +4400,8 @@
     if (this.live && this.liveWindow && ct < this.liveWindow.start) ct = this.liveWindow.start;
     var target = ct + (windowGoal || this._bufferAheadGoal());
     var readyGoal = Math.min(windowGoal || this._bufferAheadGoal(), this._bufferAheadGoal());
+    var startupCriticalOnly = (!this.startupBufferComplete || this.seekBufferPending)
+      && getBufferAhead(this.video) < 0.1;
     var candidates = [];
     tracks = tracks || [
       { rep: this.activeVideo, sb: this.videoSb },
@@ -4008,11 +4413,13 @@
       for (var j = 0; j < rep.segments.length; j++) {
         var seg = rep.segments[j];
         if (seg.state === 'expired' || seg.end <= ct - 0.5 || seg.start >= target || isSegmentBusyOrDone(seg)) continue;
+        var priority = segmentPriority(seg, ct, readyGoal);
+        if (startupCriticalOnly && priority !== 0) continue;
         candidates.push({
           rep: rep,
           sb: tracks[i].sb,
           seg: seg,
-          priority: segmentPriority(seg, ct, readyGoal)
+          priority: priority
         });
       }
     }
@@ -4413,28 +4820,37 @@
   };
 
   NativeDashProvider.prototype._maybeSwitchAuto = function () {
-    if (!this.engine._player.config.abr.enabled || this.manualTrackId) return;
+    if (!this.engine._player.config.abr.enabled || this.manualTrackId || this.videoSwitchInFlight) return;
     var ahead = getBufferAhead(this.video);
     var current = this.activeVideo;
     var candidates = this._candidateVideos();
     if (!candidates.length) return;
-    var previousBandwidth = this.bandwidth;
     var now = performance.now();
-    var allowUpgrade = ahead >= ABR_UPGRADE_BUFFER && now - this.lastSwitchAt >= ABR_SWITCH_COOLDOWN_MS;
-    if (this.bandwidthSamples < 2 && ahead >= ABR_DOWNGRADE_BUFFER) {
-      this.bandwidth = Math.max(this.bandwidth || 0, this.engine._player.config.abr.defaultBandwidthEstimate || 3000000);
+    if (now - this.lastSwitchAt >= ABR_SWITCH_COOLDOWN_MS && sampleFramePressure(this, now)) {
+      var smootherRep = this._lowerVideoRep();
+      if (smootherRep) {
+        this.frameDropDownswitchCount++;
+        this._switchVideo(smootherRep, false, 'dropped-frames');
+        return;
+      }
     }
-    var chosen = this._chooseForBudget(candidates, this.bandwidthSamples < 2 || ahead >= MIN_BUFFER_AHEAD ? 0.8 : 0.55);
-    var reason = 'bandwidth';
-
-    if (ahead < ABR_DOWNGRADE_BUFFER && this.bandwidthSamples >= 2) {
-      this.bandwidth = previousBandwidth;
-      chosen = this._chooseForBudget(candidates, 0.45);
-      reason = 'low-buffer';
-    }
-    this.bandwidth = previousBandwidth;
-
-    if (chosen.id !== current.id && (chosen.height < current.height || allowUpgrade)) {
+    var abr = this.engine._player.config.abr || {};
+    var upgradeFactor = this.live
+      ? Math.min(0.7, abr.bandwidthUpgradeTarget || 0.85)
+      : (abr.bandwidthUpgradeTarget || 0.85);
+    var downgradeFactor = abr.bandwidthDowngradeTarget || 0.95;
+    var upgradeChoice = this._chooseForBudget(candidates, upgradeFactor);
+    var sustainChoice = this._chooseForBudget(candidates, downgradeFactor);
+    var currentSustainable = (current.bandwidth || 0)
+      <= effectiveBandwidthEstimate(this) * downgradeFactor;
+    var chosen = currentSustainable
+      ? ((upgradeChoice.height || 0) > (current.height || 0) ? upgradeChoice : current)
+      : sustainChoice;
+    var isUpgrade = (chosen.height || 0) > (current.height || 0);
+    var reason = !isUpgrade && ahead < ABR_DOWNGRADE_BUFFER ? 'low-buffer' : 'bandwidth';
+    var allowUpgrade = (!this.lastSwitchAt || now - this.lastSwitchAt >= ABR_SWITCH_COOLDOWN_MS)
+      && abrUpgradeIsSafe(this, chosen, ahead);
+    if (chosen.id !== current.id && (!isUpgrade || allowUpgrade)) {
       this._switchVideo(chosen, false, reason);
     }
   };
@@ -4515,36 +4931,83 @@
   };
 
   NativeDashProvider.prototype._switchVideo = function (rep, clearBuffer, reason) {
-    if (!rep || rep.id === this.activeVideo.id || this.destroyed) return;
+    if (!rep || !this.activeVideo || rep.id === this.activeVideo.id || this.destroyed || this.videoSwitchInFlight) return;
     var self = this;
+    var previous = this.activeVideo;
+    var switchReason = reason || (clearBuffer ? 'manual' : 'auto');
+    this.videoSwitchInFlight = true;
     if (clearBuffer) this._abortRequests();
-    this.activeVideo = rep;
-    this.lastSwitchAt = performance.now();
-    this.lastSwitchReason = reason || (clearBuffer ? 'manual' : 'auto');
-    this.engine._player.emit('variantchanged');
-    console.log('[native-dash] selected video id=' + rep.id + ' height=' + rep.height + ' codec=' + rep.codecs + ' reason=' + this.lastSwitchReason);
     this._prepareRep(rep).then(function () {
+      var videoReady;
       if (clearBuffer) {
         markSegmentsUnappended(rep);
-        return resetSourceBuffer(self.videoSb, self.video.currentTime).then(function () {
-          return self._changeVideoTypeIfNeeded(rep);
+        videoReady = resetSourceBuffer(self.videoSb, self.video.currentTime);
+      } else {
+        videoReady = Promise.resolve(self.videoSb._nativeQueue).catch(function () {}).then(function () {
+          return waitForSourceBufferIdle(self.videoSb);
         }).then(function () {
-          return appendBuffer(self.videoSb, rep.initData).then(function () {
-            rep._appendedInitKey = rep.generationKey || generationKeyForRep(rep);
-          });
+          markSegmentsCoveredByBuffer(rep, self.video);
         });
       }
-      return self._changeVideoTypeIfNeeded(rep).then(function () {
+      return videoReady.then(function () {
+        return self._changeVideoTypeIfNeeded(rep);
+      }).then(function () {
         return appendBuffer(self.videoSb, rep.initData).then(function () {
           rep._appendedInitKey = rep.generationKey || generationKeyForRep(rep);
-        }).catch(function () {});
+        });
       });
     }).then(function () {
+      self.activeVideo = rep;
+      self.lastSwitchAt = performance.now();
+      self.lastSwitchReason = switchReason;
+      self.videoSwitchInFlight = false;
+      self.engine._player.emit('variantchanged');
+      console.log('[native-dash] selected video id=' + rep.id + ' height=' + rep.height + ' codec=' + rep.codecs + ' reason=' + self.lastSwitchReason);
+      if (self._flushPendingVideoSwitch()) return;
       self._tick(true);
     }).catch(function (err) {
       self.blacklisted[rep.id] = true;
-      console.warn('[native-dash] switch failed id=' + rep.id + ': ' + err.message);
+      self.lastError = err && err.message ? err.message : 'dash-variant-switch-failed';
+      // A codec change can succeed before the new initialization append fails.
+      // Restore the previous SourceBuffer type before allowing its scheduler to
+      // continue, and never leave the failed rendition reported as active.
+      var restore = previous
+        ? self._changeVideoTypeIfNeeded(previous).then(function () {
+          if (!clearBuffer) return;
+          markSegmentsUnappended(previous);
+          return self._prepareRep(previous).then(function () {
+            return appendBuffer(self.videoSb, previous.initData);
+          }).then(function () {
+            previous._appendedInitKey = previous.generationKey || generationKeyForRep(previous);
+          });
+        }).catch(function (restoreError) {
+          self.lastError += '; rollback: ' + (restoreError && restoreError.message
+            ? restoreError.message
+            : 'dash-variant-rollback-failed');
+        })
+        : Promise.resolve();
+      restore.then(function () {
+        self.activeVideo = previous;
+        self.videoSwitchInFlight = false;
+        console.warn('[native-dash] switch failed id=' + rep.id + ': ' + self.lastError);
+        if (self._flushPendingVideoSwitch()) return;
+        self._tick(true);
+      });
     });
+  };
+
+  NativeDashProvider.prototype._flushPendingVideoSwitch = function () {
+    var pending = this.pendingManualVideoSwitch;
+    if (!pending || this.destroyed || this.videoSwitchInFlight) return false;
+    this.pendingManualVideoSwitch = null;
+    var rep = this.videoReps.find(function (item) { return item.id === pending.repId; });
+    if (!rep || !variantSelectable(this, rep)) return false;
+    if (this.activeVideo === rep) {
+      this.lastSwitchReason = 'manual';
+      return false;
+    }
+    this._switchVideo(rep, pending.clearBuffer, 'manual');
+    return this.videoSwitchInFlight;
   };
 
   NativeDashProvider.prototype._changeVideoTypeIfNeeded = function (rep) {
@@ -4613,6 +5076,13 @@
     if (!rep || !variantSelectable(this, rep)) return;
     this.manualTrackId = rep.id;
     this.engine._player.config.abr.enabled = false;
+    if (this.videoSwitchInFlight) {
+      this.pendingManualVideoSwitch = {
+        repId: rep.id,
+        clearBuffer: clearBuffer !== false
+      };
+      return;
+    }
     this._switchVideo(rep, clearBuffer !== false, 'manual');
   };
 
@@ -4794,6 +5264,11 @@
       assetUri: this.manifestUrl,
       bandwidthEstimate: Math.round(this.bandwidth || 0),
       lastBandwidthSample: Math.round(this.lastBandwidthSample || 0),
+      bandwidthFastEstimate: Math.round(this.bandwidthFast || 0),
+      bandwidthSlowEstimate: Math.round(this.bandwidthSlow || 0),
+      bandwidthTimeToFirstByteEstimateMs: Math.round(this.bandwidthTtfbEstimate || 0),
+      frameDropDownswitchCount: this.frameDropDownswitchCount || 0,
+      lastFrameDropRatio: this.lastFrameDropRatio || 0,
       bufferAhead: getBufferAhead(this.video),
       bufferedRangeCount: bufferedSummary.count,
       bufferedStart: bufferedSummary.start,
@@ -4839,6 +5314,8 @@
       unsupportedVideoCount: this.unsupportedVideoCount,
       unsupportedAudioCount: this.unsupportedAudioCount,
       lastSwitchReason: this.lastSwitchReason,
+      variantSwitchInFlight: !!this.videoSwitchInFlight,
+      pendingManualVariantId: this.pendingManualVideoSwitch ? this.pendingManualVideoSwitch.repId : '',
       fallbackReason: this.engine ? (this.engine._fallbackReason || '') : '',
       rebufferCount: this.rebufferCount,
       rebufferDuration: this.rebufferDuration + (this.rebufferStartedAt ? (performance.now() - this.rebufferStartedAt) / 1000 : 0),
@@ -4859,6 +5336,7 @@
       requestCancellationCount: this.requestCancellationCount,
       seekBufferPending: !!this.seekBufferPending,
       seekBufferReadyCount: this.seekBufferReadyCount || 0,
+      bufferedSeekCount: this.bufferedSeekCount || 0,
       seekCount: this.seekCount || 0,
       seekCancelCount: this.seekCancelCount || 0,
       seekAbortCount: this.seekAbortCount || 0,
@@ -4935,7 +5413,12 @@
   };
 
   NativeDashProvider.prototype.commitSeek = function (targetTime) {
-    var target = this.beginSeek(targetTime);
+    var target = this._clampSeekTarget(targetTime);
+    if (!this.seekBufferPending
+      || !this.lastSeekStartedAt
+      || Math.abs(target - this.lastSeekTarget) > 0.05) {
+      this.beginSeek(target);
+    }
     this.seekCount++;
     try { this.video.currentTime = target; } catch (e) {}
     this._onSeek(target);
@@ -4952,6 +5435,7 @@
   NativeDashProvider.prototype.endSeek = function () {
     if (this.lastSeekStartedAt) this.lastSeekMs = performance.now() - this.lastSeekStartedAt;
     this.lastSeekStartedAt = 0;
+    this.seekBufferPending = false;
     if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
   };
 
@@ -4973,6 +5457,15 @@
     this.pendingSeek++;
     this.lastSeekTarget = target;
     this.seekBufferPending = true;
+    if (bufferedContains(this.video.buffered, target)) {
+      this.seekBufferPending = false;
+      this.seekBufferReadyCount++;
+      this.bufferedSeekCount++;
+      if (this.engine && this.engine._telemetry) {
+        this.engine._telemetry.record('seek-buffer-ready', { buffered: true });
+      }
+      return;
+    }
     var cancelled = this._abortRequests();
     if (cancelled > 0) this.seekAbortCount += cancelled;
     markSegmentsForTime(this.activeVideo, target, Math.max(2, this._seekBufferGoal()));
@@ -5120,7 +5613,7 @@
     var gap = nextBufferedGap(this.video);
     if (!gap || gap.size <= 0 || gap.size > MAX_GAP_JUMP) return false;
     try {
-      this.video.currentTime = gap.start + 0.01;
+      assignInternalMediaTime(this, gap.start + 0.01);
       this.gapJumpCount++;
       this.lastGapSize = gap.size;
       this.lastError = 'gap-jump';
@@ -5137,7 +5630,7 @@
     if (!this.liveWindow) return;
     var start = Math.max(this.liveWindow.start, this.liveWindow.end - LIVE_TARGET_LATENCY);
     if (!this.video.currentTime || this.video.currentTime < this.liveWindow.start || this.video.currentTime > this.liveWindow.end) {
-      try { this.video.currentTime = start; } catch (e) {}
+      assignInternalMediaTime(this, start);
     }
     this._updateLivePositionStats();
   };
@@ -5165,11 +5658,11 @@
     this.liveLatency = Math.max(0, edge - (this.video.currentTime || 0));
     this.atLiveEdge = this.liveLatency <= LIVE_TARGET_LATENCY + 1;
     if ((this.video.currentTime || 0) < liveRange.start - 0.1) {
-      try { this.video.currentTime = liveRange.start; } catch (e) {}
+      assignInternalMediaTime(this, liveRange.start);
     }
     if (!this.video.seeking && getBufferAhead(this.video) > 2 && this.liveLatency > LIVE_MAX_LATENCY) {
       try {
-        this.video.currentTime = Math.max(liveRange.start, edge - LIVE_TARGET_LATENCY);
+        assignInternalMediaTime(this, Math.max(liveRange.start, edge - LIVE_TARGET_LATENCY));
         this.liveLatency = Math.max(0, edge - (this.video.currentTime || 0));
         this.atLiveEdge = true;
         this.engine._telemetry.record('recovery', { lastError: 'live-edge-drift' });
@@ -5284,6 +5777,7 @@
     this._abortRequests();
     if (this._boundTick) this.video.removeEventListener('timeupdate', this._boundTick);
     if (this._boundSeek) this.video.removeEventListener('seeking', this._boundSeek);
+    if (this._boundSeeked) this.video.removeEventListener('seeked', this._boundSeeked);
     if (this._boundNativeTextCueUpdate) {
       this.video.removeEventListener('timeupdate', this._boundNativeTextCueUpdate);
       this.video.removeEventListener('seeking', this._boundNativeTextCueUpdate);
@@ -5353,6 +5847,8 @@
     var sessionData = [];
     var segments = [];
     var pendingParts = [];
+    var lastPartRangeEnd = -1;
+    var lastPartRangeUri = '';
     var preloadHints = [];
     var renditionReports = [];
     var serverControl = null;
@@ -5373,6 +5869,7 @@
     var discontinuitySequence = 0;
     var currentDiscontinuitySequence = 0;
     var pendingDiscontinuity = false;
+    var pendingGap = false;
     var endList = false;
     var targetDuration = 0;
     var mediaSequence = 0;
@@ -5391,7 +5888,7 @@
       if (!line) continue;
       if (line.indexOf('#EXT-X-MEDIA-SEQUENCE') === 0) {
         mediaSequence = parseInt(line.split(':')[1] || '0', 10) || 0;
-        if (!segments.length && targetDuration > 0) timeline = mediaSequence * targetDuration;
+        if (!segments.length && targetDuration > 0) timeline = (mediaSequence + skippedSegmentCount) * targetDuration;
       } else if (line.indexOf('#EXT-X-STREAM-INF') === 0) {
         var attrs = hlsAttrs(line);
         var uri = nextHlsUri(lines, i + 1);
@@ -5557,13 +6054,18 @@
         var partAttrs = hlsAttrs(line);
         var partUri = unquote(partAttrs.URI || '');
         if (partUri) {
+          var resolvedPartUri = resolveUrl(partUri, playlistUrl);
+          var partRangeBase = resolvedPartUri === lastPartRangeUri ? lastPartRangeEnd : -1;
+          var partRange = hlsByteRange(unquote(partAttrs.BYTERANGE || ''), partRangeBase);
           pendingParts.push({
-            url: resolveUrl(partUri, playlistUrl),
+            url: resolvedPartUri,
             duration: parseFloat(unquote(partAttrs.DURATION || '')) || 0,
             independent: String(unquote(partAttrs.INDEPENDENT || '')).toUpperCase() === 'YES',
             gap: String(unquote(partAttrs.GAP || '')).toUpperCase() === 'YES',
-            range: hlsByteRange(unquote(partAttrs.BYTERANGE || ''), -1)
+            range: partRange
           });
+          lastPartRangeEnd = partRange ? partRange.end : -1;
+          lastPartRangeUri = partRange ? resolvedPartUri : '';
         }
       } else if (line.indexOf('#EXT-X-PRELOAD-HINT') === 0) {
         var hintAttrs = hlsAttrs(line);
@@ -5586,6 +6088,7 @@
         var skipAttrs = hlsAttrs(line);
         var skipped = parseInt(unquote(skipAttrs['SKIPPED-SEGMENTS'] || '0'), 10) || 0;
         skippedSegmentCount += skipped;
+        if (!segments.length && skipped > 0 && targetDuration > 0) timeline += skipped * targetDuration;
         if (skipped > 0) warnings = mergeUnique(warnings, ['hls-delta-update-skipped-segments']);
       } else if (line.indexOf('#EXT-X-CONTENT-STEERING') === 0) {
         var steeringAttrs = hlsAttrs(line);
@@ -5609,12 +6112,14 @@
         discontinuityCount++;
         currentDiscontinuitySequence++;
         pendingDiscontinuity = true;
+      } else if (line === '#EXT-X-GAP') {
+        pendingGap = true;
       } else if (line.indexOf('#EXT-X-TARGETDURATION') === 0) {
         targetDuration = parseFloat(line.split(':')[1] || '0') || 0;
-        if (!segments.length && mediaSequence > 0 && targetDuration > 0) timeline = mediaSequence * targetDuration;
+        if (!segments.length && targetDuration > 0) timeline = (mediaSequence + skippedSegmentCount) * targetDuration;
       } else if (line.indexOf('#EXT-X-MEDIA-SEQUENCE') === 0) {
         mediaSequence = parseInt(line.split(':')[1] || '0', 10) || 0;
-        if (!segments.length && targetDuration > 0) timeline = mediaSequence * targetDuration;
+        if (!segments.length && targetDuration > 0) timeline = (mediaSequence + skippedSegmentCount) * targetDuration;
       } else if (line.indexOf('#EXT-X-ENDLIST') === 0) {
         endList = true;
       } else if (line.indexOf('#EXTINF') === 0) {
@@ -5628,16 +6133,21 @@
           start: timeline,
           end: timeline + pendingDuration,
           duration: pendingDuration,
-          mediaSequence: mediaSequence + segments.length,
+          mediaSequence: mediaSequence + skippedSegmentCount + segments.length,
           discontinuity: pendingDiscontinuity,
           discontinuitySequence: currentDiscontinuitySequence,
+          gap: pendingGap,
           url: resolveUrl(line, playlistUrl),
-          range: range
+          range: range,
+          _hlsPartialOnly: false,
+          _hlsPlaylistUrl: playlistUrl
         };
         if (imageTiles) segment.tiles = imageTiles;
         if (pendingParts.length) {
           segment.parts = normalizeHlsParts(pendingParts, segment);
           pendingParts = [];
+          lastPartRangeEnd = -1;
+          lastPartRangeUri = '';
         }
         if (currentKey) segment.key = currentKey;
         if (isFinite(pendingProgramDateTimeMs)) segment.programDateTimeMs = pendingProgramDateTimeMs;
@@ -5648,7 +6158,36 @@
         pendingDuration = 0;
         nextRange = null;
         pendingDiscontinuity = false;
+        pendingGap = false;
       }
+    }
+    // The live edge of an LL-HLS Playlist normally contains Partial Segments
+    // whose Parent Segment does not have an EXTINF/URI yet. Represent that
+    // in-progress parent explicitly so its parts participate in scheduling.
+    if (pendingParts.length) {
+      var partialDuration = pendingParts.reduce(function (sum, part) {
+        return sum + (part.duration || 0);
+      }, 0);
+      var partialParent = {
+        start: timeline,
+        end: timeline + partialDuration,
+        duration: partialDuration,
+        mediaSequence: mediaSequence + skippedSegmentCount + segments.length,
+        discontinuity: pendingDiscontinuity,
+        discontinuitySequence: currentDiscontinuitySequence,
+        gap: false,
+        url: '',
+        range: null,
+        _hlsPartialOnly: true,
+        _hlsPlaylistUrl: playlistUrl
+      };
+      if (currentKey) partialParent.key = currentKey;
+      if (isFinite(pendingProgramDateTimeMs)) partialParent.programDateTimeMs = pendingProgramDateTimeMs;
+      partialParent.parts = normalizeHlsParts(pendingParts, partialParent);
+      segments.push(partialParent);
+      timeline += partialDuration;
+      duration = timeline;
+      pendingParts = [];
     }
     return {
       variants: variants,
@@ -5663,9 +6202,12 @@
       renditionReports: renditionReports,
       serverControl: serverControl,
       partTargetDuration: partTargetDuration,
-      partialSegmentCount: segments.reduce(function (count, segment) { return count + ((segment.parts && segment.parts.length) || 0); }, 0) + pendingParts.length,
+      partialSegmentCount: segments.reduce(function (count, segment) { return count + ((segment.parts && segment.parts.length) || 0); }, 0),
+      partialSegmentGapCount: segments.reduce(function (count, segment) {
+        return count + ((segment.parts || []).filter(function (part) { return part.gap; }).length);
+      }, 0),
       skippedSegmentCount: skippedSegmentCount,
-      lowLatencyPlaylist: !!(partTargetDuration || preloadHints.length || renditionReports.length || pendingParts.length || serverControl),
+      lowLatencyPlaylist: !!(partTargetDuration || preloadHints.length || segments.some(function (segment) { return !!(segment.parts && segment.parts.length); })),
       imagesOnly: !!imageTiles,
       contentSteeringUri: contentSteeringUri,
       contentSteeringPathwayId: contentSteeringPathwayId,
@@ -7323,6 +7865,31 @@
     return target;
   }
 
+  function assignInternalMediaTime(provider, target) {
+    if (!provider || !provider.video || !isFinite(Number(target))) return false;
+    var normalizedTarget = Number(target);
+    provider._internalMediaSeekTarget = normalizedTarget;
+    provider._internalMediaSeekExpiresAt = performance.now() + 2000;
+    try {
+      provider.video.currentTime = normalizedTarget;
+      return true;
+    } catch (e) {
+      provider._internalMediaSeekTarget = null;
+      provider._internalMediaSeekExpiresAt = 0;
+      return false;
+    }
+  }
+
+  function isInternalMediaSeek(provider) {
+    if (!provider || provider._internalMediaSeekTarget == null || !isFinite(provider._internalMediaSeekTarget)) return false;
+    if (performance.now() > (provider._internalMediaSeekExpiresAt || 0)) {
+      provider._internalMediaSeekTarget = null;
+      provider._internalMediaSeekExpiresAt = 0;
+      return false;
+    }
+    return Math.abs((provider.video.currentTime || 0) - provider._internalMediaSeekTarget) <= 0.5;
+  }
+
   function applyPendingLoadStartTime(provider) {
     var target = pendingLoadStartTime(provider);
     if (target == null || !provider.video) return Promise.resolve();
@@ -7462,6 +8029,123 @@
     return 0;
   }
 
+  function updateEwma(provider, accumulatorKey, weightKey, sample, weight, halfLife) {
+    var alpha = Math.exp(Math.log(0.5) / halfLife);
+    var adjustedAlpha = Math.pow(alpha, Math.max(0.001, weight));
+    provider[accumulatorKey] = sample * (1 - adjustedAlpha)
+      + adjustedAlpha * (provider[accumulatorKey] || 0);
+    provider[weightKey] = (provider[weightKey] || 0) + Math.max(0.001, weight);
+    var zeroFactor = 1 - Math.pow(alpha, provider[weightKey]);
+    return zeroFactor > 0 ? provider[accumulatorKey] / zeroFactor : sample;
+  }
+
+  function updateTimeToFirstByteEstimate(provider, timeToFirstByteMs) {
+    if (!isFinite(timeToFirstByteMs) || timeToFirstByteMs < 0) {
+      return provider.bandwidthTtfbEstimate || DEFAULT_TIME_TO_FIRST_BYTE_MS;
+    }
+    var seconds = timeToFirstByteMs / 1000;
+    var weight = Math.sqrt(2) * Math.exp(-(seconds * seconds) / 2);
+    provider.bandwidthTtfbEstimate = updateEwma(
+      provider,
+      'bandwidthTtfbAccumulator',
+      'bandwidthTtfbWeight',
+      Math.max(5, timeToFirstByteMs),
+      weight,
+      BANDWIDTH_SLOW_HALF_LIFE
+    );
+    return provider.bandwidthTtfbEstimate;
+  }
+
+  function bandwidthSampleDuration(provider, elapsedMs, timeToFirstByteMs) {
+    var elapsed = Math.max(1, Number(elapsedMs) || 0);
+    if (!isFinite(timeToFirstByteMs) || timeToFirstByteMs < 0) return elapsed;
+    var estimate = updateTimeToFirstByteEstimate(provider, timeToFirstByteMs);
+    return Math.max(
+      MIN_BANDWIDTH_SAMPLE_MS,
+      elapsed - Math.min(timeToFirstByteMs, estimate)
+    );
+  }
+
+  // Samples are weighted by transfer duration. This prevents a tiny LL-HLS
+  // part from having the same influence as a multi-second media fragment.
+  function updateBandwidthEstimate(provider, sample, sampleDurationMs) {
+    var weight = Math.max(MIN_BANDWIDTH_SAMPLE_MS, sampleDurationMs || 0) / 1000;
+    provider.bandwidthFast = updateEwma(
+      provider,
+      'bandwidthFastAccumulator',
+      'bandwidthFastWeight',
+      sample,
+      weight,
+      BANDWIDTH_FAST_HALF_LIFE
+    );
+    provider.bandwidthSlow = updateEwma(
+      provider,
+      'bandwidthSlowAccumulator',
+      'bandwidthSlowWeight',
+      sample,
+      weight,
+      BANDWIDTH_SLOW_HALF_LIFE
+    );
+    provider.bandwidth = Math.min(provider.bandwidthFast, provider.bandwidthSlow);
+  }
+
+  function abrSegmentDuration(provider) {
+    var segments = provider && provider.activeVideo && provider.activeVideo.segments
+      ? provider.activeVideo.segments
+      : (provider && provider.segments ? provider.segments : []);
+    var currentTime = provider && provider.video ? Number(provider.video.currentTime) || 0 : 0;
+    for (var i = 0; i < segments.length; i++) {
+      var segment = segments[i];
+      if (segment.end > currentTime - 0.05) {
+        var duration = Number(segment.duration) || (Number(segment.end) - Number(segment.start));
+        if (isFinite(duration) && duration > 0) return duration;
+      }
+    }
+    return 4;
+  }
+
+  function abrUpgradeIsSafe(provider, candidate, bufferAhead) {
+    if (!provider || !candidate || !provider.bandwidthSamples || bufferAhead <= 0.05) return false;
+    var estimate = effectiveBandwidthEstimate(provider);
+    var bitrate = Number(candidate.bandwidth) || 0;
+    if (!isFinite(estimate) || estimate <= 0 || bitrate <= 0) return false;
+    var duration = abrSegmentDuration(provider);
+    var timeToFirstByte = (provider.bandwidthTtfbEstimate || DEFAULT_TIME_TO_FIRST_BYTE_MS) / 1000;
+    var predictedFetchSeconds = timeToFirstByte + bitrate * duration / estimate;
+    // Upgrade only when the next higher-quality fragment is expected to arrive
+    // before the already-buffered media is exhausted.
+    return predictedFetchSeconds <= bufferAhead + 0.05;
+  }
+
+  function sampleFramePressure(provider, now) {
+    var abr = provider && provider.engine && provider.engine._player
+      ? provider.engine._player.config.abr || {}
+      : {};
+    if (abr.capLevelOnFPSDrop === false || !provider.video || !provider.video.getVideoPlaybackQuality) return false;
+    now = isFinite(now) ? now : performance.now();
+    var quality;
+    try { quality = provider.video.getVideoPlaybackQuality(); } catch (e) { return false; }
+    if (!quality) return false;
+    var dropped = Number(quality.droppedVideoFrames) || 0;
+    var total = Number(quality.totalVideoFrames) || 0;
+    if (!provider.lastFrameSampleAt) {
+      provider.lastFrameSampleAt = now;
+      provider.lastDroppedFrames = dropped;
+      provider.lastTotalFrames = total;
+      return false;
+    }
+    if (now - provider.lastFrameSampleAt < FRAME_SAMPLE_INTERVAL_MS) return false;
+    var droppedDelta = Math.max(0, dropped - (provider.lastDroppedFrames || 0));
+    var totalDelta = Math.max(0, total - (provider.lastTotalFrames || 0));
+    provider.lastFrameSampleAt = now;
+    provider.lastDroppedFrames = dropped;
+    provider.lastTotalFrames = total;
+    provider.lastFrameDropRatio = totalDelta ? droppedDelta / totalDelta : 0;
+    return totalDelta >= 24
+      && droppedDelta >= FRAME_DROP_MIN_COUNT
+      && provider.lastFrameDropRatio >= FRAME_DROP_RATIO_THRESHOLD;
+  }
+
   function bufferedContains(ranges, time) {
     if (!ranges || !isFinite(time)) return false;
     try {
@@ -7508,6 +8192,31 @@
     for (var i = 0; i < rep.segments.length; i++) {
       rep.segments[i].appended = false;
       rep.segments[i].state = 'pending';
+    }
+  }
+
+  function markSegmentsCoveredByBuffer(rep, video) {
+    if (!rep || !rep.segments || !video || !video.buffered) return;
+    var buffered = video.buffered;
+    for (var i = 0; i < rep.segments.length; i++) {
+      var seg = rep.segments[i];
+      if (seg.gap) continue;
+      for (var rangeIndex = 0; rangeIndex < buffered.length; rangeIndex++) {
+        if (
+          seg.start >= buffered.start(rangeIndex) - 0.05
+          && seg.end <= buffered.end(rangeIndex) + 0.05
+        ) {
+          seg.appended = true;
+          seg.state = 'appended';
+          if (seg.parts) {
+            for (var partIndex = 0; partIndex < seg.parts.length; partIndex++) {
+              seg.parts[partIndex].appended = true;
+              seg.parts[partIndex].state = 'appended';
+            }
+          }
+          break;
+        }
+      }
     }
   }
 
@@ -7558,7 +8267,13 @@
   function nextFetchedSegmentForAppend(rep, currentTime) {
     if (!rep || !rep.segments) return null;
     var fetched = rep.segments.filter(function (seg) {
-      return seg.state === 'fetched' && seg._data && seg.end > currentTime - 0.5;
+      // EXT-X-PRELOAD-HINT authorizes an early download, not speculative
+      // presentation. Keep the bytes parked until a subsequent EXT-X-PART
+      // confirms and adopts this object.
+      return seg.state === 'fetched'
+        && seg._data
+        && !seg._hlsPreloadHint
+        && seg.end > currentTime - 0.5;
     }).sort(function (a, b) {
       return a.start - b.start;
     });
@@ -7698,12 +8413,22 @@
   function mergeSegmentState(oldSegments, freshSegments) {
     if (!freshSegments || !freshSegments.length) return oldSegments || freshSegments;
     var oldByKey = {};
+    var oldBySequence = {};
     oldSegments = oldSegments || [];
-    for (var i = 0; i < oldSegments.length; i++) oldByKey[segmentKey(oldSegments[i])] = oldSegments[i];
+    for (var i = 0; i < oldSegments.length; i++) {
+      oldByKey[segmentKey(oldSegments[i])] = oldSegments[i];
+      var sequenceKey = hlsSequenceKey(oldSegments[i]);
+      if (sequenceKey) oldBySequence[sequenceKey] = oldSegments[i];
+    }
     return freshSegments.map(function (seg) {
       var old = oldByKey[segmentKey(seg)];
+      if (!old) {
+        var oldAtSequence = oldBySequence[hlsSequenceKey(seg)];
+        if (oldAtSequence && (oldAtSequence._hlsPartialOnly || seg._hlsPartialOnly)) old = oldAtSequence;
+      }
       if (old) {
         if (old.state === 'fetching' || old.state === 'fetched' || old.state === 'appending') {
+          var oldParts = old.parts;
           old.start = seg.start;
           old.end = seg.end;
           old.duration = seg.duration;
@@ -7712,10 +8437,14 @@
           old.discontinuitySequence = seg.discontinuitySequence;
           old.url = seg.url;
           old.range = seg.range;
-          old.parts = seg.parts || old.parts;
           old.key = seg.key || old.key;
+          old.gap = !!seg.gap;
+          old._hlsPartialOnly = !!seg._hlsPartialOnly;
+          old._hlsPlaylistUrl = seg._hlsPlaylistUrl || old._hlsPlaylistUrl;
           if (isFinite(seg.programDateTimeMs)) old.programDateTimeMs = seg.programDateTimeMs;
           mergeHlsPartState(old, seg);
+          old.parts = seg.parts || oldParts;
+          markCompletedHlsParent(old, null);
           return old;
         }
         seg.appended = old.appended;
@@ -7726,6 +8455,7 @@
           seg.state = old.state === 'failed' || old.state === 'recovering' || old.state === 'fetching' || old.state === 'fetched' ? '' : old.state;
         }
         mergeHlsPartState(old, seg);
+        markCompletedHlsParent(seg, old);
       }
       return seg;
     });
@@ -7736,11 +8466,54 @@
     var oldByKey = {};
     for (var i = 0; i < oldSeg.parts.length; i++) oldByKey[segmentKey(oldSeg.parts[i])] = oldSeg.parts[i];
     for (var j = 0; j < freshSeg.parts.length; j++) {
-      var old = oldByKey[segmentKey(freshSeg.parts[j])];
+      var fresh = freshSeg.parts[j];
+      var old = oldByKey[segmentKey(fresh)];
       if (!old) continue;
-      freshSeg.parts[j].appended = old.appended;
-      freshSeg.parts[j].state = old.state === 'recovering' || old.state === 'fetching' ? '' : old.state;
+      if (old.state === 'fetching' || old.state === 'fetched' || old.state === 'appending') {
+        old.start = fresh.start;
+        old.end = fresh.end;
+        old.duration = fresh.duration;
+        old.mediaSequence = fresh.mediaSequence;
+        old.partIndex = fresh.partIndex;
+        old.discontinuity = fresh.discontinuity;
+        old.discontinuitySequence = fresh.discontinuitySequence;
+        old.independent = fresh.independent;
+        old.gap = fresh.gap;
+        old.key = fresh.key || old.key;
+        old._parentSegment = freshSeg;
+        old._hlsPart = true;
+        old._hlsPreloadHint = false;
+        freshSeg.parts[j] = old;
+        continue;
+      }
+      fresh.appended = old.appended;
+      fresh.state = old.state === 'recovering' ? '' : old.state;
     }
+  }
+
+  function hlsSequenceKey(seg) {
+    if (!seg || seg.mediaSequence == null || !seg._hlsPlaylistUrl) return '';
+    return seg._hlsPlaylistUrl + ':ms' + seg.mediaSequence + ':ds' + (seg.discontinuitySequence || 0);
+  }
+
+  function markCompletedHlsParent(parent, previous) {
+    if (!parent || parent._hlsPartialOnly || parent.gap) return;
+    var parts = parent.parts || [];
+    var allCurrentPartsAppended = parts.length && parts.every(function (part) {
+      return !part.gap && (part.appended || part.state === 'appended');
+    });
+    var previousParts = previous && previous.parts ? previous.parts : [];
+    var previousDuration = previousParts.reduce(function (sum, part) {
+      return sum + (part.duration || 0);
+    }, 0);
+    var allPreviousPartsAppended = previousParts.length && previousParts.every(function (part) {
+      return !part.gap && (part.appended || part.state === 'appended');
+    });
+    var previousPartsCoverParent = allPreviousPartsAppended
+      && previousDuration >= (parent.duration || 0) - 0.05;
+    if (!allCurrentPartsAppended && !previousPartsCoverParent) return;
+    parent.appended = true;
+    parent.state = 'appended';
   }
 
   function normalizeHlsParts(parts, segment) {
@@ -7765,67 +8538,245 @@
     return out;
   }
 
+  function hlsHintRange(hint) {
+    if (!hint) return null;
+    var length = isFinite(hint.byteRangeLength) ? hint.byteRangeLength : NaN;
+    var start = isFinite(hint.byteRangeStart) ? hint.byteRangeStart : NaN;
+    return isFinite(start) && isFinite(length) && length > 0
+      ? { start: start, end: start + length - 1 }
+      : null;
+  }
+
+  function hlsHintKey(url, range) {
+    return String(url || '') + (range ? ':' + range.start + '-' + range.end : '');
+  }
+
+  function reconcileHlsPreloadHints(provider, track, parsed) {
+    if (!track || !track._preloadHintSegments) return;
+    var hintsByKey = track._preloadHintSegments;
+    var retained = {};
+    var segments = parsed && parsed.segments ? parsed.segments : [];
+    for (var i = 0; i < segments.length; i++) {
+      var parts = segments[i].parts || [];
+      for (var p = 0; p < parts.length; p++) {
+        var official = parts[p];
+        var officialKey = hlsHintKey(official.url, official.range);
+        retained[officialKey] = true;
+        var hinted = hintsByKey[officialKey];
+        if (!hinted) continue;
+        hinted.start = official.start;
+        hinted.end = official.end;
+        hinted.duration = official.duration;
+        hinted.mediaSequence = official.mediaSequence;
+        hinted.partIndex = official.partIndex;
+        hinted.discontinuity = official.discontinuity;
+        hinted.discontinuitySequence = official.discontinuitySequence;
+        hinted.independent = official.independent;
+        hinted.gap = official.gap;
+        hinted.key = official.key;
+        hinted.range = official.range;
+        hinted._parentSegment = segments[i];
+        hinted._hlsPart = true;
+        hinted._hlsPreloadHint = false;
+        hinted._hlsPreloadHintStale = false;
+        if (hinted.state === 'failed' || hinted.state === 'expired') {
+          hinted.state = 'pending';
+          hinted.appended = false;
+        }
+        parts[p] = hinted;
+        delete hintsByKey[officialKey];
+        if (provider) provider.preloadHintReuseCount++;
+      }
+    }
+    var nextHints = parsed && parsed.preloadHints ? parsed.preloadHints : [];
+    for (var h = 0; h < nextHints.length; h++) {
+      retained[hlsHintKey(nextHints[h].url, hlsHintRange(nextHints[h]))] = true;
+    }
+    for (var key in hintsByKey) {
+      if (!hintsByKey.hasOwnProperty(key) || retained[key]) continue;
+      hintsByKey[key]._hlsPreloadHintStale = true;
+      if (hintsByKey[key].state !== 'fetching' && hintsByKey[key].state !== 'appending') {
+        hintsByKey[key].state = 'expired';
+        delete hintsByKey[key]._data;
+      }
+      delete hintsByKey[key];
+      if (provider) provider.preloadHintDiscardCount++;
+    }
+  }
+
+  function hlsDeliveryCursor(track) {
+    if (!track || !track.segments || !track.segments.length) return null;
+    var tail = track.segments[track.segments.length - 1];
+    if (tail.mediaSequence == null) return null;
+    if (tail._hlsPartialOnly) {
+      return {
+        msn: tail.mediaSequence,
+        part: Math.max(-1, ((tail.parts && tail.parts.length) || 0) - 1),
+        partial: true
+      };
+    }
+    return { msn: tail.mediaSequence, part: -1, partial: false };
+  }
+
+  function hlsCursorAdvanced(previous, current) {
+    if (!previous) return !!current;
+    if (!current) return false;
+    if (current.msn !== previous.msn) return current.msn > previous.msn;
+    if (previous.partial && !current.partial) return true;
+    if (!previous.partial && current.partial) return false;
+    return current.part > previous.part;
+  }
+
+  function hlsBlockingReloadUrl(url, track) {
+    if (!url || !track || !track.serverControl || !track.serverControl.canBlockReload) return url;
+    var cursor = hlsDeliveryCursor(track);
+    if (!cursor) return url;
+    var msn = cursor.partial ? cursor.msn : cursor.msn + 1;
+    var part = cursor.partial
+      ? cursor.part + 1
+      : (track.lowLatencyPlaylist && track.partTargetDuration > 0 ? 0 : null);
+    try {
+      var requestUrl = new URL(url, window.location.href);
+      requestUrl.searchParams.set('_HLS_msn', String(msn));
+      if (part != null) requestUrl.searchParams.set('_HLS_part', String(part));
+      else requestUrl.searchParams.delete('_HLS_part');
+      return requestUrl.href;
+    } catch (e) {
+      return url;
+    }
+  }
+
   function hlsPlayableSegments(provider, track, segments) {
     if (!segments || !segments.length) return segments || [];
-    if (!provider || !provider.live || !track || track.isTsPlaylist || provider.isTsPlaylist && track.kind === 'video') return segments;
+    var withoutDeclaredGaps = segments.filter(function (segment) { return !segment.gap; });
+    if (!provider || !provider.live || !track || track.isTsPlaylist || provider.isTsPlaylist && (track === provider || track.kind === 'video')) {
+      return withoutDeclaredGaps;
+    }
     var lowLatency = track.lowLatencyPlaylist || provider.lowLatencyPlaylist;
-    if (!lowLatency) return segments;
+    if (!lowLatency) return withoutDeclaredGaps;
     var out = [];
-    var ct = provider.video && isFinite(provider.video.currentTime) ? provider.video.currentTime : 0;
+    var isVideo = track === provider || track.kind === 'video';
+    // Before MSE has metadata, assigning the live startup time may not update
+    // HTMLMediaElement.currentTime yet. Use the scheduler's pending startup or
+    // seek target so LL parts are selected instead of prematurely fetching the
+    // full parent segment.
+    var schedulerTime = provider._schedulerTime ? provider._schedulerTime() : NaN;
+    var ct = isFinite(schedulerTime)
+      ? schedulerTime
+      : (provider.video && isFinite(provider.video.currentTime) ? provider.video.currentTime : 0);
     var liveEnd = provider.liveWindow ? provider.liveWindow.end : 0;
-    var nearLiveEdge = liveEnd && liveEnd - ct <= Math.max(LIVE_TARGET_LATENCY + 2, provider._bufferAheadGoal ? provider._bufferAheadGoal() : BUFFER_AHEAD);
-    for (var i = 0; i < segments.length; i++) {
-      var seg = segments[i];
+    var targetLatency = provider._targetLiveLatency ? provider._targetLiveLatency() : LIVE_TARGET_LATENCY;
+    var nearLiveEdge = liveEnd && liveEnd - ct <= Math.max(targetLatency + 2, provider._bufferAheadGoal ? provider._bufferAheadGoal() : BUFFER_AHEAD);
+    for (var i = 0; i < withoutDeclaredGaps.length; i++) {
+      var seg = withoutDeclaredGaps[i];
       var parts = seg.parts || [];
-      var usableParts = lowLatency && parts.length && nearLiveEdge && firstUsableHlsPart(parts);
-      if (usableParts && !seg.appended && seg.state !== 'appended') {
-        var failedPart = parts.some(function (part) { return part.state === 'failed'; });
-        if (!failedPart) {
-          for (var p = 0; p < parts.length; p++) out.push(parts[p]);
+      var usableParts = lowLatency && parts.length && nearLiveEdge
+        ? playableHlsParts(parts, isVideo)
+        : [];
+      if (usableParts.length && !seg.appended && seg.state !== 'appended') {
+        var unavailablePart = parts.some(function (part) { return part.gap || part.state === 'failed'; });
+        if (!unavailablePart || seg._hlsPartialOnly) {
+          for (var p = 0; p < usableParts.length; p++) out.push(usableParts[p]);
           continue;
         }
       }
+      // An in-progress Parent Segment has no resource of its own to fetch.
+      // Wait for another playlist update when none of its published parts can
+      // be decoded; never issue a request for its intentionally empty URL.
+      if (seg._hlsPartialOnly) continue;
       out.push(seg);
     }
     appendHlsPreloadHint(provider, track, out);
     return out;
   }
 
-  function firstUsableHlsPart(parts) {
-    if (!parts || !parts.length) return false;
-    return !!parts[0].independent;
+  function hlsIndependentPartStart(segments, time) {
+    if (!segments || !segments.length || !isFinite(time)) return time;
+    var selected = -1;
+    for (var i = 0; i < segments.length; i++) {
+      var part = segments[i];
+      if (!part || !part._hlsPart) continue;
+      if (part.start <= time + 0.05 && (!part._parentSegment || time <= part._parentSegment.end + 0.1)) {
+        selected = i;
+        continue;
+      }
+      if (part.start > time + 0.05) break;
+    }
+    if (selected < 0) return time;
+    var parent = segments[selected]._parentSegment;
+    for (var j = selected; j >= 0; j--) {
+      var candidate = segments[j];
+      if (!candidate || !candidate._hlsPart) continue;
+      if (parent && candidate._parentSegment !== parent) break;
+      if (candidate.independent) return Math.min(time, candidate.start);
+    }
+    return time;
+  }
+
+  function hlsNextPlayableStart(segments, time) {
+    if (!segments || !segments.length || !isFinite(time)) return time;
+    for (var i = 0; i < segments.length; i++) {
+      var segment = segments[i];
+      if (!segment || segment.gap || segment.state === 'expired' || segment.end <= time - 0.05) continue;
+      return segment.start > time + 0.05 ? segment.start : time;
+    }
+    return time;
+  }
+
+  function playableHlsParts(parts, requireIndependent) {
+    var out = [];
+    var decodable = !requireIndependent;
+    for (var i = 0; i < (parts || []).length; i++) {
+      var part = parts[i];
+      if (part.gap || part.state === 'failed') {
+        decodable = !requireIndependent;
+        continue;
+      }
+      if (part.independent) decodable = true;
+      if (decodable) out.push(part);
+    }
+    return out;
   }
 
   function appendHlsPreloadHint(provider, track, out) {
-    if (!provider || !track || track.kind !== 'video' || !provider.live || !provider.lowLatencyPlaylist) return;
-    if (!provider.serverControl || !provider.serverControl.canBlockReload) return;
-    if (provider.isTsPlaylist || getBufferAhead(provider.video) >= Math.min(1, provider._startupBufferGoal ? provider._startupBufferGoal() : 1)) return;
-    var hints = provider.preloadHints || [];
+    if (!provider || !track || !provider.live) return;
+    var isVideo = track === provider || track.kind === 'video';
+    var source = isVideo ? provider : track;
+    if (!source.lowLatencyPlaylist || source.isTsPlaylist || (isVideo && provider.isTsPlaylist)) return;
+    if (getBufferAhead(provider.video) >= Math.min(1, provider._startupBufferGoal ? provider._startupBufferGoal() : 1)) return;
+    var hints = source.preloadHints || [];
     for (var i = 0; i < hints.length; i++) {
       var hint = hints[i];
       if (String(hint.type || '').toUpperCase() !== 'PART' || !hint.url) continue;
-      var length = isFinite(hint.byteRangeLength) ? hint.byteRangeLength : NaN;
-      var start = isFinite(hint.byteRangeStart) ? hint.byteRangeStart : NaN;
-      var range = isFinite(start) && isFinite(length) && length > 0 ? { start: start, end: start + length - 1 } : null;
-      provider._preloadHintSegment = provider._preloadHintSegment || {};
-      var key = hint.url + (range ? ':' + range.start + '-' + range.end : '');
-      var seg = provider._preloadHintSegment[key];
+      var range = hlsHintRange(hint);
+      source._preloadHintSegments = source._preloadHintSegments || {};
+      var key = hlsHintKey(hint.url, range);
+      var seg = source._preloadHintSegments[key];
       if (!seg) {
-        var liveEnd = provider.liveWindow ? provider.liveWindow.end : 0;
-        var duration = provider.partTargetDuration || 0.25;
-        seg = provider._preloadHintSegment[key] = {
+        var sourceSegments = source.segments || [];
+        var tail = sourceSegments.length ? sourceSegments[sourceSegments.length - 1] : null;
+        var liveEnd = tail ? tail.end : (provider.liveWindow ? provider.liveWindow.end : 0);
+        var duration = source.partTargetDuration || provider.partTargetDuration || 0.25;
+        var cursor = hlsDeliveryCursor(source);
+        var mediaSequence = cursor
+          ? (cursor.partial ? cursor.msn : cursor.msn + 1)
+          : (source.mediaSequence || 0) + sourceSegments.length;
+        var partIndex = cursor && cursor.partial ? cursor.part + 1 : 0;
+        seg = source._preloadHintSegments[key] = {
           start: liveEnd,
           end: liveEnd + duration,
           duration: duration,
-          mediaSequence: provider.mediaSequence + (provider.segments ? provider.segments.length : 0),
-          discontinuitySequence: provider.discontinuitySequence || 0,
+          mediaSequence: mediaSequence,
+          partIndex: partIndex,
+          discontinuitySequence: source.discontinuitySequence || provider.discontinuitySequence || 0,
           url: hint.url,
           range: range,
+          _hlsPlaylistUrl: source.playlistUrl || provider.mediaPlaylistUrl || '',
           _hlsPreloadHint: true,
           _hlsPart: true
         };
       }
-      if (!isSegmentBusyOrDone(seg) && seg.state !== 'failed') out.push(seg);
+      if (!seg._hlsPreloadHintStale && !isSegmentBusyOrDone(seg) && seg.state !== 'failed' && seg.state !== 'expired') out.push(seg);
       break;
     }
   }
@@ -8510,6 +9461,14 @@
     return (seg.url || String(seg.start)) + range + hlsSeq + hlsPart;
   }
 
+  function hlsInitSegmentKey(initSegment) {
+    if (!initSegment) return '';
+    var range = initSegment.range
+      ? ':' + initSegment.range.start + '-' + initSegment.range.end
+      : '';
+    return String(initSegment.url || '') + range;
+  }
+
   function hlsFmp4TimestampOffset() {
     // CMAF/fMP4 fragments carry their media timeline in tfdt. Applying the HLS
     // playlist start again doubles timestamps (0, 2, 4... for 1s fragments) and
@@ -8715,7 +9674,7 @@
     if (provider && !provider.bandwidthSamples && abr.useNetworkInformation !== false && navigator.connection && navigator.connection.downlink) {
       return navigator.connection.downlink * 1000000;
     }
-    return (provider && provider.bandwidth) || abr.defaultBandwidthEstimate || 3000000;
+    return (provider && provider.bandwidth) || abr.defaultBandwidthEstimate || DEFAULT_BANDWIDTH_ESTIMATE;
   }
 
   function effectiveRetryParameters(provider) {
@@ -8932,6 +9891,7 @@
     getActiveAudioTrack: NativeUrlProvider.prototype.getActiveAudioTrack
   };
   window.NativeDashProviderForTest = {
+    _open: NativeDashProvider.prototype._open,
     _maybeEndVodStream: NativeDashProvider.prototype._maybeEndVodStream,
     _candidateVideos: NativeDashProvider.prototype._candidateVideos,
     _chooseForBudget: NativeDashProvider.prototype._chooseForBudget,
@@ -8976,7 +9936,9 @@
     _evictExpiredLiveSegmentState: NativeDashProvider.prototype._evictExpiredLiveSegmentState,
     _switchAudio: NativeDashProvider.prototype._switchAudio,
     _maybeSwitchAuto: NativeDashProvider.prototype._maybeSwitchAuto,
+    _flushPendingVideoSwitch: NativeDashProvider.prototype._flushPendingVideoSwitch,
     _recordBandwidthSample: NativeDashProvider.prototype._recordBandwidthSample,
+    _sampleFramePressure: sampleFramePressure,
     _recordRangeRecovery: NativeDashProvider.prototype._recordRangeRecovery,
     _recordRangeError: NativeDashProvider.prototype._recordRangeError,
     _fetchRange: NativeDashProvider.prototype._fetchRange,
@@ -9013,6 +9975,7 @@
     compareAudioReps: compareAudioReps
   };
   window.NativeHlsProviderForTest = {
+    _open: NativeHlsProvider.prototype._open,
     _maybeEndVodStream: NativeHlsProvider.prototype._maybeEndVodStream,
     _appendSegmentData: NativeHlsProvider.prototype._appendSegmentData,
     _recoverQuota: NativeHlsProvider.prototype._recoverQuota,
@@ -9027,7 +9990,18 @@
     _lowerVariant: NativeHlsProvider.prototype._lowerVariant,
     _fetchRange: NativeHlsProvider.prototype._fetchRange,
     _fetchPlaylistText: NativeHlsProvider.prototype._fetchPlaylistText,
+    _loadStartupMediaPlaylists: NativeHlsProvider.prototype._loadStartupMediaPlaylists,
+    _refreshMediaPlaylist: NativeHlsProvider.prototype._refreshMediaPlaylist,
+    _fetchReloadPlaylist: NativeHlsProvider.prototype._fetchReloadPlaylist,
+    _playlistRefreshDelay: NativeHlsProvider.prototype._playlistRefreshDelay,
+    hlsBlockingReloadUrl: hlsBlockingReloadUrl,
+    hlsPlayableSegments: hlsPlayableSegments,
+    reconcileHlsPreloadHints: reconcileHlsPreloadHints,
+    mergeSegmentState: mergeSegmentState,
+    nextFetchedSegmentForAppend: nextFetchedSegmentForAppend,
     _recordServiceWorkerFetch: NativeHlsProvider.prototype._recordServiceWorkerFetch,
+    _recordBandwidthSample: NativeHlsProvider.prototype._recordBandwidthSample,
+    _sampleFramePressure: sampleFramePressure,
     _recordOfflineHttpError: NativeHlsProvider.prototype._recordOfflineHttpError,
     _drainAppendQueue: NativeHlsProvider.prototype._drainAppendQueue,
     _ensureTsTransmuxer: NativeHlsProvider.prototype._ensureTsTransmuxer,
@@ -9037,6 +10011,7 @@
     chooseVariant: NativeHlsProvider.prototype.chooseVariant,
     getVariantTracks: NativeHlsProvider.prototype.getVariantTracks,
     selectVariantTrack: NativeHlsProvider.prototype.selectVariantTrack,
+    _flushPendingVariantSwitch: NativeHlsProvider.prototype._flushPendingVariantSwitch,
     getIFrameTracks: NativeHlsProvider.prototype.getIFrameTracks,
     getIFramePreview: NativeHlsProvider.prototype.getIFramePreview,
     _loadIFramePlaylist: NativeHlsProvider.prototype._loadIFramePlaylist,
@@ -9056,6 +10031,12 @@
     _onSeek: NativeHlsProvider.prototype._onSeek,
     _clampSeekTarget: NativeHlsProvider.prototype._clampSeekTarget,
     _seekBufferGoal: NativeHlsProvider.prototype._seekBufferGoal,
+    _startupBufferGoal: NativeHlsProvider.prototype._startupBufferGoal,
+    _bufferAheadGoal: NativeHlsProvider.prototype._bufferAheadGoal,
+    _bufferBehindGoal: NativeHlsProvider.prototype._bufferBehindGoal,
+    _targetLiveLatency: NativeHlsProvider.prototype._targetLiveLatency,
+    _defaultLiveStartTime: NativeHlsProvider.prototype._defaultLiveStartTime,
+    _updateLivePositionStats: NativeHlsProvider.prototype._updateLivePositionStats,
     _checkBufferMilestones: NativeHlsProvider.prototype._checkBufferMilestones,
     _abortRequests: NativeHlsProvider.prototype._abortRequests,
     getStats: NativeHlsProvider.prototype.getStats

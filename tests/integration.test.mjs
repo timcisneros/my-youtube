@@ -755,7 +755,7 @@ describe('HTTP endpoint smoke tests', () => {
   });
 
   it('GET /native-player-engine.js should always revalidate the player runtime', async () => {
-    const res = await httpGet(TEST_PORT, '/native-player-engine.js?v=13');
+    const res = await httpGet(TEST_PORT, '/native-player-engine.js?v=17');
     assert.strictEqual(res.status, 200);
     assert.match(res.headers['cache-control'] || '', /no-cache/);
   });

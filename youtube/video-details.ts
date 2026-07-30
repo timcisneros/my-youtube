@@ -5,30 +5,49 @@ import db from '../db.js';
 import { cache, withYtSlot, VIDEO_DETAILS_TTL } from './shared.js';
 import { getClientVersion } from '../extractors.js';
 
+const inFlightVideoDetails = new Map<string, ReturnType<typeof fetchInitialVideoDetails>>();
+
 // Get video details via oEmbed (fast, ~100ms) — enough to render page instantly
 async function getVideoDetails(videoId) {
   const cached = cache.videoDetails.get(videoId);
   if (cached && Date.now() < cached.expires) return cached.data;
   // Return stale enriched data rather than re-fetching incomplete oEmbed
   if (cached && cached.data.channelId) return cached.data;
+  const activeRequest = inFlightVideoDetails.get(videoId);
+  if (activeRequest !== undefined) return activeRequest;
 
+  const request = fetchInitialVideoDetails(videoId);
+  inFlightVideoDetails.set(videoId, request);
+  try {
+    return await request;
+  } finally {
+    if (inFlightVideoDetails.get(videoId) === request) inFlightVideoDetails.delete(videoId);
+  }
+}
+
+async function fetchInitialVideoDetails(videoId) {
   let title = '', channelTitle = '', channelId = '';
 
   // oEmbed — fast, gives title + channel name
+  let oembedTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`;
     const oembedCtrl = new AbortController();
-    const oembedTimer = setTimeout(() => oembedCtrl.abort(), 5000);
+    // Playback is the primary content on /watch. Do not let optional oEmbed
+    // metadata add several seconds to aggregate startup; the watch page fills
+    // richer metadata through /watch/details after the player is initialized.
+    oembedTimer = setTimeout(() => oembedCtrl.abort(), 750);
     const res = await fetch(oembedUrl, { signal: oembedCtrl.signal, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', 'Referer': '', 'Cookie': '' } });
     if (res.ok) {
       const oembed = await res.json();
-      clearTimeout(oembedTimer);
       title = oembed.title || '';
       channelTitle = oembed.author_name || '';
-    } else {
-      clearTimeout(oembedTimer);
     }
-  } catch {}
+  } catch {
+    // Metadata is optional on the playback path.
+  } finally {
+    if (oembedTimer) clearTimeout(oembedTimer);
+  }
 
   // Check DB for live status (persisted from previous extractions)
   const liveStatus = db.getLiveStatus(videoId) || undefined;
@@ -115,6 +134,9 @@ async function _enrichFromNextInner(videoData) {
     for (const item of contents) {
       const primary = item.videoPrimaryInfoRenderer;
       if (primary) {
+        if (!videoData.title) {
+          videoData.title = (primary.title?.runs || []).map((run) => run.text || '').join('') || primary.title?.simpleText || '';
+        }
         // Like count
         if (videoData.likeCount == null) {
           const buttons = primary.videoActions?.menuRenderer?.topLevelButtons || [];

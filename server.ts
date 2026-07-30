@@ -46,6 +46,10 @@ app.use((req, res, next) => {
   // Skip static assets and all stream routes (stream routes have their own extraction rate guard)
   if (req.path.startsWith('/public/') || req.path.startsWith('/vendor/')) return next();
   if (req.path.startsWith('/api/stream/')) return next();
+  if (fixtureMode && (
+    req.path.startsWith('/__player-benchmark')
+    || req.path === '/native-player-engine.js'
+  )) return next();
   const ip = req.ip;
   const bucket = getRateBucket(ip);
   if (bucket.tokens < 1) {
@@ -243,6 +247,17 @@ app.get('/offline', (_req, res) => {
 const db = fixtureMode ? null : (await import('./db.js')).default;
 
 if (fixtureMode) {
+  app.get('/__player-benchmark/mux-player.js', (_req, res) => {
+    res.set({
+      'Cache-Control': 'no-store',
+      'Content-Type': 'text/javascript; charset=utf-8',
+    });
+    res.sendFile(path.join(import.meta.dirname, 'node_modules/@mux/mux-player/dist/mux-player.js'));
+  });
+  app.get('/__player-benchmark', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.sendFile(path.join(import.meta.dirname, 'tests/fixtures/player-performance.html'));
+  });
   app.get('/auth/login', (_req, res) => res.status(200).send('<!doctype html><title>Fixture Login</title><form method="post" action="/auth/free"></form>'));
   app.post('/auth/free', (req, res) => {
     req.session.userId = 'fixture-user';
@@ -255,7 +270,7 @@ if (fixtureMode) {
 <head><title>Fixture Watch</title></head>
 <body>
 <video id="player"></video>
-<script src="/native-player-engine.js?v=13"></script>
+<script src="/native-player-engine.js?v=17"></script>
 <script>
 var playerDrmServers = {};
 player.configure({ drm: { servers: playerDrmServers } });
@@ -497,6 +512,11 @@ function sanitizePlayerEvent(event: unknown) {
     totalFrames: clampNumber(src.totalFrames, 0, 10_000_000),
     startupMs: clampNumber(src.startupMs, 0, 300_000),
     firstFrameMs: clampNumber(src.firstFrameMs, 0, 300_000),
+    videoStartupMs: clampNumber(src.videoStartupMs, 0, 300_000),
+    playToPlayingMs: clampNumber(src.playToPlayingMs, 0, 300_000),
+    pageToFirstFrameMs: clampNumber(src.pageToFirstFrameMs, 0, 300_000),
+    startupBufferMs: clampNumber(src.startupBufferMs, 0, 300_000),
+    seekLatencyMs: clampNumber(src.seekLatencyMs, 0, 300_000),
     at: clampNumber(src.at, 0, 86_400),
     ts: clampNumber(src.ts, 0, Number.MAX_SAFE_INTEGER),
   };

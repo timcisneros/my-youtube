@@ -263,16 +263,22 @@ function buildFixtureHlsMaster(videoId: string, query: Record<string, unknown> =
   const formats = getFixtureFormats();
   const videos = FIXTURE_VIDEO_REPS.map(rep => formats[rep.formatId]);
   const fixtureMode = firstQueryValue(query.fixtureHls);
-  const mediaGroups = fixtureMode === 'groups' || fixtureMode === 'ts-groups';
+  const benchmarkGroups = fixtureMode === 'benchmark-groups';
+  const mediaGroups = fixtureMode === 'groups' || fixtureMode === 'ts-groups' || benchmarkGroups;
   const tsMode = fixtureMode === 'ts' || fixtureMode === 'ts-muxed' || fixtureMode === 'ts-groups' || fixtureMode === 'ts-aes';
   const muxedTsMode = fixtureMode === 'ts-muxed';
   const hlsQuery = hlsFixtureQuery(query, tsMode ? fixtureMode : (mediaGroups ? 'groups' : (fixtureMode || '1')));
   const subtitleData = encodeURIComponent('WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nNative HLS captions\n');
+  const audioGroupLine = mediaGroups
+    ? `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-main",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="/api/stream/${videoId}/hls/a64.m3u8?${hlsQuery}",CODECS="mp4a.40.2"`
+    : '';
+  const subtitleGroupLine = mediaGroups && !benchmarkGroups
+    ? `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English captions",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="data:text/vtt,${subtitleData}"`
+    : '';
   return `#EXTM3U
 #EXT-X-VERSION:7
-${mediaGroups ? `#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-main",NAME="English",LANGUAGE="en",DEFAULT=YES,AUTOSELECT=YES,URI="/api/stream/${videoId}/hls/a64.m3u8?${hlsQuery}",CODECS="mp4a.40.2"
-#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English captions",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="data:text/vtt,${subtitleData}"` : ''}
-${videos.map(video => `#EXT-X-STREAM-INF:BANDWIDTH=${video.bandwidth + (mediaGroups || muxedTsMode ? formats.a64.bandwidth : 0)},RESOLUTION=${video.width}x${video.height},CODECS="${mediaGroups || muxedTsMode ? `${video.codecs},mp4a.40.2` : video.codecs}"${mediaGroups ? ',AUDIO="audio-main",SUBTITLES="subs"' : ''}
+${[audioGroupLine, subtitleGroupLine].filter(Boolean).join('\n')}
+${videos.map(video => `#EXT-X-STREAM-INF:BANDWIDTH=${video.bandwidth + (mediaGroups || muxedTsMode ? formats.a64.bandwidth : 0)},RESOLUTION=${video.width}x${video.height},CODECS="${mediaGroups || muxedTsMode ? `${video.codecs},mp4a.40.2` : video.codecs}"${mediaGroups ? `,AUDIO="audio-main"${benchmarkGroups ? '' : ',SUBTITLES="subs"'}` : ''}
 /api/stream/${videoId}/hls/${video.formatId}.m3u8?${hlsQuery}`).join('\n')}`;
 }
 

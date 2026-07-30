@@ -86,6 +86,8 @@
           <% } %>
         </div>
       </div>
+    <% } else if (typeof requestedPlaylistId !== 'undefined' && requestedPlaylistId) { %>
+      <div id="player-playlist-slot" aria-live="polite"></div>
     <% } %>
 
     <div class="player-supplemental">

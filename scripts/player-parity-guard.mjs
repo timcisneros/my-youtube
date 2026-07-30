@@ -28,7 +28,13 @@ function assertIncludes(path, source, needle, message) {
 }
 
 function listSourceFiles(dir) {
-  const ignoredDirs = new Set(['.git', 'node_modules', 'playwright-report', 'test-results']);
+  const ignoredDirs = new Set([
+    '.git',
+    'node_modules',
+    'playwright-report',
+    'test-results',
+    'tmp',
+  ]);
   const extensions = new Set(['.ejs', '.js', '.json', '.md', '.mjs', '.ts']);
   const files = [];
   for (const entry of readdirSync(dir)) {
@@ -151,28 +157,22 @@ const nativeEngine = readText('public/native-player-engine.js');
   ['new NativeHlsProvider(this, stampUri(this, url))', 'direct internal HLS loads must stamp tokens before first-party provider fetches'],
   ["var queryIndex = withoutHash.indexOf('?');", 'stream token stamping must preserve existing query-string separators'],
   ["return path + '?' + parts.join('&') + hash;", 'stream token restamping must not turn ?u= into &u= on HLS proxy URLs'],
-  ['if (!segments.length && targetDuration > 0) timeline = mediaSequence * targetDuration;', 'HLS live media sequence must advance the playback timeline so refreshed live windows can continue'],
+  ['if (!segments.length && targetDuration > 0) timeline = (mediaSequence + skippedSegmentCount) * targetDuration;', 'HLS live and delta playlists must advance the playback timeline from the first represented media sequence'],
   ['this.startupLiveTarget = null;', 'first-party HLS must track an intended live-edge startup target'],
-  ['this.liveStartupCandidate = false;', 'first-party HLS must track probably-live startup before media playlist parsing'],
-  ['self.liveStartupCandidate = true;', 'first-party HLS master-playlist startup must assume live until the media playlist proves otherwise'],
-  ['this.liveStartupCandidate = this.live && !this.startupBufferComplete;', 'first-party HLS must clear probably-live startup for VOD media playlists'],
-  ['this.liveStartupCandidate = false;', 'first-party HLS must leave probably-live startup after the startup buffer is ready'],
-  ['LIVE_STABLE_START_LATENCY', 'first-party HLS startup must keep enough DVR cushion for delayed live window publication'],
   ['LIVE_BUFFER_AHEAD', 'first-party HLS must maintain a larger buffer target for live streams'],
-  ['LIVE_STARTUP_ABR_FACTOR', 'first-party HLS live startup ABR must be conservative'],
-  ['LIVE_STABLE_ABR_FACTOR', 'first-party HLS live ABR must only upgrade conservatively after stable buffer'],
-  ['LIVE_STARTUP_MAX_HEIGHT', 'first-party HLS live startup must cap initial rendition height for stability'],
-  ['LIVE_UPGRADE_HOLDOFF_MS', 'first-party HLS live auto-upgrades must require sustained stable buffer before leaving startup cap'],
+  ['LIVE_BUFFER_BEHIND', 'first-party HLS must bound retained live media behind the playhead'],
+  ['LOW_LATENCY_BUFFER_AHEAD', 'LL-HLS must use a latency-preserving forward buffer'],
   ['this.liveWindowDriftRecoveryCount = 0;', 'first-party HLS must track live-window drift recovery attempts'],
   ['this.vodEndOfStreamCount = 0;', 'native MSE providers must track explicit VOD end-of-stream closure'],
   ['this.engine._assetUri = this.playlistUrl;', 'first-party HLS must expose an adaptive asset URI for quality menu detection'],
   ['self.startupLiveTarget = self._defaultLiveStartTime();', 'first-party HLS startup must begin far enough behind live edge to avoid immediate underrun'],
   ['NativeHlsProvider.prototype._defaultLiveStartTime = function ()', 'first-party HLS must compute a stable default live start time'],
   ['return this.live ? Math.max(goal, LIVE_BUFFER_AHEAD) : goal;', 'first-party HLS live streams must use the live buffer target'],
-  ['conservativeLiveStartup ? LIVE_STARTUP_ABR_FACTOR : 0.8', 'first-party HLS initial variant choice must use conservative live ABR'],
-  ['variant.height <= LIVE_STARTUP_MAX_HEIGHT', 'first-party HLS live startup and unstable buffer ABR must cap rendition height'],
-  ['stableLive ? LIVE_STABLE_ABR_FACTOR : LIVE_STARTUP_ABR_FACTOR', 'first-party HLS auto ABR must stay conservative until live buffer is stable'],
-  ['now - this.liveStableSince >= LIVE_UPGRADE_HOLDOFF_MS', 'first-party HLS must hold stable live buffer before upgrading above the startup cap'],
+  ['Math.min(0.7, abr.bandwidthUpgradeTarget || 0.85)', 'first-party HLS live upgrades must retain a conservative bandwidth reserve'],
+  ['function bandwidthSampleDuration(provider, elapsedMs, timeToFirstByteMs)', 'native ABR must separate request latency from transfer throughput'],
+  ['function abrUpgradeIsSafe(provider, candidate, bufferAhead)', 'native ABR upgrades must fit within the current starvation budget'],
+  ['this.variantSwitchInFlight = false;', 'first-party HLS must serialize rendition metadata transitions'],
+  ['self._appendedVideoInitKey = videoInitKey;', 'first-party HLS must append the selected rendition initialization segment'],
   ['NativeHlsProvider.prototype._maybeRefreshLiveLowBuffer = function (ahead)', 'first-party HLS must refresh live playlists immediately when live-edge buffer is low'],
   ['NativeHlsProvider.prototype._recoverLiveWindowDrift = function (ahead)', 'first-party HLS must recover when a live playlist window moves past the buffered edge'],
   ["this.lastError = 'hls-live-window-drift';", 'first-party HLS live-window drift recovery must be observable in stats'],
@@ -333,9 +333,48 @@ assertIncludes(
   'must exercise loading bar, timer, and stream status badge in a real browser'
 );
 
+const performanceRunner = readText('tests/performance/player-parity.spec.mjs');
+[
+  ["method: 'intersection-union test over co-primary cell/metric/percentile claims'", 'performance proof must use the all-claims co-primary intersection-union decision'],
+  ["multiplicityAdjustment: 'none required: every co-primary component must pass'", 'performance proof must not apply disjunctive multiplicity logic to universal non-inferiority'],
+  ["superiorityMultiplicityCorrection: 'Bonferroni'", 'native-better findings must retain family-wise multiplicity protection'],
+  ['superiorityFamilyWiseUpperBound < 0', 'native-better findings must clear zero on the family-wise upper bound'],
+  ["waitUntil: 'domcontentloaded'", 'performance collection must not confuse the unrelated page load event with fixture completion'],
+  ['page.evaluate(() => window.__playerBenchmarkDone)', 'performance collection must wait for the explicit fixture result'],
+  ["type: 'collection-failure'", 'collector transport retries must be preserved in the durable checkpoint'],
+  ["retryUnit: 'entire pair in the original implementation order'", 'collector failures must retry the whole paired observation symmetrically'],
+  ['classifyImplementationScriptTransportFailure', 'zero-byte implementation-script transport failures must be classified from CDP evidence'],
+  ['classifyCompletedBenchmarkNetworkIoSuspension', 'completed browser-wide network-I/O suspension must be classified from console and CDP evidence'],
+  ['consoleErrors.every(error => error === NETWORK_IO_SUSPENDED_CONSOLE_ERROR)', 'network-I/O suspension retry must reject unrelated console errors'],
+  ['requestOrigin !== normalizedBenchmarkOrigin', 'network-I/O suspension retry must be restricted to the benchmark origin'],
+  ["'net::ERR_NETWORK_IO_SUSPENDED'", 'Chromium network-service suspension must be a transparent collection failure'],
+  ["request.encodedBytes !== 0", 'partially delivered implementation scripts must remain hard failures'],
+  ['request.canceled', 'canceled requests must remain hard failures'],
+  ['request.blockedReason', 'blocked requests must remain hard failures'],
+  ['request.corsErrorStatus', 'CORS failures must remain hard failures'],
+  ["request.status !== 0 && (request.status < 200 || request.status >= 300)", 'HTTP implementation-asset failures must remain hard failures'],
+  ["'net::ERR_BLOCKED_BY_CLIENT'", 'blocked implementation scripts must remain hard failures in the collector self-check'],
+  ["fixtureResult: { error: 'media-error' }", 'completed player errors must remain hard in the network-suspension self-check'],
+  ["failed: 'net::ERR_CONNECTION_RESET'", 'general media transport failures must remain hard in the network-suspension self-check'],
+  ['validateCollectionFailureClassification();', 'performance proof must self-check transport classification before collection'],
+  ['Irrevocable proof gate failed', 'proof collection must fail fast after an unrecoverable hard-gate violation'],
+].forEach(([needle, message]) => (
+  assertIncludes('tests/performance/player-parity.spec.mjs', performanceRunner, needle, message)
+));
+
+const performanceFixture = readText('tests/fixtures/player-performance.html');
+[
+  ['window.__playerBenchmarkComplete = false;', 'performance fixture must expose explicit completion state'],
+  ['function completeBenchmark()', 'performance fixture must resolve through one idempotent completion path'],
+  ["result.error = result.error || 'benchmark-timeout';", 'performance fixture must surface its own watchdog as a player observation'],
+].forEach(([needle, message]) => (
+  assertIncludes('tests/fixtures/player-performance.html', performanceFixture, needle, message)
+));
+
 if (!process.exitCode) {
   console.log('[player-parity-guard] native watch-shell contract ok');
   console.log('[player-parity-guard] loading/timer/status contract ok');
   console.log('[player-parity-guard] Shaka fallback retirement ok');
   console.log('[player-parity-guard] legacy engine retirement ok');
+  console.log('[player-parity-guard] universal performance-proof contract ok');
 }

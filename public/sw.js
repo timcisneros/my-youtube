@@ -1,6 +1,6 @@
 importScripts('/idb-helpers.js');
 // Service Worker — cache-first for static assets, segment caching for video proxy
-var STATIC_CACHE = 'my-youtube-static-v13';
+var STATIC_CACHE = 'my-youtube-static-v16';
 var SEGMENT_CACHE = 'my-youtube-segments-v5';
 var IMAGE_CACHE = 'my-youtube-images-v1';
 var APP_SHELL_CACHE = 'my-youtube-shell-v1';
@@ -205,7 +205,7 @@ function buildOfflineWatchPage(bundle) {
     + '    <div class="video-channel">' + channelTitle + '</div>\n'
     + '  </div>\n'
     + '</main>\n'
-    + '<script src="/native-player-engine.js?v=13"><\/script>\n'
+    + '<script src="/native-player-engine.js?v=17"><\/script>\n'
     + '<script src="/idb-helpers.js"><\/script>\n'
     + '<script src="/app.js"><\/script>\n'
     + '<script>\n'

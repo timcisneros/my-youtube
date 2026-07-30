@@ -241,6 +241,145 @@
       var autoplaySettled = false;
       var playlistPrevUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.prevUrl : '') %>;
       var playlistNextUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.nextUrl : '') %>;
+      var requestedPlaylistId = <%- JSON.stringify(typeof requestedPlaylistId !== 'undefined' ? requestedPlaylistId : '') %>;
+      var requestedPlaylistIndex = <%= typeof requestedPlaylistIndex !== 'undefined' ? requestedPlaylistIndex : 0 %>;
+
+      function updatePlaylistMediaActions() {
+        if (!('mediaSession' in navigator)) return;
+        try { navigator.mediaSession.setActionHandler('previoustrack', playlistPrevUrl ? function () { window.location.href = playlistPrevUrl; } : null); } catch (e) {}
+        try { navigator.mediaSession.setActionHandler('nexttrack', playlistNextUrl ? function () { window.location.href = playlistNextUrl; } : null); } catch (e) {}
+      }
+
+      function renderPlaylistContext(data) {
+        var slot = document.getElementById('player-playlist-slot');
+        if (!slot || !data || !Array.isArray(data.items) || !data.items.length) return;
+        playlistPrevUrl = data.prevUrl || '';
+        playlistNextUrl = data.nextUrl || '';
+        updatePlaylistMediaActions();
+
+        var panel = document.createElement('div');
+        panel.className = 'player-playlist-panel';
+        var header = document.createElement('div');
+        header.className = 'player-playlist-header';
+        var titleLink = document.createElement('a');
+        titleLink.href = '/playlist?list=' + encodeURIComponent(data.playlistId);
+        titleLink.textContent = data.title || 'Playlist';
+        var count = document.createElement('span');
+        count.textContent = String(data.currentIndex || 0) + ' / ' + data.items.length;
+        header.append(titleLink, count);
+        panel.appendChild(header);
+
+        var actions = document.createElement('div');
+        actions.className = 'player-playlist-actions';
+        if (playlistPrevUrl) {
+          var prev = document.createElement('a');
+          prev.href = playlistPrevUrl;
+          prev.textContent = 'Previous';
+          actions.appendChild(prev);
+        }
+        if (playlistNextUrl) {
+          var next = document.createElement('a');
+          next.href = playlistNextUrl;
+          next.textContent = 'Next';
+          actions.appendChild(next);
+        }
+        panel.appendChild(actions);
+
+        var items = document.createElement('div');
+        items.className = 'player-playlist-items';
+        data.items.forEach(function (item) {
+          var row = document.createElement(item.available && item.videoId ? 'a' : 'span');
+          row.className = 'player-playlist-item' +
+            (item.videoId === '<%= video.videoId %>' ? ' active' : '') +
+            (!item.available || !item.videoId ? ' player-playlist-item-unavailable' : '');
+          if (item.available && item.videoId) {
+            row.href = '/watch?v=' + encodeURIComponent(item.videoId) +
+              '&list=' + encodeURIComponent(data.playlistId) +
+              '&index=' + encodeURIComponent(item.index);
+          }
+          var index = document.createElement('span');
+          index.className = 'player-playlist-index';
+          index.textContent = String(item.index || '');
+          row.appendChild(index);
+          if (item.available && item.videoId) {
+            var thumb = document.createElement('img');
+            thumb.dataset.src = '/api/stream/' + encodeURIComponent(item.videoId) + '/thumb';
+            thumb.alt = '';
+            thumb.className = 'player-playlist-thumb lazy-thumb';
+            thumb.width = 96;
+            thumb.height = 54;
+            row.appendChild(thumb);
+          } else {
+            var emptyThumb = document.createElement('span');
+            emptyThumb.className = 'player-playlist-thumb';
+            row.appendChild(emptyThumb);
+          }
+          var itemTitle = document.createElement('span');
+          itemTitle.className = 'player-playlist-title';
+          itemTitle.textContent = item.title || (item.videoId || 'Unavailable video');
+          row.appendChild(itemTitle);
+          items.appendChild(row);
+        });
+        panel.appendChild(items);
+        slot.replaceWith(panel);
+        if (typeof loadThumbnails === 'function') loadThumbnails();
+      }
+
+      function loadPlaylistContext() {
+        if (!requestedPlaylistId || !document.getElementById('player-playlist-slot')) return;
+        var params = new URLSearchParams({
+          v: '<%= video.videoId %>',
+          list: requestedPlaylistId,
+          index: String(requestedPlaylistIndex || 0)
+        });
+        fetch('/watch/playlist-context?' + params.toString())
+          .then(function (response) {
+            if (!response.ok) throw new Error('Playlist unavailable');
+            return response.json();
+          })
+          .then(renderPlaylistContext)
+          .catch(function (err) { console.warn('[playlist-context]', err.message || err); });
+      }
+
+      var supplementalLoadStarted = false;
+      var supplementalLoadTimer = 0;
+      var supplementalIdleCallback = 0;
+      function startSupplementalPlayerData() {
+        if (supplementalLoadStarted) return;
+        supplementalLoadStarted = true;
+        if (supplementalLoadTimer) {
+          clearPlayerTimeout(supplementalLoadTimer);
+          supplementalLoadTimer = 0;
+        }
+        function loadSupplementalData() {
+          supplementalIdleCallback = 0;
+          if (window._playerEngine !== engine) return;
+          loadPlaylistContext();
+          if (window._loadDetails) window._loadDetails();
+        }
+        if (window.requestIdleCallback) {
+          supplementalIdleCallback = window.requestIdleCallback(
+            loadSupplementalData,
+            { timeout: 1000 }
+          );
+        } else {
+          setPlayerTimeout(loadSupplementalData, 100);
+        }
+      }
+
+      function scheduleSupplementalPlayerDataFallback() {
+        if (supplementalLoadStarted || supplementalLoadTimer) return;
+        supplementalLoadTimer = setPlayerTimeout(function () {
+          supplementalLoadTimer = 0;
+          startSupplementalPlayerData();
+        }, 1500);
+      }
+      addPlayerCleanup(function () {
+        if (supplementalIdleCallback && window.cancelIdleCallback) {
+          window.cancelIdleCallback(supplementalIdleCallback);
+        }
+        supplementalIdleCallback = 0;
+      });
 
       function isLivePlayback() {
         if (isServerLive || engine.isLive) return true;
@@ -412,8 +551,7 @@
         navigator.mediaSession.setActionHandler('seekbackward', function () { playerSeekTo(Math.max(0, video.currentTime - 10)); });
         navigator.mediaSession.setActionHandler('seekforward', function () { playerSeekTo(Math.min(video.duration || Infinity, video.currentTime + 10)); });
         navigator.mediaSession.setActionHandler('seekto', function (d) { if (d.seekTime != null) playerSeekTo(d.seekTime); });
-        try { navigator.mediaSession.setActionHandler('previoustrack', playlistPrevUrl ? function () { window.location.href = playlistPrevUrl; } : null); } catch (e) {}
-        try { navigator.mediaSession.setActionHandler('nexttrack', playlistNextUrl ? function () { window.location.href = playlistNextUrl; } : null); } catch (e) {}
+        updatePlaylistMediaActions();
       }
 
       // Resume playback when restored from browser bfcache (back from external site)
@@ -860,6 +998,7 @@
         autoplaySettled = true;
         autoplayRetryAttached = false;
         startStallWatch();
+        startSupplementalPlayerData();
         if (window._stallTimer && window._stallTimer !== stallTimer) clearInterval(window._stallTimer);
         window._stallTimer = stallTimer;
       });
@@ -924,6 +1063,7 @@
           window.addEventListener('beforeunload', saveWatchTimeBeforeUnload);
           addPlayerCleanup(function () { window.removeEventListener('beforeunload', saveWatchTimeBeforeUnload); });
           requestAutoplay('reveal');
+          scheduleSupplementalPlayerDataFallback();
         }
         if (video.readyState >= 2) {
           reveal();
@@ -1073,6 +1213,20 @@
           var statsEl = document.getElementById('player-stats');
           var dateEl = document.getElementById('player-date');
           var descEl = document.getElementById('player-desc-text');
+          var titleEl = document.querySelector('.player-title');
+          var channelEl = document.querySelector('.player-channel');
+          if (titleEl && d.title) titleEl.textContent = d.title;
+          if (channelEl && d.channelTitle) channelEl.textContent = d.channelTitle;
+          if ('mediaSession' in navigator && navigator.mediaSession.metadata && (d.title || d.channelTitle)) {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: d.title || titleEl && titleEl.textContent || '<%= video.videoId %>',
+              artist: d.channelTitle || channelEl && channelEl.textContent || '',
+              artwork: [
+                { src: '/api/stream/<%= video.videoId %>/poster', sizes: '1280x720', type: 'image/jpeg' },
+                { src: '/api/stream/<%= video.videoId %>/thumb', sizes: '320x180', type: 'image/jpeg' }
+              ]
+            });
+          }
 
           // Stats — rebuild views + likes, preserve date from initial render if details lacks it
           if (statsEl && (d.viewCount != null || d.likeCount != null)) {
@@ -1188,9 +1342,9 @@
             console.warn('[details] fetch failed:', err.message || err);
           });
     };
-    // Load details immediately -- doesn't depend on video playback.
-    // For live streams, re-poll every 30s to keep viewer count fresh.
-    window._loadDetails();
+    // Initial details load is scheduled by the player after first playback (or
+    // a bounded no-play fallback), keeping optional metadata off the startup
+    // critical path. Live streams still re-poll once the first response lands.
     window._detailsTimer = null;
     function startDetailsRefresh() {
       if (window._detailsTimer) clearInterval(window._detailsTimer);

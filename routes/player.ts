@@ -45,6 +45,40 @@ async function getLocalPlaylistDetails(userId: string, playlistId: string) {
   };
 }
 
+type PlaylistSource =
+  | Awaited<ReturnType<typeof getPlaylistDetails>>
+  | NonNullable<Awaited<ReturnType<typeof getLocalPlaylistDetails>>>;
+
+function buildPlaylistContext(fetchedPlaylist: PlaylistSource | null, videoId: string, requestedPlaylistIndex: number) {
+  if (!fetchedPlaylist || fetchedPlaylist.items.length === 0) return null;
+  const foundIndex = fetchedPlaylist.items.findIndex((item) => item.videoId === videoId);
+  const currentIndex = foundIndex >= 0 ? foundIndex + 1 : requestedPlaylistIndex;
+  const prev = currentIndex > 1
+    ? fetchedPlaylist.items.slice(0, currentIndex - 1).reverse().find((item) => item.available && item.videoId) || null
+    : null;
+  const next = currentIndex > 0
+    ? fetchedPlaylist.items.slice(currentIndex).find((item) => item.available && item.videoId) || null
+    : null;
+  const buildPlaylistWatchUrl = (item: { videoId: string; index: number } | null) => item
+    ? `/watch?v=${item.videoId}&list=${encodeURIComponent(fetchedPlaylist.playlistId)}&index=${item.index}`
+    : '';
+  return {
+    ...fetchedPlaylist,
+    currentIndex,
+    prevUrl: buildPlaylistWatchUrl(prev),
+    nextUrl: buildPlaylistWatchUrl(next),
+  };
+}
+
+// Preserve data that is already cached/synchronous without allowing optional
+// remote metadata to hold the player document open.
+function resolveThisTurn<T>(promise: Promise<T>): Promise<T | null> {
+  return Promise.race([
+    promise,
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 0)),
+  ]);
+}
+
 router.get('/', ensureAuth, async (req, res) => {
   const videoId = req.query.v as string;
   if (!videoId) return res.redirect('/');
@@ -70,11 +104,12 @@ router.get('/', ensureAuth, async (req, res) => {
   // for the browser to receive HTML and fire a prefetch request
   buildMPD(videoId).catch(() => {});
 
-  const videoP = getVideoDetails(videoId);
-  const playlistP = playlistId
-    ? (isLocalPlaylistId(playlistId)
-      ? getLocalPlaylistDetails(req.session.userId, playlistId).catch(() => null)
-      : getPlaylistDetails(playlistId).catch(() => null))
+  const videoP = getVideoDetails(videoId).catch(() => null);
+  // Local playlists are an inexpensive DB lookup. Remote YouTube playlist
+  // context starts in the browser only after the playback provider is ready,
+  // so it cannot consume an extraction slot or bandwidth during startup.
+  const playlistP = playlistId && isLocalPlaylistId(playlistId)
+    ? getLocalPlaylistDetails(req.session.userId, playlistId).catch(() => null)
     : Promise.resolve(null);
 
   // Flush shell with the native player + preload/prefetch in head. The browser
@@ -85,18 +120,13 @@ router.get('/', ensureAuth, async (req, res) => {
     mainClass: 'player-page',
     extraHead: `<link rel="preload" href="/api/stream/${videoId}/poster" as="image" fetchpriority="high">\n` +
       (inlineMPD ? '' : `  <link rel="preload" href="/api/stream/${videoId}/dash.mpd?token=${streamToken}" as="fetch" crossorigin fetchpriority="high">\n`) +
-      `  <script src="/native-player-engine.js?v=13" defer><\/script>\n` +
+      `  <script src="/native-player-engine.js?v=17" defer><\/script>\n` +
       `  <script>fetch('/api/stream/${videoId}/prefetch')<\/script>`
   });
 
   try {
-    let video;
-    try {
-      video = await videoP;
-    } catch {
-      video = null;
-    }
-    const fetchedPlaylist = await playlistP;
+    let video = await resolveThisTurn(videoP);
+    const fetchedPlaylist = await resolveThisTurn(playlistP);
     if (!video || !video.title) {
       const dl = db.getDownload(videoId);
       if (dl) {
@@ -104,7 +134,19 @@ router.get('/', ensureAuth, async (req, res) => {
       }
     }
     if (!video) {
-      return res.end('<div class="player-error">Video not found</div></main><script src="/app.js"></script>\n</body>\n</html>');
+      video = {
+        videoId,
+        title: videoId,
+        channelTitle: '',
+        description: '',
+        channelId: '',
+        publishedAt: '',
+        viewCount: null,
+        likeCount: null,
+        liveStatus: db.getLiveStatus(videoId) || undefined,
+      };
+    } else if (!video.title) {
+      video = { ...video, title: videoId };
     }
     const tags = db.getTags(req.session.userId, videoId);
     const currentRating = db.getVideoRating(req.session.userId, videoId);
@@ -132,26 +174,7 @@ router.get('/', ensureAuth, async (req, res) => {
         if (h > downloadedHeight) downloadedHeight = h;
       }
     }
-    let playlist = null;
-    if (fetchedPlaylist && fetchedPlaylist.items.length > 0) {
-      const foundIndex = fetchedPlaylist.items.findIndex((item) => item.videoId === videoId);
-      const currentIndex = foundIndex >= 0 ? foundIndex + 1 : requestedPlaylistIndex;
-      const prev = currentIndex > 1
-        ? fetchedPlaylist.items.slice(0, currentIndex - 1).reverse().find((item) => item.available && item.videoId) || null
-        : null;
-      const next = currentIndex > 0
-        ? fetchedPlaylist.items.slice(currentIndex).find((item) => item.available && item.videoId) || null
-        : null;
-      const buildPlaylistWatchUrl = (item: { videoId: string; index: number } | null) => item
-        ? `/watch?v=${item.videoId}&list=${encodeURIComponent(fetchedPlaylist.playlistId)}&index=${item.index}`
-        : '';
-      playlist = {
-        ...fetchedPlaylist,
-        currentIndex,
-        prevUrl: buildPlaylistWatchUrl(prev),
-        nextUrl: buildPlaylistWatchUrl(next),
-      };
-    }
+    const playlist = buildPlaylistContext(fetchedPlaylist, videoId, requestedPlaylistIndex);
     await res.streamContent('player', {
       video,
       tags,
@@ -164,10 +187,32 @@ router.get('/', ensureAuth, async (req, res) => {
       downloadedHeight,
       playerDrmServers: playerDrmServers(),
       playlist,
+      requestedPlaylistId: playlistId,
+      requestedPlaylistIndex,
     });
   } catch (err) {
     console.error('Player error:', err.message);
     res.end('<div class="player-error">Failed to load video</div></main><script src="/app.js"></script>\n</body>\n</html>');
+  }
+});
+
+// Playlist UI and previous/next actions are secondary to playback startup.
+router.get('/playlist-context', ensureAuth, async (req, res) => {
+  try {
+    const videoId = String(req.query.v || '');
+    const playlistId = sanitizePlaylistId(req.query.list);
+    const requestedPlaylistIndex = Math.max(1, parseInt(String(req.query.index || '0'), 10) || 0);
+    if (!/^[A-Za-z0-9_-]{11}$/.test(videoId) || !playlistId) {
+      return res.status(400).json({ error: 'Invalid video or playlist ID' });
+    }
+    const fetchedPlaylist = isLocalPlaylistId(playlistId)
+      ? await getLocalPlaylistDetails(req.session.userId, playlistId)
+      : await getPlaylistDetails(playlistId);
+    const playlist = buildPlaylistContext(fetchedPlaylist, videoId, requestedPlaylistIndex);
+    if (!playlist) return res.status(404).json({ error: 'Playlist not found' });
+    return res.json(playlist);
+  } catch (err) {
+    return res.status(502).json({ error: err instanceof Error ? err.message : 'Playlist unavailable' });
   }
 });
 

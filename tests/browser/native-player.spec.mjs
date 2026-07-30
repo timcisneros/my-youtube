@@ -1300,6 +1300,7 @@ test('native adapter exposes defensive configuration snapshots', async ({ page }
   expect(state.snapshot.abr.restrictions.minHeight).toBe(1080);
   expect(state.snapshot.streaming.retryParameters.maxAttempts).toBe(99);
   expect(state.current.abr.enabled).toBe(false);
+  expect(state.current.abr.defaultBandwidthEstimate).toBe(500_000);
   expect(state.current.abr.restrictions.minHeight).toBe(360);
   expect(state.current.streaming.retryParameters.maxAttempts).toBe(5);
   expect(state.stats.fallbackReason || '').toBe('');
@@ -1751,7 +1752,7 @@ test('native provider seek lifecycle clamps live targets and records seek stats'
   expect(state.hls.currentTime).toBe(30);
   expect(state.hls.seekAbortCount).toBe(2);
   expect(state.hls.seekCount).toBe(1);
-  expect(state.hls.seekBufferPending).toBe(true);
+  expect(state.hls.seekBufferPending).toBe(false);
   expect(state.hls.lastSeekTarget).toBe(30);
   expect(state.hls.hlsAborted).toBe(1);
   expect(state.hls.states).toContain('seeking');
@@ -1934,6 +1935,24 @@ test('watch page renders centralized player cleanup hooks', async ({ request }) 
   expect(html).toContain('runPlayerCleanupTasks();');
 });
 
+test('watch page renders centralized non-blocking metadata and playlist startup', () => {
+  const route = readFileSync('routes/player.ts', 'utf8');
+  const player = readFileSync('views/player.ejs', 'utf8');
+
+  expect(route).toContain('let video = await resolveThisTurn(videoP);');
+  expect(route).toContain('const fetchedPlaylist = await resolveThisTurn(playlistP);');
+  expect(route).toContain("router.get('/playlist-context'");
+  expect(route).not.toContain('video = await videoP;');
+  expect(route).not.toContain('const fetchedPlaylist = await playlistP;');
+  expect(player).toContain("fetch('/watch/playlist-context?' + params.toString())");
+  expect(player).toMatch(
+    /video\.addEventListener\('playing', function \(\) \{[\s\S]{0,300}startSupplementalPlayerData\(\)/
+  );
+  expect(player).toContain('scheduleSupplementalPlayerDataFallback();');
+  expect(player).toContain('if (window._loadDetails) window._loadDetails();');
+  expect(player).not.toContain('// Load details immediately');
+});
+
 test('native engine destroy removes owned listeners and is idempotent', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -2035,6 +2054,51 @@ test('native telemetry unload summary is one-shot and detached after destroy', a
   expect(state.eventTypes).toEqual([]);
   expect(state.telemetryDestroyed).toBe(true);
   expect(shakaRequests).toHaveLength(0);
+});
+
+test('native telemetry posts compositor-frame startup and seeking-to-seeked latency', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    window.__disablePlayerTelemetry = true;
+    const video = document.getElementById('player');
+    let mediaTime = 0;
+    let frameCallback;
+    Object.defineProperty(video, 'paused', { configurable: true, get() { return false; } });
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return mediaTime; } });
+    video.requestVideoFrameCallback = function (callback) {
+      frameCallback = callback;
+      return 1;
+    };
+    video.cancelVideoFrameCallback = function () {};
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: '' });
+    await engine.init();
+    // Keep events in memory while exercising the browser event boundaries.
+    window.__disablePlayerTelemetry = false;
+    video.dispatchEvent(new Event('play'));
+    await new Promise(resolve => setTimeout(resolve, 15));
+    video.dispatchEvent(new Event('playing'));
+    mediaTime = 0.25;
+    frameCallback(performance.now(), { mediaTime, presentedFrames: 1 });
+    video.dispatchEvent(new Event('seeking'));
+    await new Promise(resolve => setTimeout(resolve, 15));
+    video.dispatchEvent(new Event('seeked'));
+    const events = engine._telemetry.events.slice();
+    window.__disablePlayerTelemetry = true;
+    engine.destroy();
+    delete window.__disablePlayerTelemetry;
+    return events;
+  });
+
+  const startup = state.find(event => event.type === 'playback-started');
+  const firstFrame = state.find(event => event.type === 'first-frame');
+  const seek = state.find(event => event.type === 'seek-complete');
+  expect(startup.playToPlayingMs).toBeGreaterThanOrEqual(10);
+  expect(startup.videoStartupMs).toBe(0);
+  expect(firstFrame.videoStartupMs).toBeGreaterThanOrEqual(10);
+  expect(firstFrame.pageToFirstFrameMs).toBeGreaterThan(0);
+  expect(seek.seekLatencyMs).toBeGreaterThanOrEqual(10);
 });
 
 test('native engine destroy rejects held network requests and clears hold stats', async ({ page }) => {
@@ -2600,7 +2664,10 @@ test('native DASH startup uses default ABR without a minimum-height floor', asyn
     expect(item.nativeRestrictions).toEqual({});
     expect(item.nativeProvider).toBe('native-dash');
     expect(item.nativeFallbackReason).toBe('');
-    expect(item.nativeHeight).toBe(360);
+    // Default startup deliberately uses a conservative bandwidth factor and
+    // has no hidden minimum-height floor. Quality can promote after the first
+    // measured media request.
+    expect(item.nativeHeight).toBe(240);
   }
 });
 
@@ -2770,7 +2837,9 @@ test('native ABR uses viewport cap and measured bandwidth', async ({ page }) => 
 
   expect(state.viewportHeight).toBe(360);
   expect(state.estimatedBandwidth).toBeLessThan(3000000);
-  expect(state.lowBandwidthHeight).toBe(360);
+  // A first slow sample is treated as real congestion instead of being diluted
+  // by the optimistic startup estimate.
+  expect(state.lowBandwidthHeight).toBe(240);
   expect(shakaRequests).toHaveLength(0);
 });
 
@@ -2837,6 +2906,79 @@ test('native ABR upgrades and downgrades with buffer-aware cooldown', async ({ p
   expect(state.upgraded).toEqual({ id: '720', reason: 'bandwidth' });
   expect(state.downgraded).toEqual({ id: '240', reason: 'low-buffer' });
   expect(shakaRequests).toHaveLength(0);
+});
+
+test('native ABR upgrades safely with dual bandwidth estimates and drops decode-heavy renditions', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: '' });
+    let quality = { droppedVideoFrames: 10, totalVideoFrames: 100 };
+    video.getVideoPlaybackQuality = () => quality;
+
+    const bandwidth = { bandwidth: 3_000_000, bandwidthFast: 0, bandwidthSlow: 0, bandwidthSamples: 0 };
+    window.NativeDashProviderForTest._recordBandwidthSample.call(bandwidth, 1_000_000, 1000);
+    window.NativeDashProviderForTest._recordBandwidthSample.call(bandwidth, 62_500, 1000);
+    const latencyAdjusted = { bandwidth: 500_000, bandwidthFast: 0, bandwidthSlow: 0, bandwidthSamples: 0 };
+    window.NativeDashProviderForTest._recordBandwidthSample.call(latencyAdjusted, 27_533, 115, 65);
+
+    const dash = {
+      engine,
+      video,
+      activeVideo: { id: '720', height: 720, bandwidth: 1_800_000 },
+      videoReps: [
+        { id: '360', height: 360, bandwidth: 800_000 },
+        { id: '720', height: 720, bandwidth: 1_800_000 },
+      ],
+      blacklisted: {},
+      manualTrackId: null,
+      bandwidth: 3_000_000,
+      bandwidthSamples: 3,
+      lastSwitchAt: performance.now() - 10_000,
+      lastFrameSampleAt: performance.now() - 3_000,
+      lastDroppedFrames: 10,
+      lastTotalFrames: 100,
+      frameDropDownswitchCount: 0,
+      _candidateVideos: window.NativeDashProviderForTest._candidateVideos,
+      _chooseForBudget: window.NativeDashProviderForTest._chooseForBudget,
+      _lowerVideoRep: window.NativeDashProviderForTest._lowerVideoRep,
+      _switchVideo(rep, _clearBuffer, reason) {
+        this.activeVideo = rep;
+        this.lastSwitchReason = reason;
+      },
+    };
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      get() {
+        return { length: 1, start() { return 0; }, end() { return 20; } };
+      },
+    });
+    quality = { droppedVideoFrames: 20, totalVideoFrames: 140 };
+    window.NativeDashProviderForTest._maybeSwitchAuto.call(dash);
+
+    return {
+      fastEstimate: bandwidth.bandwidthFast,
+      slowEstimate: bandwidth.bandwidthSlow,
+      effectiveEstimate: bandwidth.bandwidth,
+      latencyAdjustedSample: latencyAdjusted.lastBandwidthSample,
+      latencyAdjustedTtfb: latencyAdjusted.bandwidthTtfbEstimate,
+      selectedHeight: dash.activeVideo.height,
+      switchReason: dash.lastSwitchReason,
+      frameDropDownswitchCount: dash.frameDropDownswitchCount,
+      frameDropRatio: dash.lastFrameDropRatio,
+    };
+  });
+
+  expect(state.fastEstimate).toBeLessThan(state.slowEstimate);
+  expect(state.effectiveEstimate).toBe(state.fastEstimate);
+  expect(state.latencyAdjustedSample).toBeGreaterThan(4_000_000);
+  expect(state.latencyAdjustedTtfb).toBeCloseTo(65, 0);
+  expect(state.selectedHeight).toBe(360);
+  expect(state.switchReason).toBe('dropped-frames');
+  expect(state.frameDropDownswitchCount).toBe(1);
+  expect(state.frameDropRatio).toBeCloseTo(0.25, 4);
 });
 
 test('native capability probing filters non-smooth variants and records counts', async ({ page }) => {
@@ -3038,6 +3180,81 @@ test('manual native quality selection disables ABR and updates active track', as
   expect(shakaRequests).toHaveLength(0);
 });
 
+test('manual native quality selection queues behind in-flight DASH and HLS switches', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const makeRep = (id, height) => ({
+      id,
+      height,
+      width: Math.round(height * 16 / 9),
+      bandwidth: height * 2000,
+      codecs: 'avc1.42c01f',
+      mimeType: 'video/mp4',
+      capability: { supported: true, smooth: true, powerEfficient: true },
+    });
+    const low = makeRep('240', 240);
+    const high = makeRep('720', 720);
+
+    function exercise(api, kind) {
+      const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: 'test-token' });
+      const provider = {
+        engine,
+        video,
+        destroyed: false,
+        blacklisted: {},
+        manualTrackId: null,
+        _viewportMaxHeight() { return Infinity; },
+      };
+      if (kind === 'hls') {
+        Object.assign(provider, {
+          variants: [low, high],
+          activeVariant: high,
+          variantSwitchInFlight: true,
+          pendingManualVariantSwitch: null,
+          _switchVariant(rep, clearBuffer, reason) {
+            this.started = { id: rep.id, clearBuffer, reason };
+            this.variantSwitchInFlight = true;
+          },
+        });
+        api.selectVariantTrack.call(provider, low, true);
+        const queued = provider.pendingManualVariantSwitch && provider.pendingManualVariantSwitch.variantId;
+        provider.variantSwitchInFlight = false;
+        api._flushPendingVariantSwitch.call(provider);
+        return { queued, started: provider.started, abrEnabled: engine.getPlayer().config.abr.enabled };
+      }
+      Object.assign(provider, {
+        videoReps: [low, high],
+        activeVideo: high,
+        videoSwitchInFlight: true,
+        pendingManualVideoSwitch: null,
+        _switchVideo(rep, clearBuffer, reason) {
+          this.started = { id: rep.id, clearBuffer, reason };
+          this.videoSwitchInFlight = true;
+        },
+      });
+      api.selectVariantTrack.call(provider, low, true);
+      const queued = provider.pendingManualVideoSwitch && provider.pendingManualVideoSwitch.repId;
+      provider.videoSwitchInFlight = false;
+      api._flushPendingVideoSwitch.call(provider);
+      return { queued, started: provider.started, abrEnabled: engine.getPlayer().config.abr.enabled };
+    }
+
+    return {
+      hls: exercise(window.NativeHlsProviderForTest, 'hls'),
+      dash: exercise(window.NativeDashProviderForTest, 'dash'),
+    };
+  });
+
+  for (const result of [state.hls, state.dash]) {
+    expect(result.queued).toBe('240');
+    expect(result.started).toEqual({ id: '240', clearBuffer: true, reason: 'manual' });
+    expect(result.abrEnabled).toBe(false);
+  }
+});
+
 test('native stats expose active quality and playback health', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -3237,11 +3454,11 @@ test('service-worker segment cache keeps the current player runtime ahead of cac
   const route = readFileSync('routes/player.ts', 'utf8');
   const head = readFileSync('views/partials/head.ejs', 'utf8');
 
-  expect(worker).toContain("var STATIC_CACHE = 'my-youtube-static-v13';");
+  expect(worker).toContain("var STATIC_CACHE = 'my-youtube-static-v16';");
   expect(worker).toContain("var NETWORK_FIRST_STATIC = [\n  '/idb-helpers.js',\n  '/app.js',\n  '/native-player-engine.js'\n];");
   expect(worker).toContain('if (NETWORK_FIRST_STATIC.indexOf(url.pathname) !== -1)');
-  expect(route).toContain('/native-player-engine.js?v=13');
-  expect(head).toContain('/native-player-engine.js?v=13');
+  expect(route).toContain('/native-player-engine.js?v=17');
+  expect(head).toContain('/native-player-engine.js?v=17');
 });
 
 test('service-worker segment cache leaves the first streamed Today page intact during install', () => {
@@ -3256,6 +3473,136 @@ test('service-worker segment cache leaves the first streamed Today page intact d
   expect(shell).toContain('Checking your subscriptions for new videos');
   expect(today).toContain("document.getElementById('today-loading')");
   expect(route).toContain("showTodayLoading: true");
+});
+
+test('native provider seek lifecycle clamps buffered targets without scheduler churn', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    function makeVideo() {
+      const video = document.getElementById('player').cloneNode();
+      let currentTime = 1.5;
+      Object.defineProperty(video, 'currentTime', {
+        configurable: true,
+        get() { return currentTime; },
+        set(value) { currentTime = value; },
+      });
+      Object.defineProperty(video, 'buffered', {
+        configurable: true,
+        get() {
+          return {
+            length: 1,
+            start() { return 0; },
+            end() { return 6; },
+          };
+        },
+      });
+      return video;
+    }
+
+    function engine(states, events) {
+      return {
+        _serverDown: false,
+        _setState(value) { states.push(value); },
+        _telemetry: {
+          record(type, payload) { events.push({ type, payload: payload || null }); },
+        },
+      };
+    }
+
+    function exercise(kind) {
+      const states = [];
+      const events = [];
+      let abortCalls = 0;
+      let tickCalls = 0;
+      let beginCalls = 0;
+      const proto = kind === 'hls'
+        ? window.NativeHlsProviderForTest
+        : window.NativeDashProviderForTest;
+      const provider = {
+        video: makeVideo(),
+        engine: engine(states, events),
+        destroyed: false,
+        live: false,
+        liveWindow: null,
+        seekBufferPending: false,
+        seekBufferReadyCount: 0,
+        bufferedSeekCount: 0,
+        seekCount: 0,
+        seekAbortCount: 0,
+        lastSeekTarget: 0,
+        lastSeekStartedAt: 0,
+        lastSeekMs: 0,
+        _lastSeekHandledTarget: null,
+        _lastSeekHandledAt: 0,
+        pendingSeek: 0,
+        variantSwitchInFlight: false,
+        _clampSeekTarget: proto._clampSeekTarget,
+        _onSeek: proto._onSeek,
+        beginSeek(target) {
+          beginCalls++;
+          return proto.beginSeek.call(this, target);
+        },
+        _abortRequests() {
+          abortCalls++;
+          return 1;
+        },
+        _tick() {
+          tickCalls++;
+        },
+      };
+
+      proto.beginSeek.call(provider, 4.5);
+      beginCalls++;
+      const startedAt = provider.lastSeekStartedAt;
+      const target = proto.commitSeek.call(provider, 4.5);
+      const reusedBeginTimestamp = provider.lastSeekStartedAt === startedAt;
+      proto._onSeek.call(provider, 4.5);
+      proto.endSeek.call(provider);
+
+      return {
+        target,
+        currentTime: provider.video.currentTime,
+        beginCalls,
+        reusedBeginTimestamp,
+        abortCalls,
+        tickCalls,
+        seekCount: provider.seekCount,
+        seekBufferPending: provider.seekBufferPending,
+        seekBufferReadyCount: provider.seekBufferReadyCount,
+        bufferedSeekCount: provider.bufferedSeekCount,
+        pendingSeek: provider.pendingSeek,
+        states,
+        events,
+      };
+    }
+
+    return {
+      hls: exercise('hls'),
+      dash: exercise('dash'),
+    };
+  });
+
+  for (const provider of [state.hls, state.dash]) {
+    expect(provider.target).toBe(4.5);
+    expect(provider.currentTime).toBe(4.5);
+    expect(provider.beginCalls).toBe(1);
+    expect(provider.reusedBeginTimestamp).toBe(true);
+    expect(provider.abortCalls).toBe(0);
+    expect(provider.tickCalls).toBe(0);
+    expect(provider.seekCount).toBe(1);
+    expect(provider.seekBufferPending).toBe(false);
+    expect(provider.seekBufferReadyCount).toBe(1);
+    expect(provider.bufferedSeekCount).toBe(1);
+    expect(provider.states).toContain('seeking');
+    expect(provider.states.at(-1)).toBe('ready');
+    expect(provider.events).toEqual([
+      { type: 'seek-buffer-ready', payload: { buffered: true } },
+    ]);
+  }
+  expect(state.hls.pendingSeek).toBe(0);
+  expect(state.dash.pendingSeek).toBe(1);
 });
 
 test('native buffer milestones emit startup and seek readiness telemetry', async ({ page }) => {
@@ -3319,6 +3666,158 @@ test('native buffer milestones emit startup and seek readiness telemetry', async
   expect(state.seekBufferReadyCount).toBe(1);
   expect(state.events.map(event => event.type)).toEqual(['startup-buffer-ready', 'seek-buffer-ready']);
   expect(shakaRequests).toHaveLength(0);
+});
+
+test('native startup chooses concurrent initialization for independent audio and video buffers', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(async () => {
+    function sourceBuffer(name) {
+      const listeners = {};
+      return {
+        name,
+        mode: '',
+        updating: false,
+        addEventListener(type, fn) { listeners[type] = fn; },
+        removeEventListener(type) { delete listeners[type]; },
+        appendBuffer() {
+          this.updating = true;
+          window.__startupOrder.push('append-' + name);
+          setTimeout(() => {
+            this.updating = false;
+            if (listeners.updateend) listeners.updateend();
+          }, 25);
+        },
+      };
+    }
+
+    const video = document.getElementById('player');
+    window.__startupOrder = [];
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: '' });
+    engine._setState = function () {};
+    engine._player.emit = function () {};
+    const videoSb = sourceBuffer('video');
+    const audioSb = sourceBuffer('audio');
+    const hls = {
+      mediaSource: {
+        duration: NaN,
+        addSourceBuffer(type) { return type.startsWith('video/') ? videoSb : audioSb; },
+      },
+      video,
+      live: false,
+      duration: 6,
+      mimeType: 'video/mp4; codecs="avc1.42c01f"',
+      audioMimeType: 'audio/mp4; codecs="mp4a.40.2"',
+      initSegment: { url: '/video-init', range: null },
+      audioInitSegment: { url: '/audio-init', range: null },
+      activeAudio: { id: 'audio' },
+      segments: [],
+      engine,
+      _fetchRange(url) {
+        window.__startupOrder.push('fetch-' + url.slice(1));
+        return new Promise(resolve => setTimeout(() => resolve(new ArrayBuffer(1)), url.includes('video') ? 30 : 10));
+      },
+      _schedulePlaylistRefresh() {},
+      _tick() {},
+    };
+
+    const hlsOpen = window.NativeHlsProviderForTest._open.call(hls);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    const hlsRequestsBeforeFirstResolution = window.__startupOrder.slice();
+    await hlsOpen;
+
+    window.__startupOrder = [];
+    const dash = {
+      mediaSource: {
+        duration: NaN,
+        addSourceBuffer(type) { return type.startsWith('video/') ? videoSb : audioSb; },
+      },
+      video,
+      live: false,
+      duration: 6,
+      activeVideo: { id: 'video', mimeType: 'video/mp4', codecs: 'avc1.42c01f', initData: new ArrayBuffer(1) },
+      audio: { id: 'audio', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', initData: new ArrayBuffer(1) },
+      engine,
+      _prepareRep(rep) { return Promise.resolve(rep); },
+      _tick() {},
+      _scheduleManifestRefresh() {},
+    };
+    await window.NativeDashProviderForTest._open.call(dash);
+    clearInterval(dash.fillTimer);
+    const dashAppendOrder = window.__startupOrder.slice();
+
+    return { hlsRequestsBeforeFirstResolution, dashAppendOrder };
+  });
+
+  expect(state.hlsRequestsBeforeFirstResolution).toEqual(['fetch-video-init', 'fetch-audio-init']);
+  expect(state.dashAppendOrder.slice(0, 2)).toEqual(['append-video', 'append-audio']);
+});
+
+test('native HLS low-latency playlist honors advertised live-edge startup and bounded buffers', async ({ page }) => {
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    const engine = new window.PlayerEngine(video, { videoId: 'TESTVIDEO01', streamToken: '' });
+    const provider = {
+      video,
+      engine,
+      live: true,
+      lowLatencyPlaylist: true,
+      liveWindow: { start: 100, end: 200 },
+      partTargetDuration: 0.5,
+      serverControl: { partHoldBack: 1.5 },
+      _bufferAheadGoal: window.NativeHlsProviderForTest._bufferAheadGoal,
+      _targetLiveLatency: window.NativeHlsProviderForTest._targetLiveLatency,
+    };
+    video.currentTime = 198;
+    window.NativeHlsProviderForTest._updateLivePositionStats.call(provider);
+    const result = {
+      start: window.NativeHlsProviderForTest._defaultLiveStartTime.call(provider),
+      startup: window.NativeHlsProviderForTest._startupBufferGoal.call(provider),
+      ahead: window.NativeHlsProviderForTest._bufferAheadGoal.call(provider),
+      behind: window.NativeHlsProviderForTest._bufferBehindGoal.call(provider),
+      targetLatency: window.NativeHlsProviderForTest._targetLiveLatency.call(provider),
+      atLiveEdge: provider.atLiveEdge,
+    };
+    const normalProvider = {
+      video,
+      engine,
+      live: true,
+      lowLatencyPlaylist: false,
+      liveWindow: { start: 100, end: 200 },
+      targetDuration: 4,
+      serverControl: { holdBack: 8 },
+      _targetLiveLatency: window.NativeHlsProviderForTest._targetLiveLatency,
+    };
+    result.normal = {
+      start: window.NativeHlsProviderForTest._defaultLiveStartTime.call(normalProvider),
+      ahead: window.NativeHlsProviderForTest._bufferAheadGoal.call(normalProvider),
+      behind: window.NativeHlsProviderForTest._bufferBehindGoal.call(normalProvider),
+      targetLatency: window.NativeHlsProviderForTest._targetLiveLatency.call(normalProvider),
+    };
+    engine.getPlayer().configure('streaming.bufferingGoal', 2);
+    result.explicitAhead = window.NativeHlsProviderForTest._bufferAheadGoal.call(provider);
+    return result;
+  });
+
+  expect(state).toEqual({
+    start: 198.5,
+    startup: 1,
+    ahead: 4,
+    behind: 8,
+    targetLatency: 1.5,
+    atLiveEdge: true,
+    normal: {
+      start: 192,
+      ahead: 30,
+      behind: 8,
+      targetLatency: 8,
+    },
+    explicitAhead: 2,
+  });
 });
 
 test('native streaming config controls buffer targets and rebuffer readiness', async ({ page }) => {
@@ -3611,6 +4110,7 @@ test('native media scheduler respects max concurrent request limit', async ({ pa
     const provider = {
       video,
       destroyed: false,
+      startupBufferComplete: true,
       activeRanges: {},
       engine: {
         _telemetry: { record(type, payload) { events.push({ type, payload }); } },
@@ -3649,6 +4149,72 @@ test('native media scheduler respects max concurrent request limit', async ({ pa
   expect(state.events).toEqual([
     { type: 'scheduler-backpressure', payload: { mediaFetchInFlightCount: 2 } },
   ]);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native media scheduler respects startup-critical video and audio bandwidth', async ({ page }) => {
+  const shakaRequests = await blockShakaScript(page);
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    Object.defineProperty(video, 'currentTime', { configurable: true, get() { return 0; } });
+    Object.defineProperty(video, 'buffered', {
+      configurable: true,
+      get() {
+        return { length: 0, start() { return 0; }, end() { return 0; } };
+      },
+    });
+    const provider = {
+      video,
+      destroyed: false,
+      startupBufferComplete: false,
+      seekBufferPending: false,
+      activeRanges: {},
+      engine: { _telemetry: { record() {} } },
+      _bufferAheadGoal() { return 30; },
+      _maxConcurrentMediaRequests() { return 3; },
+      _drainAppendQueue: window.NativeDashProviderForTest._drainAppendQueue,
+      _buildSegmentCandidates: window.NativeDashProviderForTest._buildSegmentCandidates,
+      _startSegmentFetch: window.NativeDashProviderForTest._startSegmentFetch,
+      _scheduleMediaRequests: window.NativeDashProviderForTest._scheduleMediaRequests,
+      _fetchRange() { return new Promise(() => {}); },
+    };
+    const videoRep = {
+      id: 'v',
+      kind: 'video',
+      baseUrl: '/video',
+      segments: [
+        { id: 'v0', start: 0, end: 2, range: { start: 0, end: 99 } },
+        { id: 'v1', start: 2, end: 4, range: { start: 100, end: 199 } },
+      ],
+    };
+    const audioRep = {
+      id: 'a',
+      kind: 'audio',
+      baseUrl: '/audio',
+      segments: [
+        { id: 'a0', start: 0, end: 2, range: { start: 0, end: 49 } },
+        { id: 'a1', start: 2, end: 4, range: { start: 50, end: 99 } },
+      ],
+    };
+    provider._scheduleMediaRequests(4, [
+      { rep: videoRep, sb: { updating: false } },
+      { rep: audioRep, sb: { updating: false } },
+    ]);
+    return {
+      videoFetching: videoRep.segments.filter(seg => seg.state === 'fetching').map(seg => seg.id),
+      audioFetching: audioRep.segments.filter(seg => seg.state === 'fetching').map(seg => seg.id),
+      activeRangeCount: Object.keys(provider.activeRanges).length,
+    };
+  });
+
+  expect(state).toEqual({
+    videoFetching: ['v0'],
+    audioFetching: ['a0'],
+    activeRangeCount: 2,
+  });
   expect(shakaRequests).toHaveLength(0);
 });
 
@@ -5571,10 +6137,59 @@ test('native DASH fixture plays through MSE without Shaka fallback', async ({ pa
 
   expect(state.currentTime).toBeGreaterThan(0);
   expect(state.bufferedEnd).toBeGreaterThan(0);
-  expect(state.activeTrack.height).toBe(360);
+  expect(state.activeTrack.height).toBeGreaterThanOrEqual(240);
   await expectFirstPartyNativePlayback(page, { provider: 'native-dash', mode: 'dash' });
   expect(shakaRequests).toHaveLength(0);
   expect(logs.some(line => line.includes('falling back to shaka'))).toBe(false);
+});
+
+test('native ABR upgrades DASH and serializes the switch before scheduling new media', async ({ page }) => {
+  const pageErrors = [];
+  page.on('pageerror', error => pageErrors.push(error.message));
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({
+      streaming: {
+        bufferingGoal: 4,
+        startupBufferGoal: 1,
+        maxConcurrentRequests: 3,
+      },
+    });
+    return engine.init()
+      .then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd'))
+      .then(() => video.play());
+  });
+
+  await page.waitForFunction(() => {
+    const video = document.getElementById('player');
+    const track = window.__player.getActiveVariantTrack();
+    return video.currentTime > 0
+      && video.videoHeight >= 720
+      && track
+      && track.height >= 720;
+  }, null, { timeout: 12_000 });
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    return {
+      mediaError: video.error && (video.error.message || video.error.code),
+      height: video.videoHeight,
+      stats: window.__player.getStats(),
+    };
+  });
+  expect(state.mediaError).toBeFalsy();
+  expect(state.height).toBeGreaterThanOrEqual(720);
+  expect(state.stats.activeVariant.height).toBeGreaterThanOrEqual(720);
+  expect(state.stats.lastSwitchReason).toBe('bandwidth');
+  expect(state.stats.fatalError).toBe('');
+  expect(pageErrors).toEqual([]);
 });
 
 test('native DASH fixture seeks and rebuilds buffer without fallback', async ({ page }) => {
@@ -6344,6 +6959,8 @@ test('native DASH exposes audio tracks and switches audio without touching video
     const audioSb = makeSourceBuffer();
     const audio1 = { id: 'a-en', kind: 'audio', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', bandwidth: 48000, language: 'en', label: 'English', initData: new ArrayBuffer(1), segments: [{ start: 0, end: 2 }] };
     const audio2 = { id: 'a-es', kind: 'audio', mimeType: 'audio/mp4', codecs: 'mp4a.40.2', bandwidth: 64000, language: 'es', label: 'Spanish', initData: new ArrayBuffer(1), segments: [{ start: 0, end: 2 }] };
+    let resolveTick;
+    const switched = new Promise(resolve => { resolveTick = resolve; });
     const provider = {
       engine,
       video,
@@ -6363,7 +6980,10 @@ test('native DASH exposes audio tracks and switches audio without touching video
       },
       _prepareRep(rep) { return Promise.resolve(rep); },
       _changeAudioTypeIfNeeded() { return Promise.resolve(); },
-      _tick() { this.ticked = true; },
+      _tick() {
+        this.ticked = true;
+        resolveTick();
+      },
       getActiveAudioTrack: window.NativeDashProviderForTest.getActiveAudioTrack,
       getAudioTracks: window.NativeDashProviderForTest.getAudioTracks,
       _switchAudio: window.NativeDashProviderForTest._switchAudio,
@@ -6372,7 +6992,7 @@ test('native DASH exposes audio tracks and switches audio without touching video
     engine._provider = provider;
     const before = provider.getAudioTracks();
     provider.selectAudioTrack({ id: 'a-es' });
-    return new Promise(resolve => setTimeout(() => resolve({
+    return switched.then(() => ({
       before,
       active: provider.getActiveAudioTrack(),
       videoRemoveCalls: videoSb.removeCalls,
@@ -6380,7 +7000,7 @@ test('native DASH exposes audio tracks and switches audio without touching video
       audioAppendCalls: audioSb.appendCalls,
       generation: provider.requestGeneration,
       ticked: !!provider.ticked,
-    }), 20));
+    }));
   });
 
   expect(state.before).toEqual([
@@ -7367,7 +7987,8 @@ test('native DASH live fixture starts near live edge and reports live stats with
   expect(stats.liveWindowEnd).toBeGreaterThan(stats.liveWindowStart);
   expect(stats.liveLatency).toBeGreaterThanOrEqual(0);
   expect(stats.atLiveEdge).toBe(true);
-  expect(stats.activeVariant.height).toBe(360);
+  expect(stats.activeVariant.height).toBeGreaterThanOrEqual(360);
+  expect(stats.fatalError).toBe('');
   await expectFirstPartyNativePlayback(page, { provider: 'native-dash', mode: 'dash' });
   expect(shakaRequests).toHaveLength(0);
 });
@@ -7777,6 +8398,7 @@ test('native live adapters expose live range and seek to live edge through lifec
       _clampSeekTarget: window.NativeHlsProviderForTest._clampSeekTarget,
       _seekBufferGoal: window.NativeHlsProviderForTest._seekBufferGoal,
       _bufferAheadGoal: window.NativeDashProviderForTest._bufferAheadGoal,
+      _targetLiveLatency: window.NativeHlsProviderForTest._targetLiveLatency,
       _abortRequests: window.NativeHlsProviderForTest._abortRequests,
       _tick(force) { this.ticked = force; },
     };
@@ -8585,7 +9207,7 @@ test('native DASH retries a failed media range without Shaka fallback or reset',
     const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
     window.__engine = engine;
     window.__player = engine.getPlayer();
-    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=500&fixtureFailCount=1&fixtureFailFormat=v360&fixtureFailPhase=media'));
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=500&fixtureFailCount=1&fixtureFailFormat=v240&fixtureFailPhase=media'));
   });
 
   await page.evaluate(() => document.getElementById('player').play());
@@ -8678,7 +9300,7 @@ test('native DASH refreshes media URLs after exhausted CDN expiry errors', async
     const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
     window.__engine = engine;
     window.__player = engine.getPlayer();
-    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=410&fixtureFailCount=3&fixtureFailFormat=v360&fixtureFailPhase=media'));
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=410&fixtureFailCount=3&fixtureFailFormat=v240&fixtureFailPhase=media'));
   });
 
   await page.evaluate(() => document.getElementById('player').play());
@@ -8725,7 +9347,7 @@ test('native DASH refreshes manifest state after stale media range errors', asyn
     const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
     window.__engine = engine;
     window.__player = engine.getPlayer();
-    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=416&fixtureFailCount=3&fixtureFailFormat=v360&fixtureFailPhase=media'));
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=416&fixtureFailCount=3&fixtureFailFormat=v240&fixtureFailPhase=media'));
   });
 
   await page.evaluate(() => document.getElementById('player').play());
@@ -8762,7 +9384,7 @@ test('native DASH treats token expiry on media as recoverable retry', async ({ p
     const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
     window.__engine = engine;
     window.__player = engine.getPlayer();
-    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=401&fixtureFailCount=1&fixtureFailFormat=v360&fixtureFailPhase=media'));
+    return engine.init().then(() => engine.load('/api/stream/PLAYERTEST1/dash.mpd?fixtureFailStatus=401&fixtureFailCount=1&fixtureFailFormat=v240&fixtureFailPhase=media'));
   });
 
   await page.evaluate(() => document.getElementById('player').play());
@@ -8909,8 +9531,8 @@ video.mp4
   ]);
   expect(parsed.map).toEqual({ url: 'https://example.test/hls/video.mp4', range: { start: 0, end: 99 } });
   expect(parsed.segments).toEqual([
-    { start: 0, end: 2, duration: 2, mediaSequence: 0, discontinuity: false, discontinuitySequence: 0, url: 'https://example.test/hls/video.mp4', range: { start: 100, end: 299 } },
-    { start: 2, end: 4, duration: 2, mediaSequence: 1, discontinuity: false, discontinuitySequence: 0, url: 'https://example.test/hls/video.mp4', range: { start: 300, end: 499 } },
+    expect.objectContaining({ start: 0, end: 2, duration: 2, mediaSequence: 0, discontinuity: false, discontinuitySequence: 0, gap: false, _hlsPartialOnly: false, _hlsPlaylistUrl: 'https://example.test/hls/hi.m3u8', url: 'https://example.test/hls/video.mp4', range: { start: 100, end: 299 } }),
+    expect.objectContaining({ start: 2, end: 4, duration: 2, mediaSequence: 1, discontinuity: false, discontinuitySequence: 0, gap: false, _hlsPartialOnly: false, _hlsPlaylistUrl: 'https://example.test/hls/hi.m3u8', url: 'https://example.test/hls/video.mp4', range: { start: 300, end: 499 } }),
   ]);
   expect(parsed.duration).toBe(4);
   expect(parsed.mediaSequence).toBe(0);
@@ -9091,6 +9713,250 @@ seg-271.m4s
     expect.objectContaining({ url: 'https://example.test/hls/live/filePart271.0.m4s', duration: 0.33334, independent: true, gap: false, range: null }),
     expect.objectContaining({ url: 'https://example.test/hls/live/filePart271.1.m4s', duration: 0.33334, independent: false, gap: false, range: { start: 100, end: 499 } }),
   ]);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS treats trailing parts as the in-progress parent and preserves implicit ranges', async ({ page }) => {
+  const shakaRequests = await blockShakaScript(page);
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const media = `#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:270
+#EXT-X-SERVER-CONTROL:PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES
+#EXT-X-PART-INF:PART-TARGET=0.5
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:2.000,
+seg-270.m4s
+#EXT-X-PART:DURATION=0.5,URI="parts-271.m4s",BYTERANGE="100@0",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.5,URI="parts-271.m4s",BYTERANGE="120"
+#EXT-X-PART:DURATION=0.5,URI="missing-271.m4s",GAP=YES`;
+    const parsed = window.NativeDashProviderForTest.parseHlsPlaylist(media, 'https://example.test/live/high.m3u8?token=abc');
+    const provider = {
+      live: true,
+      liveWindow: { start: parsed.segments[0].start, end: parsed.segments.at(-1).end },
+      lowLatencyPlaylist: parsed.lowLatencyPlaylist,
+      partTargetDuration: parsed.partTargetDuration,
+      partialSegmentCount: parsed.partialSegmentCount,
+      serverControl: parsed.serverControl,
+      segments: parsed.segments,
+      preloadHints: [],
+      mediaSequence: parsed.mediaSequence,
+      discontinuitySequence: parsed.discontinuitySequence,
+      isTsPlaylist: false,
+      video: { currentTime: parsed.segments.at(-1).start, buffered: { length: 0 } },
+      _schedulerTime() { return parsed.segments.at(-1).start; },
+      _targetLiveLatency() { return 1; },
+      _bufferAheadGoal() { return 4; },
+      _startupBufferGoal() { return 1; },
+    };
+    const playable = window.NativeHlsProviderForTest.hlsPlayableSegments(provider, provider, parsed.segments);
+    const blockingUrl = window.NativeHlsProviderForTest.hlsBlockingReloadUrl(
+      'https://example.test/live/high.m3u8?token=abc',
+      provider,
+    );
+    return {
+      parsed,
+      playable: playable.map(segment => ({
+        url: segment.url,
+        range: segment.range,
+        gap: !!segment.gap,
+        partial: !!segment._hlsPart,
+      })),
+      blockingUrl,
+    };
+  });
+
+  expect(state.parsed.segments).toHaveLength(2);
+  expect(state.parsed.segments[0]).toMatchObject({ mediaSequence: 270, url: 'https://example.test/live/seg-270.m4s' });
+  expect(state.parsed.segments[1]).toMatchObject({
+    mediaSequence: 271,
+    duration: 1.5,
+    url: '',
+    _hlsPartialOnly: true,
+  });
+  expect(state.parsed.segments[1].parts).toEqual([
+    expect.objectContaining({ partIndex: 0, range: { start: 0, end: 99 }, independent: true, gap: false }),
+    expect.objectContaining({ partIndex: 1, range: { start: 100, end: 219 }, independent: false, gap: false }),
+    expect.objectContaining({ partIndex: 2, range: null, gap: true }),
+  ]);
+  expect(state.parsed.partialSegmentCount).toBe(3);
+  expect(state.parsed.partialSegmentGapCount).toBe(1);
+  expect(state.playable).toEqual([
+    expect.objectContaining({ url: 'https://example.test/live/seg-270.m4s', partial: false }),
+    expect.objectContaining({ url: 'https://example.test/live/parts-271.m4s', range: { start: 0, end: 99 }, partial: true }),
+    expect.objectContaining({ url: 'https://example.test/live/parts-271.m4s', range: { start: 100, end: 219 }, partial: true }),
+  ]);
+  expect(state.playable.some(segment => !segment.url || segment.gap)).toBe(false);
+  const reloadUrl = new URL(state.blockingUrl);
+  expect(reloadUrl.searchParams.get('token')).toBe('abc');
+  expect(reloadUrl.searchParams.get('_HLS_msn')).toBe('271');
+  expect(reloadUrl.searchParams.get('_HLS_part')).toBe('3');
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS carries appended trailing-part state into the completed parent', async ({ page }) => {
+  const shakaRequests = await blockShakaScript(page);
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const merged = await page.evaluate(() => {
+    const prefix = `#EXTM3U
+#EXT-X-VERSION:9
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:9
+#EXT-X-SERVER-CONTROL:PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES
+#EXT-X-PART-INF:PART-TARGET=1
+#EXT-X-MAP:URI="init.mp4"
+#EXT-X-PART:DURATION=1,URI="part-9.0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=1,URI="part-9.1.m4s"`;
+    const oldPlaylist = window.NativeDashProviderForTest.parseHlsPlaylist(
+      prefix,
+      'https://example.test/live/high.m3u8',
+    );
+    oldPlaylist.segments[0].parts.forEach(part => {
+      part.appended = true;
+      part.state = 'appended';
+    });
+    const completedPlaylist = window.NativeDashProviderForTest.parseHlsPlaylist(
+      `${prefix}
+#EXTINF:2,
+seg-9.m4s`,
+      'https://example.test/live/high.m3u8',
+    );
+    return window.NativeHlsProviderForTest.mergeSegmentState(
+      oldPlaylist.segments,
+      completedPlaylist.segments,
+    );
+  });
+
+  expect(merged).toHaveLength(1);
+  expect(merged[0]).toMatchObject({
+    mediaSequence: 9,
+    url: 'https://example.test/live/seg-9.m4s',
+    appended: true,
+    state: 'appended',
+    _hlsPartialOnly: false,
+  });
+  expect(merged[0].parts.every(part => part.appended && part.state === 'appended')).toBe(true);
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS schedules and reuses video preload hints', async ({ page }) => {
+  const shakaRequests = await blockShakaScript(page);
+  await page.goto('/auth/login');
+  await setPlayerContent(page, '<video id="player"></video>');
+
+  const state = await page.evaluate(() => {
+    const provider = {
+      live: true,
+      lowLatencyPlaylist: true,
+      isTsPlaylist: false,
+      partTargetDuration: 0.5,
+      mediaSequence: 40,
+      discontinuitySequence: 0,
+      mediaPlaylistUrl: 'https://example.test/live/high.m3u8',
+      segments: [{
+        start: 80,
+        end: 80.5,
+        duration: 0.5,
+        mediaSequence: 40,
+        discontinuitySequence: 0,
+        url: '',
+        _hlsPartialOnly: true,
+        _hlsPlaylistUrl: 'https://example.test/live/high.m3u8',
+        parts: [{
+          start: 80,
+          end: 80.5,
+          duration: 0.5,
+          mediaSequence: 40,
+          partIndex: 0,
+          discontinuitySequence: 0,
+          independent: true,
+          url: 'https://example.test/live/part-40.0.m4s',
+          range: null,
+          _hlsPart: true,
+        }],
+      }],
+      preloadHints: [{
+        type: 'PART',
+        url: 'https://example.test/live/part-40.1.m4s',
+        byteRangeStart: NaN,
+        byteRangeLength: NaN,
+      }],
+      video: { currentTime: 80, buffered: { length: 0 } },
+      liveWindow: { start: 80, end: 80.5 },
+      _schedulerTime() { return 80; },
+      _targetLiveLatency() { return 1; },
+      _bufferAheadGoal() { return 4; },
+      _startupBufferGoal() { return 1; },
+      preloadHintReuseCount: 0,
+      preloadHintDiscardCount: 0,
+    };
+    provider.segments[0].parts[0]._parentSegment = provider.segments[0];
+    const playable = window.NativeHlsProviderForTest.hlsPlayableSegments(provider, provider, provider.segments);
+    const hinted = playable.find(segment => segment._hlsPreloadHint);
+    hinted.state = 'fetched';
+    hinted.appended = false;
+    hinted._data = new ArrayBuffer(8);
+    const speculativeAppend = window.NativeHlsProviderForTest.nextFetchedSegmentForAppend(
+      { segments: [hinted] },
+      80,
+    );
+
+    const official = window.NativeDashProviderForTest.parseHlsPlaylist(`#EXTM3U
+#EXT-X-TARGETDURATION:2
+#EXT-X-MEDIA-SEQUENCE:40
+#EXT-X-SERVER-CONTROL:PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES
+#EXT-X-PART-INF:PART-TARGET=0.5
+#EXT-X-MAP:URI="init.mp4"
+#EXT-X-PART:DURATION=0.5,URI="part-40.0.m4s",INDEPENDENT=YES
+#EXT-X-PART:DURATION=0.5,URI="part-40.1.m4s"`, 'https://example.test/live/high.m3u8');
+    window.NativeHlsProviderForTest.reconcileHlsPreloadHints(provider, provider, official);
+    const reused = official.segments[0].parts[1];
+    const confirmedAppend = window.NativeHlsProviderForTest.nextFetchedSegmentForAppend(
+      { segments: official.segments[0].parts },
+      80,
+    );
+    return {
+      hinted: {
+        url: hinted.url,
+        mediaSequence: hinted.mediaSequence,
+        partIndex: hinted.partIndex,
+      },
+      reused: {
+        url: reused.url,
+        appended: reused.appended,
+        state: reused.state,
+        retainedBytes: reused._data.byteLength,
+        preload: !!reused._hlsPreloadHint,
+        parentSequence: reused._parentSegment.mediaSequence,
+      },
+      preloadHintReuseCount: provider.preloadHintReuseCount,
+      speculativeAppend: !!speculativeAppend,
+      confirmedAppendUrl: confirmedAppend && confirmedAppend.url,
+    };
+  });
+
+  expect(state.hinted).toEqual({
+    url: 'https://example.test/live/part-40.1.m4s',
+    mediaSequence: 40,
+    partIndex: 1,
+  });
+  expect(state.reused).toEqual({
+    url: 'https://example.test/live/part-40.1.m4s',
+    appended: false,
+    state: 'fetched',
+    retainedBytes: 8,
+    preload: false,
+    parentSequence: 40,
+  });
+  expect(state.preloadHintReuseCount).toBe(1);
+  expect(state.speculativeAppend).toBe(false);
+  expect(state.confirmedAppendUrl).toBe('https://example.test/live/part-40.1.m4s');
   expect(shakaRequests).toHaveLength(0);
 });
 
@@ -9734,6 +10600,7 @@ test('native HLS fixture plays through MSE without Shaka fallback', async ({ pag
 test('native HLS low-latency playlist fetches and appends partial segments without Shaka fallback', async ({ page }) => {
   const shakaRequests = [];
   const partialRequests = [];
+  const blockingReloads = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
     shakaRequests.push(route.request().url());
     route.abort();
@@ -9755,23 +10622,25 @@ test('native HLS low-latency playlist fetches and appends partial segments witho
       ].join('\n'),
     });
   });
-  await page.route('**/ll-media.m3u8', async route => {
+  await page.route('**/ll-media.m3u8**', async route => {
     const url = new URL(route.request().url());
+    if (url.searchParams.has('_HLS_msn')) blockingReloads.push(url);
     const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
     let text = await resp.text();
-    const firstRange = text.match(/#EXT-X-BYTERANGE:([^\n]+)\n(\/api\/stream\/PLAYERTEST1\/fmt\/v360)/);
-    const partRange = firstRange ? firstRange[1] : '';
-    const partUrl = firstRange ? firstRange[2] + '?llpart=0' : 'seg-0.part.m4s';
+    const mediaRanges = [...text.matchAll(/#EXT-X-BYTERANGE:([^\n]+)\n(\/api\/stream\/PLAYERTEST1\/fmt\/v360)/g)];
+    const liveEdgeRange = mediaRanges.at(-1);
+    const partRange = liveEdgeRange ? liveEdgeRange[1] : '';
+    const partUrl = liveEdgeRange ? liveEdgeRange[2] + '?llpart=0' : 'seg-live.part.m4s';
     text = text.replace('#EXTM3U', [
       '#EXTM3U',
       '#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12.0,HOLD-BACK=6.0,PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES',
       '#EXT-X-PART-INF:PART-TARGET=0.33334',
-      '#EXT-X-SKIP:SKIPPED-SEGMENTS=2',
     ].join('\n'));
-    text = text.replace('#EXTINF:', [
+    const lastSegment = text.lastIndexOf('#EXTINF:');
+    text = text.slice(0, lastSegment) + [
       `#EXT-X-PART:DURATION=0.33334,URI="${partUrl}",BYTERANGE="${partRange}",INDEPENDENT=YES`,
       '#EXTINF:',
-    ].join('\n'));
+    ].join('\n') + text.slice(lastSegment + '#EXTINF:'.length);
     text = text.replace('#EXT-X-ENDLIST', [
       '#EXT-X-PRELOAD-HINT:TYPE=PART,URI="next.part.m4s"',
       '#EXT-X-RENDITION-REPORT:URI="low.m3u8",LAST-MSN=1,LAST-PART=1',
@@ -9797,6 +10666,7 @@ test('native HLS low-latency playlist fetches and appends partial segments witho
   await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
   await page.evaluate(() => document.getElementById('player').play());
   await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+  await expect.poll(() => page.evaluate(() => window.__player.getStats().blockingReloadRequestCount)).toBeGreaterThan(0);
 
   const state = await page.evaluate(() => ({
     stats: window.__player.getStats(),
@@ -9809,15 +10679,20 @@ test('native HLS low-latency playlist fetches and appends partial segments witho
   expect(state.stats.partialSegmentAppendCount).toBeGreaterThan(0);
   expect(state.stats.partialSegmentFallbackCount).toBe(0);
   expect(state.stats.preloadHintCount).toBe(1);
+  expect(state.stats.blockingReloadResponseCount).toBeGreaterThan(0);
   expect(state.stats.renditionReportCount).toBe(1);
-  expect(state.stats.skippedSegmentCount).toBe(2);
+  // EXT-X-SKIP is intentionally absent here: a delta update is only valid
+  // when merged with a previously loaded complete Playlist.
+  expect(state.stats.skippedSegmentCount).toBe(0);
   expect(state.stats.iframeVariantCount).toBe(1);
   expect(state.stats.contentSteeringUri).toBe('/steering.json');
-  expect(state.stats.manifestCompatibilityWarnings).toContain('hls-delta-update-skipped-segments');
+  expect(state.stats.manifestCompatibilityWarnings).not.toContain('hls-delta-update-skipped-segments');
   expect(state.stats.fallbackReason).toBe('');
   expect(state.tracks).toHaveLength(1);
   expect(state.tracks[0]).toMatchObject({ height: 360, selectable: true });
   expect(partialRequests.length).toBeGreaterThan(0);
+  expect(blockingReloads.length).toBeGreaterThan(0);
+  expect(blockingReloads[0].searchParams.get('_HLS_part')).toBe('0');
   await expectFirstPartyNativePlayback(page, { provider: 'native-hls', mode: 'hls' });
   expect(shakaRequests).toHaveLength(0);
 });
@@ -9844,21 +10719,23 @@ test('native HLS falls back to full segment when a low-latency part is missing',
       ].join('\n'),
     });
   });
-  await page.route('**/ll-missing-media.m3u8', async route => {
+  await page.route('**/ll-missing-media.m3u8**', async route => {
     const url = new URL(route.request().url());
     const resp = await fetch(url.origin + '/api/stream/PLAYERTEST1/hls/v360.m3u8?fixtureHls=1');
     let text = await resp.text();
-    const firstRange = text.match(/#EXT-X-BYTERANGE:([^\n]+)\n(\/api\/stream\/PLAYERTEST1\/fmt\/v360)/);
-    const partRange = firstRange ? firstRange[1] : '';
+    const mediaRanges = [...text.matchAll(/#EXT-X-BYTERANGE:([^\n]+)\n(\/api\/stream\/PLAYERTEST1\/fmt\/v360)/g)];
+    const liveEdgeRange = mediaRanges.at(-1);
+    const partRange = liveEdgeRange ? liveEdgeRange[1] : '';
     text = text.replace('#EXTM3U', [
       '#EXTM3U',
       '#EXT-X-SERVER-CONTROL:CAN-SKIP-UNTIL=12.0,HOLD-BACK=6.0,PART-HOLD-BACK=1.0,CAN-BLOCK-RELOAD=YES',
       '#EXT-X-PART-INF:PART-TARGET=0.33334',
     ].join('\n'));
-    text = text.replace('#EXTINF:', [
+    const lastSegment = text.lastIndexOf('#EXTINF:');
+    text = text.slice(0, lastSegment) + [
       `#EXT-X-PART:DURATION=0.33334,URI="/missing.part.m4s?llpart=missing",BYTERANGE="${partRange}",INDEPENDENT=YES`,
       '#EXTINF:',
-    ].join('\n'));
+    ].join('\n') + text.slice(lastSegment + '#EXTINF:'.length);
     text = text.replace('#EXT-X-ENDLIST', '');
     route.fulfill({ status: 200, contentType: 'application/vnd.apple.mpegurl', body: text });
   });
@@ -10062,6 +10939,80 @@ test('native HLS live fixture starts near live edge without Shaka fallback', asy
   expect(state.stats.playlistMediaSequence).toBe(0);
   expect(state.currentTime).toBeGreaterThanOrEqual(state.stats.liveWindowStart);
   await expectFirstPartyNativePlayback(page, { provider: 'native-hls', mode: 'hls' });
+  expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS live fixture starts without rewinding playback or refetching an aborted ABR segment', async ({ page }) => {
+  const shakaRequests = await blockShakaScript(page);
+  const videoRanges = [];
+  await page.route('**/api/stream/PLAYERTEST1/fmt/v720', async route => {
+    const range = route.request().headers().range || '';
+    if (range && range !== 'bytes=0-790') videoRanges.push(range);
+    const response = await route.fetch();
+    const delayMs = range === 'bytes=386407-466274' ? 650 : (range ? 350 : 0);
+    if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
+    await route.fulfill({ response });
+  });
+
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    window.__postStartWaitingCount = 0;
+    window.__firstAdvancingFrameSeen = false;
+    window.__largestFrameRewind = 0;
+    let lastMediaTime = 0;
+    const trackFrames = (_now, metadata) => {
+      const mediaTime = Number(metadata.mediaTime) || video.currentTime || 0;
+      if (mediaTime > 0) window.__firstAdvancingFrameSeen = true;
+      if (lastMediaTime > 0) {
+        window.__largestFrameRewind = Math.min(
+          window.__largestFrameRewind,
+          mediaTime - lastMediaTime
+        );
+      }
+      lastMediaTime = mediaTime;
+      if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(trackFrames);
+    };
+    if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(trackFrames);
+    video.addEventListener('waiting', () => {
+      if (window.__firstAdvancingFrameSeen) window.__postStartWaitingCount++;
+    });
+
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({
+      streaming: {
+        bufferingGoal: 4,
+        startupBufferGoal: 1,
+        maxConcurrentRequests: 3,
+      },
+    });
+    return engine.init()
+      .then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=live&fixtureLiveKey=no-rewind'))
+      .then(() => video.play());
+  });
+
+  await page.waitForFunction(() => document.getElementById('player').currentTime >= 4.4, null, { timeout: 12_000 });
+  const state = await page.evaluate(() => ({
+    currentTime: document.getElementById('player').currentTime,
+    postStartWaitingCount: window.__postStartWaitingCount,
+    largestFrameRewind: window.__largestFrameRewind,
+    stats: window.__player.getStats(),
+  }));
+
+  expect(state.currentTime).toBeGreaterThanOrEqual(4.4);
+  expect(state.postStartWaitingCount).toBe(0);
+  expect(state.largestFrameRewind).toBeGreaterThanOrEqual(-0.1);
+  expect(state.stats.seekAbortCount).toBe(0);
+  expect(state.stats.mediaFetchRetryCount).toBe(0);
+  expect(videoRanges.length).toBeGreaterThanOrEqual(2);
+  expect(new Set(videoRanges).size).toBe(videoRanges.length);
   expect(shakaRequests).toHaveLength(0);
 });
 
@@ -10344,6 +11295,10 @@ test('native HLS MPEG-TS muxed audio/video plays without Shaka fallback', async 
     const video = document.getElementById('player');
     video.muted = true;
     video.canPlayType = () => '';
+    window.__postStartWaitingCount = 0;
+    video.addEventListener('waiting', () => {
+      if (video.currentTime > 0) window.__postStartWaitingCount++;
+    });
     const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
     window.__engine = engine;
     window.__player = engine.getPlayer();
@@ -10353,14 +11308,18 @@ test('native HLS MPEG-TS muxed audio/video plays without Shaka fallback', async 
 
   await expect.poll(() => page.evaluate(() => window._playerProvider)).toBe('native-hls');
   await page.evaluate(() => { document.getElementById('player').play().catch(() => {}); });
-  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 1.5, null, { timeout: 10_000 });
 
-  const stats = await page.evaluate(() => window.__player.getStats());
+  const { stats, postStartWaitingCount } = await page.evaluate(() => ({
+    stats: window.__player.getStats(),
+    postStartWaitingCount: window.__postStartWaitingCount,
+  }));
   expect(stats.provider).toBe('native-hls');
   expect(stats.muxedTsAudio).toBe(true);
   expect(stats.transmuxerProvider).toBe('first-party-ts');
   expect(stats.transmuxedVideoSegmentCount).toBeGreaterThan(0);
   expect(stats.transmuxedAudioSegmentCount).toBeGreaterThan(0);
+  expect(postStartWaitingCount).toBe(0);
   expect(stats.fallbackReason).toBe('');
   await expectNativePlayback(page, { provider: 'native-hls', mode: 'hls', transmuxerProvider: 'first-party-ts' });
   expect(shakaRequests).toHaveLength(0);
@@ -10442,6 +11401,57 @@ test('native HLS manual quality selection updates active variant without Shaka',
   expect(shakaRequests).toHaveLength(0);
 });
 
+test('native ABR upgrades HLS seek playback to 720p without a decode error', async ({ page }) => {
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player" muted playsinline style="width:1280px;height:720px"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  await page.evaluate(() => {
+    const video = document.getElementById('player');
+    video.muted = true;
+    video.canPlayType = () => '';
+    const engine = new window.PlayerEngine(video, { videoId: 'PLAYERTEST1', streamToken: '' });
+    window.__engine = engine;
+    window.__player = engine.getPlayer();
+    window.__player.configure({
+      streaming: {
+        bufferingGoal: 4,
+        startupBufferGoal: 1,
+        seekBufferGoal: 1,
+        maxConcurrentRequests: 3,
+      },
+    });
+    return engine.init()
+      .then(() => engine.load('/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=benchmark-groups'))
+      .then(() => video.play());
+  });
+
+  await page.waitForFunction(() => document.getElementById('player').currentTime > 0, null, { timeout: 10_000 });
+  await page.evaluate(() => window.__player.commitSeek(4.5));
+  await page.waitForFunction(() => {
+    const video = document.getElementById('player');
+    return video.currentTime >= 4.4 && video.videoHeight >= 720;
+  }, null, { timeout: 10_000 });
+
+  const state = await page.evaluate(() => {
+    const video = document.getElementById('player');
+    return {
+      mediaError: video.error && (video.error.message || video.error.code),
+      width: video.videoWidth,
+      height: video.videoHeight,
+      stats: window.__player.getStats(),
+    };
+  });
+
+  expect(state.mediaError).toBeFalsy();
+  expect(state.width).toBeGreaterThanOrEqual(1280);
+  expect(state.height).toBeGreaterThanOrEqual(720);
+  expect(state.stats.activeVariant.height).toBe(720);
+  expect(state.stats.bandwidthTimeToFirstByteEstimateMs).toBeGreaterThan(0);
+  expect(state.stats.seekBufferPending).toBe(false);
+  expect(state.stats.fatalError).toBe('');
+});
+
 test('native HLS media groups expose audio and subtitle tracks without Shaka', async ({ page }) => {
   const shakaRequests = [];
   await page.route('**/vendor/shaka/shaka-player.compiled.js', route => {
@@ -10491,6 +11501,80 @@ test('native HLS media groups expose audio and subtitle tracks without Shaka', a
   expect(state.stats.fallbackReason).toBe('');
   await expectFirstPartyNativePlayback(page, { provider: 'native-hls', mode: 'hls' });
   expect(shakaRequests).toHaveLength(0);
+});
+
+test('native HLS media groups expose concurrent startup and refresh playlist requests', async ({ page }) => {
+  await page.goto('/auth/login');
+  await page.setContent('<video id="player"></video>');
+  await page.addScriptTag({ path: 'public/native-player-engine.js' });
+
+  const state = await page.evaluate(async () => {
+    const requested = [];
+    const parsed = [];
+    const resolvers = {};
+    const variant = { id: 'video-240', url: '/video.m3u8' };
+    const audio = { id: 'audio-en', url: '/audio.m3u8' };
+    const provider = {
+      variants: [variant],
+      activeVariant: variant,
+      activeAudio: audio,
+      blacklisted: {},
+      _fetchPlaylistText(url) {
+        requested.push(url);
+        return new Promise(resolve => {
+          resolvers[url] = resolve;
+        });
+      },
+      _loadMediaPlaylist(text, url) {
+        parsed.push({ kind: 'video', text, url });
+      },
+      _loadAudioPlaylist(text, url) {
+        parsed.push({ kind: 'audio', text, url });
+      },
+      _fetchReloadPlaylist: window.NativeHlsProviderForTest._fetchReloadPlaylist,
+    };
+
+    const loading = window.NativeHlsProviderForTest._loadStartupMediaPlaylists.call(provider);
+    await Promise.resolve();
+    const requestedBeforeEitherResponse = requested.slice();
+    resolvers['/video.m3u8']('video-playlist');
+    await Promise.resolve();
+    const parsedBeforeAudioResponse = parsed.slice();
+    resolvers['/audio.m3u8']('audio-playlist');
+    await loading;
+    const startupParsed = parsed.slice();
+
+    requested.length = 0;
+    parsed.length = 0;
+    provider._refreshContentSteering = () => Promise.resolve();
+    provider._applyContentSteeringToActiveVariant = () => {};
+    const refreshing = window.NativeHlsProviderForTest._refreshMediaPlaylist.call(provider, 'live');
+    await Promise.resolve();
+    await Promise.resolve();
+    const refreshRequestedBeforeEitherResponse = requested.slice();
+    resolvers['/video.m3u8']('refreshed-video-playlist');
+    resolvers['/audio.m3u8']('refreshed-audio-playlist');
+    await refreshing;
+    return {
+      requestedBeforeEitherResponse,
+      parsedBeforeAudioResponse,
+      startupParsed,
+      refreshRequestedBeforeEitherResponse,
+      refreshParsed: parsed,
+    };
+  });
+
+  expect(state.requestedBeforeEitherResponse).toEqual(['/video.m3u8', '/audio.m3u8']);
+  expect(state.parsedBeforeAudioResponse).toEqual([]);
+  expect(state.startupParsed).toEqual([
+    { kind: 'video', text: 'video-playlist', url: '/video.m3u8' },
+    { kind: 'audio', text: 'audio-playlist', url: '/audio.m3u8' },
+  ]);
+  expect(state.refreshRequestedBeforeEitherResponse).toEqual(['/video.m3u8', '/audio.m3u8']);
+  expect(state.refreshParsed).toEqual([
+    { kind: 'video', text: 'refreshed-video-playlist', url: '/video.m3u8' },
+    { kind: 'audio', text: 'refreshed-audio-playlist', url: '/audio.m3u8' },
+  ]);
 });
 
 test('unsupported HLS audio codec stays native with explicit terminal reason', async ({ page }) => {

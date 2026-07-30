@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Player performance fixture</title>
+  <style>
+    html, body { margin: 0; background: #000; }
+    video, mux-player { display: block; width: 100vw; height: 100vh; }
+  </style>
+</head>
+<body>
+<script>
+(function () {
+  'use strict';
+
+  var params = new URLSearchParams(location.search);
+  var implementation = params.get('implementation') || 'native';
+  var mode = params.get('mode') || 'cold';
+  var sourceKind = params.get('source') || 'vod-av';
+  var runId = params.get('run') || '0';
+  var sourceByKind = {
+    // Product-path parity: the application prefers first-party DASH while Mux
+    // Player's supported adaptive path is HLS. Both manifests reference the
+    // same encoded CMAF fixture files and rendition ladder.
+    'product-av': implementation === 'native'
+      ? '/api/stream/PLAYERTEST1/dash.mpd'
+      : '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=benchmark-groups',
+    'vod-video': '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=1',
+    'vod-av': '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=benchmark-groups',
+    'vod-aes': '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=aes',
+    'vod-ts': '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=ts-muxed',
+    'live': '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=live&fixtureLiveKey=benchmark-' + encodeURIComponent(runId),
+    'progressive': '/api/stream/PLAYERTEST1/progressive.mp4'
+  };
+  var sourceUrl = sourceByKind[sourceKind];
+  var result = {
+    implementation: implementation,
+    mode: mode,
+    source: sourceKind,
+    runId: runId,
+    navigationStartMs: 0,
+    scriptStartMs: performance.now(),
+    scriptReadyMs: 0,
+    playerInitMs: 0,
+    playerReadyMs: 0,
+    pageLoadMs: 0,
+    sourceStartMs: 0,
+    playIntentMs: 0,
+    playCallMs: 0,
+    loadedMetadataMs: 0,
+    loadedDataMs: 0,
+    canPlayMs: 0,
+    playingMs: 0,
+    firstFrameMs: 0,
+    firstFrameMediaTime: 0,
+    firstFramePresentedFrames: 0,
+    firstFrameVideoWidth: 0,
+    firstFrameVideoHeight: 0,
+    steadyStateFrameMs: 0,
+    steadyStateMediaTime: 0,
+    steadyStateVideoWidth: 0,
+    steadyStateVideoHeight: 0,
+    playbackAdvanceMs: 0,
+    videoStartupMs: 0,
+    aggregateStartupMs: 0,
+    playerStartupMs: 0,
+    loadToFirstFrameMs: 0,
+    seekStartMs: 0,
+    seekedMs: 0,
+    seekFrameMs: 0,
+    seekLatencyMs: 0,
+    seekFrameLatencyMs: 0,
+    postSeekVideoWidth: 0,
+    postSeekVideoHeight: 0,
+    readyState: 0,
+    videoWidth: 0,
+    videoHeight: 0,
+    droppedVideoFrames: 0,
+    totalVideoFrames: 0,
+    waitingCount: 0,
+    postStartWaitingCount: 0,
+    error: ''
+  };
+  var playerTarget;
+  var media;
+  var engine;
+  var loadPromise = Promise.resolve();
+  var completed = false;
+  var restoreOptionalMuxCast = null;
+
+  window.__playerBenchmarkResult = result;
+  window.__playerBenchmarkComplete = false;
+  window.__playerBenchmarkDone = new Promise(function (resolve) {
+    window.__resolvePlayerBenchmark = resolve;
+  });
+
+  function completeBenchmark() {
+    if (completed) return;
+    completed = true;
+    window.__playerBenchmarkComplete = true;
+    window.__resolvePlayerBenchmark(result);
+  }
+
+  function at(name) {
+    if (!result[name]) result[name] = performance.now();
+  }
+
+  function listenMediaEvents(target) {
+    target.addEventListener('loadedmetadata', function () { at('loadedMetadataMs'); });
+    target.addEventListener('loadeddata', function () { at('loadedDataMs'); });
+    target.addEventListener('canplay', function () { at('canPlayMs'); });
+    target.addEventListener('playing', function () { at('playingMs'); });
+    target.addEventListener('waiting', function () {
+      if (result.playIntentMs) {
+        result.waitingCount++;
+        if (result.firstFrameMs) result.postStartWaitingCount++;
+      }
+    });
+    target.addEventListener('error', function (event) {
+      var detail = event && event.detail;
+      var mediaError = media && media.error;
+      result.error = (detail && (detail.message || detail.code))
+        || (mediaError && (mediaError.message || mediaError.code))
+        || 'media-error';
+    });
+  }
+
+  function frameCallback(target, predicate, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var started = performance.now();
+      var timeout = setTimeout(function () {
+        if (done) return;
+        done = true;
+        reject(new Error('frame-timeout-' + timeoutMs));
+      }, timeoutMs);
+      function finish(now, metadata) {
+        if (done) return;
+        if (!predicate(metadata || {}, target)) {
+          schedule();
+          return;
+        }
+        done = true;
+        clearTimeout(timeout);
+        resolve({ now: now, metadata: metadata || {} });
+      }
+      function schedule() {
+        if (done) return;
+        if (target.requestVideoFrameCallback) {
+          target.requestVideoFrameCallback(finish);
+        } else {
+          requestAnimationFrame(function fallbackFrame(now) {
+            if (target.currentTime > 0 && !target.paused) finish(now, {
+              mediaTime: target.currentTime,
+              presentedFrames: 0
+            });
+            else if (performance.now() - started < timeoutMs) requestAnimationFrame(fallbackFrame);
+          });
+        }
+      }
+      schedule();
+    });
+  }
+
+  function callPlay() {
+    if (result.playCallMs) return;
+    result.playCallMs = performance.now();
+    var promise;
+    try {
+      promise = playerTarget.play();
+    } catch (error) {
+      result.error = error && error.message ? error.message : String(error);
+      return;
+    }
+    Promise.resolve(promise).catch(function (error) {
+      // Native playback can receive the user intent before MSE has attached.
+      // Preserve the original intent timestamp and retry once attachment
+      // generates a readiness event.
+      if (implementation === 'native' && error && (
+        error.name === 'AbortError'
+        || error.name === 'NotSupportedError'
+      )) return;
+      result.error = error && error.message ? error.message : String(error);
+    });
+  }
+
+  function waitForPreload() {
+    if (media.readyState >= 2) return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      var timeout = setTimeout(function () {
+        reject(new Error('preload-timeout'));
+      }, 20000);
+      media.addEventListener('loadeddata', function () {
+        clearTimeout(timeout);
+        resolve();
+      }, { once: true });
+      media.addEventListener('error', function () {
+        clearTimeout(timeout);
+        reject(new Error(result.error || 'preload-error'));
+      }, { once: true });
+    });
+  }
+
+  async function measure() {
+    if (mode === 'preloaded') await waitForPreload();
+    result.playIntentMs = performance.now();
+    var initialTime = Number(media.currentTime) || 0;
+    var firstFrame = frameCallback(media, function (metadata, target) {
+      var mediaTime = Number(metadata.mediaTime);
+      return !target.paused && (
+        (isFinite(mediaTime) && mediaTime > initialTime + 0.001)
+        || target.currentTime > initialTime + 0.001
+      );
+    }, 20000);
+    callPlay();
+    if (implementation === 'native') {
+      ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay'].forEach(function (name) {
+        media.addEventListener(name, callPlay, { once: true });
+      });
+      loadPromise.then(callPlay).catch(function () {});
+    }
+    var frame = await firstFrame;
+    result.firstFrameMs = frame.now;
+    result.firstFrameMediaTime = Number(frame.metadata.mediaTime) || Number(media.currentTime) || 0;
+    result.firstFramePresentedFrames = Number(frame.metadata.presentedFrames) || 0;
+    result.firstFrameVideoWidth = media.videoWidth;
+    result.firstFrameVideoHeight = media.videoHeight;
+    result.videoStartupMs = result.firstFrameMs - result.playIntentMs;
+    result.pageLoadMs = result.playerInitMs;
+    result.playerStartupMs = result.playerReadyMs - result.playerInitMs;
+    result.aggregateStartupMs = result.pageLoadMs
+      + result.playerStartupMs
+      + result.videoStartupMs;
+    result.loadToFirstFrameMs = result.firstFrameMs - result.sourceStartMs;
+
+    // Keep every sample alive through an advancing-frame checkpoint so a fast
+    // first frame cannot hide an ABR implementation that remains at a lower
+    // rendition than the comparator. The fixture has one-second segment
+    // boundaries, so sample at 1.5 seconds to avoid comparing the last decoded
+    // frame of one rendition with the first frame of the next.
+    var steadyTarget = result.firstFrameMediaTime + 1.5;
+    if (isFinite(media.duration)) steadyTarget = Math.min(steadyTarget, Math.max(0, media.duration - 0.25));
+    var steadyFrame = await frameCallback(media, function (metadata, target) {
+      var mediaTime = Number(metadata.mediaTime);
+      return !target.paused && (
+        (isFinite(mediaTime) && mediaTime >= steadyTarget - 0.05)
+        || target.currentTime >= steadyTarget - 0.05
+      );
+    }, 20000);
+    result.steadyStateFrameMs = steadyFrame.now;
+    result.steadyStateMediaTime = Number(steadyFrame.metadata.mediaTime) || Number(media.currentTime) || 0;
+    result.steadyStateVideoWidth = media.videoWidth;
+    result.steadyStateVideoHeight = media.videoHeight;
+    result.playbackAdvanceMs = result.steadyStateFrameMs - result.firstFrameMs;
+
+    if (params.get('seek') === '1' && sourceKind !== 'live') {
+      var seekTarget = Math.max(0, Math.min(4.5, (Number(media.duration) || 6) - 0.5));
+      result.seekStartMs = performance.now();
+      var seekFrame = frameCallback(media, function (metadata, target) {
+        var mediaTime = Number(metadata.mediaTime);
+        return !target.seeking && (
+          (isFinite(mediaTime) && mediaTime >= seekTarget - 0.1)
+          || target.currentTime >= seekTarget - 0.1
+        );
+      }, 20000);
+      var seeked = new Promise(function (resolve) {
+        if (!media.seeking && Math.abs(media.currentTime - seekTarget) < 0.1) {
+          resolve(performance.now());
+          return;
+        }
+        media.addEventListener('seeked', function () { resolve(performance.now()); }, { once: true });
+      });
+      if (implementation === 'native' && engine && engine.getPlayer) {
+        var adapter = engine.getPlayer();
+        if (adapter.beginSeek) adapter.beginSeek(seekTarget);
+        if (adapter.commitSeek) adapter.commitSeek(seekTarget);
+        else media.currentTime = seekTarget;
+      } else {
+        playerTarget.currentTime = seekTarget;
+      }
+      result.seekedMs = await seeked;
+      var postSeekFrame = await seekFrame;
+      result.seekFrameMs = postSeekFrame.now;
+      result.seekLatencyMs = result.seekedMs - result.seekStartMs;
+      result.seekFrameLatencyMs = result.seekFrameMs - result.seekStartMs;
+      result.postSeekVideoWidth = media.videoWidth;
+      result.postSeekVideoHeight = media.videoHeight;
+    }
+
+    var quality = media.getVideoPlaybackQuality ? media.getVideoPlaybackQuality() : {};
+    result.readyState = media.readyState;
+    result.videoWidth = media.videoWidth;
+    result.videoHeight = media.videoHeight;
+    result.droppedVideoFrames = Number(quality.droppedVideoFrames) || 0;
+    result.totalVideoFrames = Number(quality.totalVideoFrames) || 0;
+    if (engine && engine.getPlayer) {
+      var stats = engine.getPlayer().getStats();
+      result.nativeStats = {
+        provider: stats.provider,
+        bandwidthEstimate: stats.bandwidthEstimate,
+        bandwidthTimeToFirstByteEstimateMs: stats.bandwidthTimeToFirstByteEstimateMs,
+        activeHeight: stats.activeVariant && stats.activeVariant.height,
+        mediaFetchCompletedCount: stats.mediaFetchCompletedCount,
+        mediaFetchRetryCount: stats.mediaFetchRetryCount,
+        seekAbortCount: stats.seekAbortCount,
+        seekBufferPending: stats.seekBufferPending,
+        seekBufferReadyCount: stats.seekBufferReadyCount,
+        bufferedSeekCount: stats.bufferedSeekCount,
+        lastSeekMs: stats.lastSeekMs,
+        startupBufferComplete: stats.startupBufferComplete,
+        rebufferCount: stats.rebufferCount,
+        rebufferDuration: stats.rebufferDuration
+      };
+    } else if (playerTarget && playerTarget._hls) {
+      result.muxStats = {
+        bandwidthEstimate: playerTarget._hls.bandwidthEstimate || 0,
+        currentLevel: playerTarget._hls.currentLevel,
+        loadLevel: playerTarget._hls.loadLevel
+      };
+    }
+  }
+
+  async function setupNative() {
+    media = document.createElement('video');
+    media.id = 'player';
+    media.muted = true;
+    media.playsInline = true;
+    media.preload = 'auto';
+    document.body.appendChild(media);
+    playerTarget = media;
+    engine = new window.PlayerEngine(media, { videoId: 'PLAYERTEST1', streamToken: '' });
+    await engine.init();
+    result.playerReadyMs = performance.now();
+    listenMediaEvents(media);
+    result.sourceStartMs = performance.now();
+    var mimeType = sourceKind === 'progressive'
+      ? 'video/mp4'
+      : (sourceKind === 'product-av' ? 'application/dash+xml' : 'application/vnd.apple.mpegurl');
+    loadPromise = engine.getPlayer().load(sourceUrl, undefined, mimeType);
+    loadPromise.catch(function (error) {
+      result.error = error && error.message ? error.message : String(error);
+    });
+  }
+
+  async function setupMux() {
+    await customElements.whenDefined('mux-player');
+    playerTarget = document.createElement('mux-player');
+    playerTarget.setAttribute('disable-tracking', '');
+    playerTarget.setAttribute('disable-cookies', '');
+    playerTarget.setAttribute('prefer-playback', 'mse');
+    playerTarget.setAttribute('preload', 'auto');
+    playerTarget.setAttribute('muted', '');
+    playerTarget.setAttribute('playsinline', '');
+    playerTarget.setAttribute('stream-type', sourceKind === 'live' ? 'live' : 'on-demand');
+    document.body.appendChild(playerTarget);
+    media = playerTarget.media && playerTarget.media.nativeEl
+      ? playerTarget.media.nativeEl
+      : playerTarget.media;
+    if (!media) throw new Error('mux-native-media-missing');
+    media.muted = true;
+    listenMediaEvents(media);
+    result.playerReadyMs = performance.now();
+    result.sourceStartMs = performance.now();
+    playerTarget.src = sourceUrl;
+  }
+
+  function loadImplementationScript() {
+    return new Promise(function (resolve, reject) {
+      // Cast is outside this player's feature scope. Masking Chrome's optional
+      // sender-framework request gives the Mux comparator the conservative
+      // advantage of avoiding unrelated remote work during initialization.
+      if (implementation === 'mux') {
+        var originalAppendChild = document.head.appendChild;
+        var originalAppend = document.head.append;
+        function isCastFrameworkScript(node) {
+          return node
+            && node.tagName === 'SCRIPT'
+            && /^https:\/\/www\.gstatic\.com\/cv\//.test(node.src || '');
+        }
+        document.head.appendChild = function (node) {
+          if (isCastFrameworkScript(node)) {
+            result.muxOptionalCastDisabled = true;
+            return node;
+          }
+          return originalAppendChild.call(this, node);
+        };
+        document.head.append = function () {
+          var nodes = Array.prototype.slice.call(arguments);
+          var allowed = nodes.filter(function (node) {
+            if (!isCastFrameworkScript(node)) return true;
+            result.muxOptionalCastDisabled = true;
+            return false;
+          });
+          if (allowed.length) originalAppend.apply(this, allowed);
+        };
+        restoreOptionalMuxCast = function () {
+          document.head.appendChild = originalAppendChild;
+          document.head.append = originalAppend;
+          restoreOptionalMuxCast = null;
+        };
+      }
+      var script = document.createElement('script');
+      script.src = implementation === 'mux'
+        ? '/__player-benchmark/mux-player.js'
+        : '/native-player-engine.js?v=17';
+      script.onload = function () {
+        result.scriptReadyMs = performance.now();
+        resolve();
+      };
+      script.onerror = function () {
+        if (restoreOptionalMuxCast) restoreOptionalMuxCast();
+        reject(new Error('implementation-script-load-failed'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+
+  loadImplementationScript()
+    .then(function () {
+      result.playerInitMs = performance.now();
+      return implementation === 'mux' ? setupMux() : setupNative();
+    })
+    .then(measure)
+    .then(function () {
+      if (restoreOptionalMuxCast) restoreOptionalMuxCast();
+      completeBenchmark();
+    })
+    .catch(function (error) {
+      if (restoreOptionalMuxCast) restoreOptionalMuxCast();
+      result.error = error && error.message ? error.message : String(error);
+      completeBenchmark();
+    });
+
+  setTimeout(function () {
+    if (completed) return;
+    result.error = result.error || 'benchmark-timeout';
+    completeBenchmark();
+  }, 30000);
+})();
+</script>
+</body>
+</html>

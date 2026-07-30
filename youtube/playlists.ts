@@ -26,6 +26,8 @@ interface PlaylistDetails {
   nextPageToken: string | null;
 }
 
+const inFlightPlaylists = new Map<string, Promise<PlaylistDetails>>();
+
 function sanitizePlaylistId(value: unknown): string {
   const playlistId = typeof value === 'string' ? value.trim() : '';
   if (!/^[A-Za-z0-9_-]{2,128}$/.test(playlistId)) return '';
@@ -271,8 +273,10 @@ async function getPlaylistDetails(rawPlaylistId: unknown): Promise<PlaylistDetai
   if (!playlistId) throw new Error('Invalid playlist ID');
   const cached = cache.playlists.get(playlistId);
   if (cached && Date.now() < cached.expires) return cached.data as PlaylistDetails;
+  const activeRequest = inFlightPlaylists.get(playlistId);
+  if (activeRequest !== undefined) return activeRequest;
 
-  const playlist = await withYtSlot(async () => {
+  const request = withYtSlot(async () => {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 10000);
     try {
@@ -287,9 +291,14 @@ async function getPlaylistDetails(rawPlaylistId: unknown): Promise<PlaylistDetai
       clearTimeout(timer);
     }
   });
-
-  cache.playlists.set(playlistId, { data: playlist, expires: Date.now() + PLAYLIST_TTL });
-  return playlist;
+  inFlightPlaylists.set(playlistId, request);
+  try {
+    const playlist = await request;
+    cache.playlists.set(playlistId, { data: playlist, expires: Date.now() + PLAYLIST_TTL });
+    return playlist;
+  } finally {
+    if (inFlightPlaylists.get(playlistId) === request) inFlightPlaylists.delete(playlistId);
+  }
 }
 
 async function getExpandedPlaylistDetails(rawPlaylistId: unknown, maxItems = 500): Promise<PlaylistDetails> {
