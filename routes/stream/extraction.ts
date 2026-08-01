@@ -37,8 +37,11 @@ function setCache(videoId, data) {
 async function extractFormats(videoId) {
   const cached = getCached(videoId);
   if (cached) return cached;
+  const localRequest = extractionInflight.get(videoId);
+  if (localRequest) return localRequest;
 
   // Cross-worker dedup: check if another worker already has the result in Redis
+  let ownsExtractionLock = false;
   if (hasRedis()) {
     const redisEntry = await formatCache.getAsync(videoId);
     if (redisEntry && redisEntry.data && Date.now() < redisEntry.expires) return redisEntry.data;
@@ -46,6 +49,10 @@ async function extractFormats(videoId) {
     // Try to acquire extraction lock — if another worker is extracting, wait for result
     const lockAcquired = await acquireLock(`extract:${videoId}`, 60000);
     if (!lockAcquired) {
+      // A request in this process may have populated the in-flight map while
+      // the Redis checks above were pending. Join it instead of polling Redis.
+      const newlyLocalRequest = extractionInflight.get(videoId);
+      if (newlyLocalRequest) return newlyLocalRequest;
       // Another worker is extracting — poll Redis for result
       for (let i = 0; i < 30; i++) {
         await new Promise(r => setTimeout(r, 1000 + Math.random() * 500));
@@ -57,9 +64,11 @@ async function extractFormats(videoId) {
       formatCache.set(videoId, { data: timeoutResult, expires: Date.now() + 10000 }); // short 10s TTL
       return timeoutResult;
     }
+    ownsExtractionLock = true;
   }
 
   return dedup(extractionInflight, videoId, async () => {
+    try {
     // Try extraction queue (separate worker process) if available
     if (hasExtractionQueue()) {
       try {
@@ -72,7 +81,6 @@ async function extractFormats(videoId) {
           console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct) via extraction-worker (${result._extractedVia || 'unknown'})`);
           setCache(videoId, result);
           cacheVideoDetailsFromInfo(videoId, result);
-          releaseLock(`extract:${videoId}`).catch(err => console.warn('[extraction] lock release failed:', err.message));
           return result;
         }
         // Queue returned empty/null — fall through to in-process extraction
@@ -140,8 +148,10 @@ async function extractFormats(videoId) {
     setCache(videoId, info);
     // Populate video details cache so /watch/details can return instantly
     cacheVideoDetailsFromInfo(videoId, info);
-    releaseLock(`extract:${videoId}`).catch(err => console.warn('[extraction] lock release failed:', err.message));
     return info;
+    } finally {
+      if (ownsExtractionLock) await releaseLock(`extract:${videoId}`);
+    }
   });
 }
 

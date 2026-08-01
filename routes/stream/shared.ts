@@ -109,9 +109,15 @@ const extractionStatus = new LRUMap(100);
 // While a call for key K is in-flight, subsequent calls return the same promise.
 function dedup(map, key, fn) {
   if (map.has(key)) return map.get(key);
-  const promise = fn();
+  const promise = Promise.resolve().then(fn);
   map.set(key, promise);
-  promise.finally(() => map.delete(key));
+  // Do not use an ignored `finally()` chain here. If `promise` rejects, the
+  // promise returned by `finally()` rejects too and becomes an unhandled
+  // rejection even when every caller correctly handles the original promise.
+  void promise.then(
+    () => map.delete(key),
+    () => map.delete(key),
+  );
   return promise;
 }
 const extractionInflight = new Map();

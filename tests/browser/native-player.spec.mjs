@@ -469,59 +469,85 @@ test('watch navigation loading bar timer and stream status badge complete in bro
   await expect(page.locator('#load-timer')).toHaveText('');
   await expect(page.locator('.top-loading-bar')).toHaveCount(0);
 
-  await page.route('**/watch?v=OFFLINE001A', route => {
-    route.fulfill({
-      status: 200,
-      headers: { 'X-SW-Fallback': '1', 'Content-Type': 'text/html' },
-      body: '<main><div class="offline-message">offline</div></main>',
-    });
-  });
-  await page.evaluate(() => {
-    history.replaceState({}, '', '/');
-    window._isOffline = true;
-    document.body.innerHTML = [
-      '<nav><span class="nav-status">',
-      '<span class="stream-via" id="stream-via"></span>',
-      '<span class="load-timer" id="load-timer"></span>',
-      '</span></nav>',
-      '<main><a id="offline-watch" href="/watch?v=OFFLINE001A">Offline watch</a></main>',
-    ].join('');
-  });
-  await page.locator('#offline-watch').click();
-  await expect(page.locator('#stream-via')).toHaveText('offline');
-  await expect(page.locator('#load-timer')).toHaveClass(/done-green|done-yellow|done-red/);
-  await expect(page.locator('.top-loading-bar')).toHaveCount(0);
 });
 
-test('thumbnail SPA navigation ignores stale watch responses and initializes latest player', async ({ page }) => {
+test('Today thumbnails use full document navigation for streamed watch pages', async ({ page }) => {
+  const watchRequestTypes = [];
+  page.on('request', request => {
+    if (request.url().includes('/watch?v=TODAYVIDEO1')) watchRequestTypes.push(request.resourceType());
+  });
+  await page.route('**/watch?v=TODAYVIDEO1', route => route.fulfill({
+    status: 200,
+    contentType: 'text/html',
+    body: '<!doctype html><title>Today watch</title><main><h1 id="today-watch">Today watch</h1></main>',
+  }));
+  await page.goto('/auth/login');
+  await page.setContent([
+    '<nav><span class="nav-status"><span id="stream-via"></span><span id="load-timer"></span></span></nav>',
+    '<main><div class="video-grid"><a id="today-card" class="video-card" href="/watch?v=TODAYVIDEO1">Today video</a></div></main>',
+  ].join(''));
+  await page.addScriptTag({ path: 'public/app.js' });
+
+  await page.click('#today-card');
+  await expect(page.locator('#today-watch')).toHaveText('Today watch');
+  expect(watchRequestTypes).toEqual(['document']);
+});
+
+test('Explore thumbnails use full document navigation for streamed watch pages', async ({ page }) => {
+  const watchRequestTypes = [];
+  page.on('request', request => {
+    if (request.url().includes('/watch?v=EXPLOREVID1')) watchRequestTypes.push(request.resourceType());
+  });
+  await page.route('**/watch?v=EXPLOREVID1', route => route.fulfill({
+    status: 200,
+    contentType: 'text/html',
+    body: '<!doctype html><title>Explore watch</title><main><h1 id="explore-watch">Explore watch</h1></main>',
+  }));
+  await page.goto('/auth/login');
+  await page.setContent([
+    '<nav><span class="nav-status"><span id="stream-via"></span><span id="load-timer"></span></span></nav>',
+    '<main><div class="video-grid" data-session-id="test-session">',
+    '<a id="explore-card" class="video-card" data-channel-id="channel" data-explore-pos="0" href="/watch?v=EXPLOREVID1">Explore video</a>',
+    '</div></main>',
+  ].join(''));
+  await page.addScriptTag({ path: 'public/app.js' });
+
+  await page.click('#explore-card');
+  await expect(page.locator('#explore-watch')).toHaveText('Explore watch');
+  expect(watchRequestTypes).toEqual(['document']);
+});
+
+test('PJAX navigation waits for an in-flight page runtime before initializing', async ({ page }) => {
+  let releaseRuntime;
+  await page.route('**/test-player-runtime.js', async route => {
+    await new Promise(resolve => { releaseRuntime = resolve; });
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/javascript',
+      body: 'window.__testPlayerRuntimeReady = true;',
+    });
+  });
+
   await page.goto('/auth/login');
   await page.setContent([
     '<nav><span class="nav-status"><span id="stream-via"></span><span id="load-timer"></span></span></nav>',
     '<main><div class="video-grid">',
-    '<a id="first" class="video-card" href="/watch?v=FIRSTVIDEO1"><span>First</span></a>',
-    '<a id="second" class="video-card" href="/watch?v=SECONDVID2"><span>Second</span></a>',
+    '<a id="runtime-first" href="/channel/runtime-first">First</a>',
+    '<a id="runtime-second" href="/channel/runtime-second">Second</a>',
     '</div></main>',
   ].join(''));
   await page.addScriptTag({
     content: `
-      window.__resolveFirstWatch = null;
       window.fetch = function(url) {
         var href = String(url);
-        if (href.indexOf('/watch?v=FIRSTVIDEO1') !== -1) {
-          return new Promise(function(resolve) {
-            window.__resolveFirstWatch = function() {
-              resolve(new Response('<!doctype html><title>First</title><main><h1>First</h1><script>window.__initializedVideo = "FIRSTVIDEO1";<\\/script></main>', {
-                status: 200,
-                headers: { 'Content-Type': 'text/html' },
-              }));
-            };
-          });
-        }
-        if (href.indexOf('/watch?v=SECONDVID2') !== -1) {
-          return Promise.resolve(new Response('<!doctype html><title>Second</title><main><h1>Second</h1><script>window.__initializedVideo = "SECONDVID2";<\\/script></main>', {
-            status: 200,
-            headers: { 'Content-Type': 'text/html' },
-          }));
+        var match = href.match(/\\/channel\\/(runtime-(?:first|second))/);
+        if (match) {
+          var pageId = match[1];
+          return Promise.resolve(new Response(
+            '<!doctype html><head><title>' + pageId + '</title><script src="/test-player-runtime.js"><\\/script></head>' +
+            '<body><main><h1>' + pageId + '</h1><script>window.__initializedPage = window.__testPlayerRuntimeReady ? "' + pageId + '" : "missing-runtime";<\\/script></main></body>',
+            { status: 200, headers: { 'Content-Type': 'text/html' } }
+          ));
         }
         return Promise.resolve(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
       };
@@ -529,18 +555,48 @@ test('thumbnail SPA navigation ignores stale watch responses and initializes lat
   });
   await page.addScriptTag({ path: 'public/app.js' });
 
-  await page.click('#first');
-  await page.click('#second');
-  await expect.poll(() => page.evaluate(() => window.__initializedVideo)).toBe('SECONDVID2');
-  await page.evaluate(() => window.__resolveFirstWatch && window.__resolveFirstWatch());
-  await page.waitForTimeout(100);
+  await page.click('#runtime-first');
+  await expect.poll(() => Boolean(releaseRuntime)).toBe(true);
+  await page.click('#runtime-second');
+  releaseRuntime();
 
-  const state = await page.evaluate(() => ({
-    initialized: window.__initializedVideo,
-    title: document.title,
-    heading: document.querySelector('main h1')?.textContent || '',
+  await expect.poll(() => page.evaluate(() => window.__initializedPage)).toBe('runtime-second');
+  await expect(page.locator('main h1')).toHaveText('runtime-second');
+});
+
+test('stalled PJAX page navigation falls back to a full document request', async ({ page }) => {
+  await page.route('**/channel/stalled', route => route.fulfill({
+    status: 200,
+    contentType: 'text/html',
+    body: '<!doctype html><title>Recovered</title><main><h1 id="recovered-page">Recovered page</h1></main>',
   }));
-  expect(state).toEqual({ initialized: 'SECONDVID2', title: 'Second', heading: 'Second' });
+  await page.goto('/auth/login');
+  await page.setContent([
+    '<nav><span class="nav-status"><span id="stream-via"></span><span id="load-timer"></span></span></nav>',
+    '<main><a id="stalled-page" href="/channel/stalled">Open page</a></main>',
+  ].join(''));
+  await page.addScriptTag({
+    content: `
+      window.__navigationTimeoutMs = 50;
+      window.fetch = function(url, options) {
+        if (String(url).indexOf('/channel/stalled') !== -1) {
+          return new Promise(function(_resolve, reject) {
+            if (options && options.signal) {
+              options.signal.addEventListener('abort', function() {
+                reject(new DOMException('aborted', 'AbortError'));
+              }, { once: true });
+            }
+          });
+        }
+        return Promise.resolve(new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }));
+      };
+    `,
+  });
+  await page.addScriptTag({ path: 'public/app.js' });
+
+  await page.click('#stalled-page');
+  await expect(page.locator('#recovered-page')).toHaveText('Recovered page');
+  await expect(page).toHaveURL(/\/channel\/stalled$/);
 });
 
 test('native engine keeps unsupported DASH terminal without lazy-loading Shaka', async ({ page }) => {

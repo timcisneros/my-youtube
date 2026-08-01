@@ -673,8 +673,38 @@ function loadWatchProgress() {
     if (_durationSource) { _durationSource.close(); _durationSource = null; }
   }
 
-  // Inject <head> resources (CSS/JS) from the fetched page that aren't already present.
-  // Returns a promise that resolves when all new scripts have loaded.
+  var navigationTimeoutMs = Number(window.__navigationTimeoutMs) || 12000;
+  var headResourceTimeoutMs = Number(window.__headResourceTimeoutMs) || 10000;
+
+  function waitForHeadResource(el, key) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timeout = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        el.dataset.pjaxResourceState = 'failed';
+        el.remove();
+        reject(new Error('Timed out loading ' + key));
+      }, headResourceTimeoutMs);
+
+      function finish(ok) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        el.dataset.pjaxResourceState = ok ? 'loaded' : 'failed';
+        if (!ok) el.remove();
+        if (ok) resolve();
+        else reject(new Error('Failed to load ' + key));
+      }
+
+      el.addEventListener('load', function () { finish(true); }, { once: true });
+      el.addEventListener('error', function () { finish(false); }, { once: true });
+    });
+  }
+
+  // Inject <head> resources from a fetched page. In-flight scripts must be
+  // awaited by later navigations; merely finding their element is not proof
+  // that the runtime is ready yet.
   function injectHeadResources(doc) {
     var promises = [];
     doc.querySelectorAll('head link[rel="stylesheet"], head script[src]').forEach(function (el) {
@@ -683,22 +713,33 @@ function loadWatchProgress() {
       var selector = el.tagName === 'LINK'
         ? 'link[rel="stylesheet"][href="' + key + '"]'
         : 'script[src="' + key + '"]';
-      if (document.head.querySelector(selector)) return;
+      var existing = document.head.querySelector(selector);
+      if (existing) {
+        if (existing.dataset.pjaxResourceState === 'loading') {
+          promises.push(waitForHeadResource(existing, key));
+        } else if (el.tagName === 'SCRIPT'
+          && key.indexOf('/native-player-engine.js') !== -1
+          && !window.PlayerEngine
+          && document.readyState !== 'loading') {
+          // A completed script element without its expected global most likely
+          // failed. Remove it so this navigation gets a real retry.
+          existing.remove();
+          existing = null;
+        } else {
+          return;
+        }
+      }
+      if (existing) return;
       var clone = document.createElement(el.tagName);
       if (el.tagName === 'LINK') {
         clone.rel = 'stylesheet';
         clone.href = key;
-        promises.push(new Promise(function (resolve) {
-          clone.onload = resolve;
-          clone.onerror = resolve;
-        }));
       } else {
         clone.src = key;
-        promises.push(new Promise(function (resolve) {
-          clone.onload = resolve;
-          clone.onerror = resolve;
-        }));
+        clone.async = false;
       }
+      clone.dataset.pjaxResourceState = 'loading';
+      promises.push(waitForHeadResource(clone, key));
       document.head.appendChild(clone);
     });
     return promises.length > 0 ? Promise.all(promises) : Promise.resolve();
@@ -707,23 +748,30 @@ function loadWatchProgress() {
   var navigationSeq = 0;
   var navigationController = null;
 
+  function isWatchDocumentUrl(url) {
+    return url.pathname === '/watch'
+      || url.pathname.startsWith('/watch/')
+      || url.pathname.startsWith('/live/');
+  }
+
   function swapContent(html, seq) {
-    if (seq && seq !== navigationSeq) return;
+    if (seq && seq !== navigationSeq) return Promise.resolve(false);
     destroyPlayer();
     var doc = new DOMParser().parseFromString(html, 'text/html');
     var resourcesReady = injectHeadResources(doc);
     var newMain = doc.querySelector('main');
+    if (!newMain) return Promise.reject(new Error('Navigation response did not contain <main>'));
     var newTitle = doc.querySelector('title');
     if (newTitle) {
       document.title = newTitle.textContent;
     }
     // Wait for all head resources (CSS + JS) before swapping DOM and running scripts
     // so the page is never shown unstyled
-    resourcesReady.then(function () {
-      if (seq && seq !== navigationSeq) return;
-      if (newMain) {
-        document.querySelector('main').innerHTML = newMain.innerHTML;
-      }
+    return resourcesReady.then(function () {
+      if (seq && seq !== navigationSeq) return false;
+      var currentMain = document.querySelector('main');
+      if (!currentMain) throw new Error('Current page did not contain <main>');
+      currentMain.innerHTML = newMain.innerHTML;
       updateActiveNav();
       initComments();
       initTags();
@@ -746,24 +794,31 @@ function loadWatchProgress() {
         ns.textContent = s.textContent;
         s.parentNode.replaceChild(ns, s);
       });
+      return true;
     });
   }
 
   async function navigate(href) {
+    var targetUrl = new URL(href, window.location.origin);
+    if (isWatchDocumentUrl(targetUrl)) {
+      window.location.assign(targetUrl.href);
+      return;
+    }
     var seq = ++navigationSeq;
     if (navigationController) {
       try { navigationController.abort(); } catch (e) {}
     }
-    navigationController = window.AbortController ? new AbortController() : null;
+    var controller = window.AbortController ? new AbortController() : null;
+    navigationController = controller;
+    var navigationTimedOut = false;
+    var navigationTimeout = controller ? setTimeout(function () {
+      navigationTimedOut = true;
+      controller.abort();
+    }, navigationTimeoutMs) : 0;
     startBar();
-    var watchMatch = href.match(/[?&]v=([A-Za-z0-9_-]+)/);
-    if (watchMatch) {
-      if (window._startLoadTimer) window._startLoadTimer();
-      if (!_isOffline) fetch('/api/stream/' + watchMatch[1] + '/prefetch').catch(function () {});
-    }
     try {
       var fetchOpts = { headers: { 'Accept': 'text/html' } };
-      if (navigationController) fetchOpts.signal = navigationController.signal;
+      if (controller) fetchOpts.signal = controller.signal;
       var res = await fetch(href, fetchOpts);
       if (seq !== navigationSeq) return;
       if (!res.ok) {
@@ -773,6 +828,7 @@ function loadWatchProgress() {
       }
       var isFallback = res.headers.get('X-SW-Fallback') === '1';
       var html = await res.text();
+      if (navigationTimeout) { clearTimeout(navigationTimeout); navigationTimeout = 0; }
       if (seq !== navigationSeq) return;
       history.pushState({}, '', href);
       if (isFallback) {
@@ -782,21 +838,26 @@ function loadWatchProgress() {
         handleFallback(html);
       } else {
         if (_isOffline) hideOfflineBadge();
-        swapContent(html, seq);
+        await swapContent(html, seq);
+        if (seq !== navigationSeq) return;
         cacheDownloadMetadata();
-        if (watchMatch) {
-          window._finishLoadingBar = finishBar;
-        } else {
-          finishBar();
-          if (window._resetLoadTimer) window._resetLoadTimer();
-          var svel = document.getElementById('stream-via');
-          if (svel) svel.textContent = '';
-        }
+        finishBar();
+        if (window._resetLoadTimer) window._resetLoadTimer();
+        var svel = document.getElementById('stream-via');
+        if (svel) svel.textContent = '';
       }
       window.scrollTo(0, 0);
     } catch (e) {
-      if (e && e.name === 'AbortError') return;
+      if (navigationTimeout) clearTimeout(navigationTimeout);
+      if (e && e.name === 'AbortError' && !navigationTimedOut) return;
       if (seq !== navigationSeq) return;
+      if (navigationTimedOut) {
+        finishShellLoad();
+        // A full document navigation consumes the server's streamed shell as
+        // soon as it arrives and avoids leaving the current page stuck forever.
+        window.location.assign(href);
+        return;
+      }
       finishBar();
       history.pushState({}, '', href);
       destroyPlayer();
@@ -807,8 +868,10 @@ function loadWatchProgress() {
   }
 
   document.addEventListener('click', function (e) {
+    if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     var a = e.target.closest('a');
     if (!a) return;
+    if (a.hasAttribute('download') || (a.target && a.target !== '_self')) return;
     var href = a.getAttribute('href');
     if (!href || href.startsWith('#')) return;
     // Only intercept same-origin, non-auth links
@@ -816,26 +879,39 @@ function loadWatchProgress() {
       var url = new URL(href, window.location.origin);
       if (url.origin !== window.location.origin) return;
       if (url.pathname.startsWith('/auth/')) return;
+      // Watch responses are deliberately streamed. Let the browser own these
+      // navigations so it can parse the shell and load the player runtime as
+      // chunks arrive instead of buffering the whole document through PJAX.
+      if (isWatchDocumentUrl(url)) {
+        startBar();
+        if (window._startLoadTimer) window._startLoadTimer();
+        return;
+      }
     } catch (err) { return; }
     e.preventDefault();
     navigate(href);
   });
 
   window.addEventListener('popstate', function () {
+    if (isWatchDocumentUrl(new URL(window.location.href))) {
+      window.location.reload();
+      return;
+    }
     var seq = ++navigationSeq;
     if (navigationController) {
       try { navigationController.abort(); } catch (e) {}
     }
-    navigationController = window.AbortController ? new AbortController() : null;
+    var controller = window.AbortController ? new AbortController() : null;
+    navigationController = controller;
+    var navigationTimedOut = false;
+    var navigationTimeout = controller ? setTimeout(function () {
+      navigationTimedOut = true;
+      controller.abort();
+    }, navigationTimeoutMs) : 0;
     destroyPlayer();
     startBar();
-    var vMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]+)/);
-    if (vMatch) {
-      if (window._startLoadTimer) window._startLoadTimer();
-      if (!_isOffline) fetch('/api/stream/' + vMatch[1] + '/prefetch').catch(function () {});
-    }
     var fetchOpts = { headers: { 'Accept': 'text/html' } };
-    if (navigationController) fetchOpts.signal = navigationController.signal;
+    if (controller) fetchOpts.signal = controller.signal;
     fetch(window.location.href, fetchOpts)
       .then(function (r) {
         if (seq !== navigationSeq) return null;
@@ -843,6 +919,7 @@ function loadWatchProgress() {
         return r.ok ? r.text().then(function (t) { return { html: t, fallback: fallback }; }) : null;
       })
       .then(function (result) {
+        if (navigationTimeout) { clearTimeout(navigationTimeout); navigationTimeout = 0; }
         if (seq !== navigationSeq) return;
         if (!result) {
           finishShellLoad();
@@ -855,21 +932,25 @@ function loadWatchProgress() {
           handleFallback(result.html);
         } else {
           if (_isOffline) hideOfflineBadge();
-          swapContent(result.html, seq);
-          cacheDownloadMetadata();
-          if (vMatch) {
-            window._finishLoadingBar = finishBar;
-          } else {
+          return swapContent(result.html, seq).then(function () {
+            if (seq !== navigationSeq) return;
+            cacheDownloadMetadata();
             finishBar();
             if (window._resetLoadTimer) window._resetLoadTimer();
             var svel = document.getElementById('stream-via');
             if (svel) svel.textContent = '';
-          }
+          });
         }
       })
       .catch(function (err) {
-        if (err && err.name === 'AbortError') return;
+        if (navigationTimeout) clearTimeout(navigationTimeout);
+        if (err && err.name === 'AbortError' && !navigationTimedOut) return;
         if (seq !== navigationSeq) return;
+        if (navigationTimedOut) {
+          finishShellLoad();
+          window.location.reload();
+          return;
+        }
         finishBar();
         updateActiveNav();
         handleFallback('');

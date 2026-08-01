@@ -8,11 +8,51 @@ import * as extractionQueue from '../lib/extraction-queue.js';
 import * as storage from '../lib/storage.js';
 import * as segCache from '../lib/segment-cache.js';
 import * as wsStatus from '../lib/ws-status.js';
+import { dedup } from '../routes/stream/shared.js';
 import { stopChild } from './helpers/child-process.mjs';
 
 // ---------------------------------------------------------------------------
 // These tests verify the app doesn't crash when optional services fail
 // ---------------------------------------------------------------------------
+
+describe('In-flight request deduplication', () => {
+  it('shares one request and clears it after success', async () => {
+    const inflight = new Map();
+    let calls = 0;
+    const first = dedup(inflight, 'video', async () => {
+      calls++;
+      await new Promise(resolve => setTimeout(resolve, 5));
+      return 'ready';
+    });
+    const second = dedup(inflight, 'video', async () => {
+      calls++;
+      return 'duplicate';
+    });
+
+    assert.strictEqual(first, second);
+    assert.deepStrictEqual(await Promise.all([first, second]), ['ready', 'ready']);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(calls, 1);
+    assert.strictEqual(inflight.has('video'), false);
+  });
+
+  it('cleans up rejected and synchronously failing requests without an orphan rejection', async () => {
+    const inflight = new Map();
+    const asyncFailure = dedup(inflight, 'async-failure', async () => {
+      throw new Error('async boom');
+    });
+    await assert.rejects(asyncFailure, /async boom/);
+
+    const syncFailure = dedup(inflight, 'sync-failure', () => {
+      throw new Error('sync boom');
+    });
+    await assert.rejects(syncFailure, /sync boom/);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.strictEqual(inflight.has('async-failure'), false);
+    assert.strictEqual(inflight.has('sync-failure'), false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // 1. SharedLRUMap with failed Redis

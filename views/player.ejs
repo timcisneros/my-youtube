@@ -1196,8 +1196,36 @@
 
 <%- include('player/keyboard-shortcuts') %>
     }
+    var playerInitStarted = false;
+    var playerEngineRetryAttempted = false;
+    function showPlayerBootstrapError() {
+      var container = document.getElementById('player-container');
+      if (container) {
+        container.classList.add('player-fallback');
+        container.innerHTML = '<div class="player-error">The video player failed to load. <button type="button" onclick="window.location.reload()">Try again</button></div>';
+      }
+      if (window._stopLoadTimer) window._stopLoadTimer();
+      if (window._finishLoadingBar) window._finishLoadingBar();
+    }
     function tryInitPlayer() {
-      if (window.PlayerEngine) initPlayer();
+      if (playerInitStarted) return;
+      if (window.PlayerEngine) {
+        playerInitStarted = true;
+        initPlayer();
+        return;
+      }
+      // A transient runtime request failure used to leave the spinner visible
+      // forever. Retry the player bundle once, then surface a recoverable error.
+      if (playerEngineRetryAttempted) {
+        showPlayerBootstrapError();
+        return;
+      }
+      playerEngineRetryAttempted = true;
+      var retryScript = document.createElement('script');
+      retryScript.src = '/native-player-engine.js?v=17&retry=1';
+      retryScript.onload = tryInitPlayer;
+      retryScript.onerror = showPlayerBootstrapError;
+      document.head.appendChild(retryScript);
     }
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', tryInitPlayer);

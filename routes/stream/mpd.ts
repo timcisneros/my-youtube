@@ -2,7 +2,6 @@ import fs from 'fs';
 import db from '../../db.js';
 import { hasRedis } from '../../lib/cache.js';
 import {
-  fetchWithConnTimeout,
   sanitizeHeaders,
   mpdCache,
   urlLookup,
@@ -22,9 +21,22 @@ async function probeMP4Ranges(url, headers) {
 
   // Fetch a chunk starting at offset, return a Buffer
   async function fetchChunk(start, size) {
-    const resp = await fetchWithConnTimeout(url, { headers: { ...headers, Range: `bytes=${start}-${start + size - 1}` } }, 8000);
-    if (!resp.ok && resp.status !== 206) return null;
-    return Buffer.from(await resp.arrayBuffer());
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    try {
+      // Keep the timeout armed through body consumption. The shared proxy
+      // helper intentionally clears its timer after response headers because
+      // media streams can be long-lived, but these small probe reads must be
+      // bounded or one stalled CDN body can hold the manifest forever.
+      const resp = await fetch(url, {
+        headers: { ...headers, Range: `bytes=${start}-${start + size - 1}` },
+        signal: controller.signal,
+      });
+      if (!resp.ok && resp.status !== 206) return null;
+      return Buffer.from(await resp.arrayBuffer());
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   // First fetch — most YouTube MP4s have ftyp+moov+sidx within the first few KB
@@ -229,7 +241,15 @@ async function buildMPD(videoId) {
       }
     }
 
-    const info = await extractFormats(videoId);
+    let info;
+    try {
+      info = await extractFormats(videoId);
+    } catch (err) {
+      // Always close WebSocket/SSE status listeners when extraction itself
+      // fails before manifest construction begins.
+      notifyExtractionDone(videoId);
+      throw err;
+    }
     if (info._unavailable) { notifyExtractionDone(videoId); return { unavailable: info._unavailable, scheduledStart: info._scheduledStart }; }
     notifyExtractionStep(videoId, 'building');
 
