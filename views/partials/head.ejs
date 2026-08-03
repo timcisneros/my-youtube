@@ -4,8 +4,7 @@
 <link rel="stylesheet" href="/fonts/roboto.css">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="manifest" href="/manifest.json">
-<link rel="stylesheet" href="/style.css">
-<link rel="prefetch" href="/native-player-engine.js?v=17" as="script" fetchpriority="low">
-<script src="/idb-helpers.js"></script>
-<script src="/app.js"></script>
+<link rel="stylesheet" href="<%= runtimeAssetUrl('style.css') %>">
+<script src="<%= runtimeAssetUrl('idb-helpers.js') %>" defer></script>
+<script src="<%= runtimeAssetUrl('app.js') %>" defer></script>
 <script>if('serviceWorker' in navigator){var hadServiceWorkerController=!!navigator.serviceWorker.controller;navigator.serviceWorker.register('/sw.js');navigator.serviceWorker.addEventListener('controllerchange',function(){if(hadServiceWorkerController)window.location.reload()})}</script>

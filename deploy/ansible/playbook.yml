@@ -175,9 +175,25 @@
         force: false
       register: git_result
 
-    - name: Install npm dependencies
+    - name: Install npm build dependencies
       become_user: "{{ app_user }}"
-      shell: npm ci --production
+      command: npm ci
+      args:
+        chdir: "{{ app_dir }}"
+      environment:
+        YOUTUBE_DL_SKIP_DOWNLOAD: "1"
+      when: git_result.changed
+
+    - name: Build application
+      become_user: "{{ app_user }}"
+      command: npm run build
+      args:
+        chdir: "{{ app_dir }}"
+      when: git_result.changed
+
+    - name: Remove development dependencies
+      become_user: "{{ app_user }}"
+      command: npm prune --omit=dev
       args:
         chdir: "{{ app_dir }}"
       when: git_result.changed

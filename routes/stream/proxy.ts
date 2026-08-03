@@ -12,14 +12,16 @@ import {
   extractionInflight,
   CACHE_TTL,
   PROACTIVE_REFRESH_AGE,
+  streamRequestSignal,
 } from './shared.js';
 import { extractFormats } from './extraction.js';
-import { bgDownloads, cleanupBgDownload } from './downloads.js';
+import { bgDownloads } from './downloads.js';
+import { getDownloadedFormat } from '../../lib/download-files.js';
 
-// Look up a cached format URL + headers (sync, returns null if missing/expired)
-function resolveFormat(videoId, itag) {
-  const lookup = urlLookup.get(`${videoId}:${itag}`);
-  if (lookup && Date.now() < lookup.expires) return { url: lookup.url, cdnHeaders: lookup.headers || {} };
+// Check worker-local memory first, then the shared cache on a cold worker.
+async function resolveFormat(videoId, itag) {
+  const lookup = await urlLookup.getAsync(`${videoId}:${itag}`);
+  if (lookup) return { url: lookup.url, cdnHeaders: lookup.headers || {} };
   return null;
 }
 
@@ -27,12 +29,10 @@ function resolveFormat(videoId, itag) {
 function evictVideoCache(videoId, _oldUrl) {
   formatCache.delete(videoId);
   mpdCache.delete(videoId);
-  // Remove all urlLookup entries and bg downloads for this video
+  // Remove only ephemeral upstream URL lookups. Durable downloads are
+  // independent of signed CDN URL expiry and must never be deleted here.
   for (const [key] of urlLookup) {
     if (key.startsWith(videoId + ':')) urlLookup.delete(key);
-  }
-  for (const [key] of bgDownloads) {
-    if (key.startsWith(videoId + ':')) cleanupBgDownload(key);
   }
 }
 
@@ -62,7 +62,10 @@ function mountProxyRoutes(router) {
       const headers = { ...sanitizeHeaders(fmt.http_headers) };
       if (req.headers.range) headers['Range'] = req.headers.range;
 
-      const upstream = await fetch(fmt.url, { headers });
+      const upstream = await fetchWithConnTimeout(fmt.url, {
+        headers,
+        signal: streamRequestSignal(req, res),
+      });
       res.status(upstream.status);
       const fwd = ['content-type', 'content-length', 'content-range', 'accept-ranges'];
       for (const h of fwd) {
@@ -83,10 +86,11 @@ function mountProxyRoutes(router) {
   router.get('/:videoId/proxy/:itag', async (req, res) => {
     try {
       const { videoId, itag } = req.params;
+      const requestSignal = streamRequestSignal(req, res);
 
       // Resolve format URL + CDN headers (cached or fresh)
       let fmtUrl, cdnHeaders = {};
-      const resolved = resolveFormat(videoId, itag);
+      const resolved = await resolveFormat(videoId, itag);
       if (resolved) {
         fmtUrl = resolved.url;
         cdnHeaders = resolved.cdnHeaders;
@@ -112,18 +116,21 @@ function mountProxyRoutes(router) {
       // Check if requested bytes are available from background download cache
       const range = parseRange(req.headers.range);
       const bg = bgDownloads.get(`${videoId}:${itag}`);
-      if (bg && range && range.start >= 0) {
-        const effectiveEnd = range.end >= 0 ? range.end : bg.bytesDownloaded - 1;
-        if (effectiveEnd < bg.bytesDownloaded && range.start <= effectiveEnd) {
+      const downloaded = bg && bg.done
+        ? { filePath: bg.filePath, size: bg.bytesDownloaded }
+        : await getDownloadedFormat(videoId, itag);
+      if (downloaded && range && range.start >= 0) {
+        const effectiveEnd = range.end >= 0 ? range.end : downloaded.size - 1;
+        if (effectiveEnd < downloaded.size && range.start <= effectiveEnd) {
           const slice = effectiveEnd - range.start + 1;
           res.status(206);
           res.set('Content-Type', 'application/octet-stream');
           res.set('Content-Length', String(slice));
-          res.set('Content-Range', `bytes ${range.start}-${effectiveEnd}/${bg.totalSize || '*'}`);
+          res.set('Content-Range', `bytes ${range.start}-${effectiveEnd}/${downloaded.size}`);
           res.set('Accept-Ranges', 'bytes');
           res.set('Cache-Control', 'private, max-age=3600');
           res.set('Vary', 'Range');
-          const stream = fs.createReadStream(bg.filePath, { start: range.start, end: effectiveEnd });
+          const stream = fs.createReadStream(downloaded.filePath, { start: range.start, end: effectiveEnd });
           return pipeline(stream, res);
         }
       }
@@ -133,20 +140,28 @@ function mountProxyRoutes(router) {
         headers['Range'] = req.headers.range;
       }
 
-      let upstream = await fetchWithConnTimeout(fmtUrl, { headers });
+      let upstream = await fetchWithConnTimeout(fmtUrl, { headers, signal: requestSignal });
 
       // If YouTube CDN rejected the URL (expired/throttled), evict caches and retry once
       // Circuit breaker: deduplicate re-extraction when many users hit the same expired URL
       if (upstream.status === 403 || upstream.status === 410) {
         await upstream.body?.cancel().catch(() => {});
         evictVideoCache(videoId, fmtUrl);
-        const info = await dedup(extractionInflight, `refresh:${videoId}`, () => extractFormats(videoId));
+        const info = await dedup(
+          extractionInflight,
+          `refresh:${videoId}`,
+          () => extractFormats(videoId),
+          { name: 'stream_extraction', maxEntries: 256 },
+        );
         const fmt = (info.formats || []).find(f => String(f.format_id) === String(itag));
         if (!fmt || !fmt.url) return res.status(404).json({ error: 'Format not found after refresh' });
         fmtUrl = fmt.url;
         cdnHeaders = sanitizeHeaders(fmt.http_headers);
-        urlLookup.set(`${videoId}:${itag}`, { url: fmtUrl, headers: cdnHeaders, expires: Date.now() + CACHE_TTL });
-        upstream = await fetchWithConnTimeout(fmtUrl, { headers: { ...cdnHeaders, ...(req.headers.range ? { Range: req.headers.range } : {}) } });
+        await urlLookup.setAsync(`${videoId}:${itag}`, { url: fmtUrl, headers: cdnHeaders, expires: Date.now() + CACHE_TTL });
+        upstream = await fetchWithConnTimeout(fmtUrl, {
+          headers: { ...cdnHeaders, ...(req.headers.range ? { Range: req.headers.range } : {}) },
+          signal: requestSignal,
+        });
       }
 
       res.status(upstream.status);

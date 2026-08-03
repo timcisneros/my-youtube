@@ -58,24 +58,11 @@ variable "db_instance_type" {
   # g6-standard-2: 2 vCPU, 4GB RAM — $24/month
 }
 
-variable "storage_instance_type" {
-  description = "Linode plan for MinIO storage"
-  type        = string
-  default     = "g6-standard-2"
-  # g6-standard-2: 2 vCPU, 4GB RAM — $24/month
-}
-
 # Volume sizes (GB)
 variable "db_volume_size" {
   description = "Size of the database volume in GB"
   type        = number
   default     = 50
-}
-
-variable "storage_volume_size" {
-  description = "Size of the MinIO volume in GB"
-  type        = number
-  default     = 200
 }
 
 # Credentials
@@ -87,19 +74,6 @@ variable "postgres_password" {
 
 variable "redis_password" {
   description = "Redis requirepass password"
-  type        = string
-  sensitive   = true
-}
-
-variable "s3_access_key" {
-  description = "MinIO root access key"
-  type        = string
-  sensitive   = true
-  default     = "myyoutube-admin"
-}
-
-variable "s3_secret_key" {
-  description = "MinIO root secret key"
   type        = string
   sensitive   = true
 }

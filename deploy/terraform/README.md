@@ -1,7 +1,7 @@
 # my-youtube Terraform Configurations
 
 Infrastructure-as-code for deploying my-youtube across four cloud providers.
-Each configuration creates the same architecture: 4 servers with private networking,
+Each configuration creates the same architecture: 3 servers with private networking,
 firewalls, and persistent storage.
 
 ## Architecture (all providers)
@@ -11,16 +11,20 @@ firewalls, and persistent storage.
 | web      | Nginx + Node.js app server  | 10.0.1.10   |
 | worker   | yt-dlp extraction worker    | 10.0.1.20   |
 | database | PostgreSQL 16 + Redis       | 10.0.1.30   |
-| storage  | MinIO (S3-compatible)       | 10.0.1.40   |
 
 **Networking:** All servers communicate over a private network (VPC/VLAN).
-PostgreSQL, Redis, and MinIO are only accessible from the private network.
+PostgreSQL and Redis are only accessible from the private network.
 Only the web server exposes HTTP/HTTPS publicly.
 
 **Firewall rules:**
 - Web: SSH (restricted), HTTP, HTTPS
 - Worker: SSH (restricted), no inbound
-- Database/Storage: SSH (restricted), PG/Redis/MinIO from private network only
+- Database: SSH (restricted), PostgreSQL/Redis from private network only
+
+Downloaded media uses the application's bounded local download library. In a
+multi-host deployment, mount the same durable filesystem on every process that
+serves or writes downloads; otherwise keep the download worker and serving web
+process co-located.
 
 ## Monthly Cost Comparison
 
@@ -29,12 +33,10 @@ Only the web server exposes HTTP/HTTPS publicly.
 | Web (2c/4GB)     | EUR 5 (~$5)    | $24            | $24            | ~$30 (t3.medium) |
 | Worker (4c/8GB)  | EUR 10 (~$11)  | $36            | $48            | ~$60 (t3.large)  |
 | Database (2c/4GB)| EUR 5 (~$5)    | $24            | $24            | ~$30 (t3.medium) |
-| Storage (2c/4GB) | EUR 5 (~$5)    | $24            | $24            | ~$30 (t3.medium) |
 | DB Volume (50GB) | EUR 2          | $5             | $5             | ~$4 (gp3)        |
-| MinIO Vol (200GB)| EUR 10         | $20            | $20            | ~$16 (gp3)       |
 | Static/Elastic IP| Free           | Free           | Free (attached)| ~$4              |
 | NAT Gateway      | N/A            | N/A            | N/A            | ~$32             |
-| **Total**        | **~$30/mo**    | **~$133/mo**   | **~$145/mo**   | **~$185/mo**     |
+| **Total**        | **~$15/mo**    | **~$89/mo**    | **~$101/mo**   | **~$140/mo**     |
 
 > Prices are approximate and may vary by region. AWS is the most expensive due
 > to NAT Gateway costs and higher instance pricing. Hetzner is the cheapest by
@@ -78,12 +80,12 @@ terraform output -raw env_config > /tmp/myyoutube.env
 
 Each provider configuration creates:
 
-1. **4 servers** (web, worker, database, storage) with Ubuntu 24.04
+1. **3 servers** (web, worker, database) with Ubuntu 24.04
 2. **Private network** (VPC or VLAN) for inter-server communication
 3. **Firewalls** restricting access to internal services
-4. **Persistent volumes** for database and MinIO data
+4. **Persistent volume** for database data
 5. **Static IP** for the web server
-6. **cloud-init provisioning** that installs Node.js 22, yt-dlp, ffmpeg, PostgreSQL, Redis, and MinIO
+6. **cloud-init provisioning** that installs Node.js 22, yt-dlp, ffmpeg, PostgreSQL, and Redis
 
 ## Post-Provisioning Steps
 
@@ -101,8 +103,9 @@ sudo -u myyoutube git clone <repo_url> /opt/myyoutube/app
 
 # 4. Install dependencies and build
 cd /opt/myyoutube/app
-sudo -u myyoutube npm ci
+sudo -u myyoutube env YOUTUBE_DL_SKIP_DOWNLOAD=1 npm ci
 sudo -u myyoutube npm run build
+sudo -u myyoutube npm prune --omit=dev
 
 # 5. Set up systemd service (or use the Ansible playbook)
 # See deploy/ansible/ for automated deployment
@@ -136,10 +139,10 @@ worker_instance_type = "t3.xlarge"  # AWS example: 4 vCPU, 16GB
 ```
 Then run `terraform apply`. Note: this will restart the instance.
 
-### Increase storage
-Update the volume size variable and run `terraform apply`:
+### Increase database storage
+Update the database volume size variable and run `terraform apply`:
 ```hcl
-storage_volume_size = 500  # GB
+db_volume_size = 100  # GB
 ```
 Then resize the filesystem on the server:
 ```bash
@@ -163,8 +166,8 @@ terraform destroy
 
 **Before destroying:**
 1. Back up your PostgreSQL database: `pg_dump myyoutube > backup.sql`
-2. Back up MinIO data: `mc mirror myyoutube/myyoutube ./backup/`
-3. Download any data from volumes before detaching
+2. Back up the local download library if it is mounted on durable storage
+3. Download any other data from volumes before detaching
 
 **Volumes with data:** Terraform will destroy EBS/Block Storage volumes.
 If you need to preserve data, detach volumes manually first or use

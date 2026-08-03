@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # --- Infrastructure ---
 
@@ -21,7 +19,8 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # BullMQ jobs, sessions, and distributed locks must never be evicted.
+    command: redis-server --maxmemory 512mb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     healthcheck:
@@ -30,37 +29,55 @@ services:
       timeout: 3s
       retries: 5
 
-  minio:
-    image: minio/minio:latest
+  redis-cache:
+    image: redis:7-alpine
     restart: unless-stopped
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-minioadmin}
-    volumes:
-      - minio_data:/data
-    ports:
-      - "9001:9001"  # MinIO console (optional, remove in production)
+    # Volatile metadata and media-segment caches may evict old values safely.
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
       retries: 5
 
-  # Create the S3 bucket on first start
-  minio-init:
-    image: minio/mc:latest
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-minioadmin} $${MINIO_ROOT_PASSWORD:-minioadmin};
-      mc mb --ignore-existing local/myyoutube;
-      exit 0;
-      "
-
   # --- Application ---
+
+  edge:
+    build:
+      context: .
+      target: edge
+    restart: unless-stopped
+    depends_on:
+      web:
+        condition: service_healthy
+    ports:
+      - "${PORT:-3000}:80"
+    volumes:
+      - thumbnail_cache:/var/cache/nginx/thumbnails
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/favicon.svg"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  migrate:
+    build: .
+    restart: "no"
+    command: ["node", "dist/migrate.js"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://myyoutube:${POSTGRES_PASSWORD:-changeme}@postgres:5432/myyoutube
+      RSS_LEGACY_MIGRATION_BATCH_SIZE: ${RSS_LEGACY_MIGRATION_BATCH_SIZE:-200}
+      EXPLORE_COWATCH_MAX_AGE_DAYS: ${EXPLORE_COWATCH_MAX_AGE_DAYS:-90}
+      EXPLORE_COWATCH_PER_USER_LIMIT: ${EXPLORE_COWATCH_PER_USER_LIMIT:-50}
+      EXPLORE_COWATCH_REFRESH_INTERVAL_MINUTES: ${EXPLORE_COWATCH_REFRESH_INTERVAL_MINUTES:-60}
+      DOWNLOAD_MANIFEST_CONCURRENCY: ${DOWNLOAD_MANIFEST_CONCURRENCY:-8}
+      DOWNLOAD_MANIFEST_BATCH_SIZE: ${DOWNLOAD_MANIFEST_BATCH_SIZE:-256}
+    volumes:
+      - app_data:/app/data
 
   web:
     build: .
@@ -70,21 +87,86 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    ports:
-      - "${PORT:-3000}:3000"
+      redis-cache:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    expose:
+      - "3000"
     environment:
       NODE_ENV: production
       PORT: 3000
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-4}
       DATABASE_URL: postgres://myyoutube:${POSTGRES_PASSWORD:-changeme}@postgres:5432/myyoutube
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-5}
+      DATABASE_CONNECT_TIMEOUT_MS: ${DATABASE_CONNECT_TIMEOUT_MS:-3000}
+      DATABASE_IDLE_TIMEOUT_MS: ${DATABASE_IDLE_TIMEOUT_MS:-30000}
+      DATABASE_QUERY_TIMEOUT_MS: ${DATABASE_QUERY_TIMEOUT_MS:-15000}
+      EXPLORE_COWATCH_MAX_AGE_DAYS: ${EXPLORE_COWATCH_MAX_AGE_DAYS:-90}
+      EXPLORE_COWATCH_MAX_USERS: ${EXPLORE_COWATCH_MAX_USERS:-500}
+      EXPLORE_COWATCH_PER_USER_LIMIT: ${EXPLORE_COWATCH_PER_USER_LIMIT:-50}
+      EXPLORE_COWATCH_REFRESH_INTERVAL_MINUTES: ${EXPLORE_COWATCH_REFRESH_INTERVAL_MINUTES:-60}
+      EXPLORE_RICH_SCORE_CANDIDATE_LIMIT: ${EXPLORE_RICH_SCORE_CANDIDATE_LIMIT:-2000}
+      EXPLORE_RICH_TEXT_CANDIDATE_LIMIT: ${EXPLORE_RICH_TEXT_CANDIDATE_LIMIT:-800}
+      EXPLORE_PERSONAL_HISTORY_LIMIT: ${EXPLORE_PERSONAL_HISTORY_LIMIT:-500}
+      DATABASE_MAINTENANCE_INTERVAL_MS: ${DATABASE_MAINTENANCE_INTERVAL_MS:-3600000}
+      DATABASE_MAINTENANCE_BATCH_SIZE: ${DATABASE_MAINTENANCE_BATCH_SIZE:-1000}
+      DATABASE_MAINTENANCE_MAX_BATCHES: ${DATABASE_MAINTENANCE_MAX_BATCHES:-10}
+      SKIP_DATABASE_MIGRATIONS: "1"
       REDIS_URL: redis://redis:6379
-      STORAGE_URL: s3://myyoutube
-      S3_ENDPOINT: http://minio:9000
-      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-minioadmin}
-      S3_SECRET_KEY: ${S3_SECRET_KEY:-minioadmin}
-      S3_REGION: us-east-1
+      QUEUE_REDIS_URL: redis://redis:6379
+      CACHE_REDIS_URL: redis://redis-cache:6379
+      RSS_REFRESH_QUEUE_ENABLED: "1"
+      RSS_QUEUE_BATCH_WAIT_TIMEOUT_MS: ${RSS_QUEUE_BATCH_WAIT_TIMEOUT_MS:-180000}
+      PLAYLIST_REFRESH_CONCURRENCY: ${PLAYLIST_REFRESH_CONCURRENCY:-2}
+      PLAYLIST_REFRESH_GLOBAL_CONCURRENCY: ${PLAYLIST_REFRESH_GLOBAL_CONCURRENCY:-4}
+      PLAYLIST_REFRESH_MAX_QUEUE: ${PLAYLIST_REFRESH_MAX_QUEUE:-500}
       SESSION_SECRET: ${SESSION_SECRET:-change-this-in-production}
       STREAM_SECRET: ${STREAM_SECRET:-}
       MAX_CONCURRENT_YTDLP: ${MAX_CONCURRENT_YTDLP:-4}
+      YTDLP_MAX_QUEUE: ${YTDLP_MAX_QUEUE:-128}
+      YTDLP_QUEUE_TIMEOUT_MS: ${YTDLP_QUEUE_TIMEOUT_MS:-75000}
+      WATCH_TIME_MAX_PENDING: ${WATCH_TIME_MAX_PENDING:-10000}
+      WATCH_TIME_WRITE_CONCURRENCY: ${WATCH_TIME_WRITE_CONCURRENCY:-4}
+      STATUS_MAX_CONNECTIONS: ${STATUS_MAX_CONNECTIONS:-1000}
+      STATUS_MAX_CONNECTIONS_PER_IP: ${STATUS_MAX_CONNECTIONS_PER_IP:-8}
+      STATUS_CONNECTION_MAX_AGE_MS: ${STATUS_CONNECTION_MAX_AGE_MS:-45000}
+      DURATION_STATUS_MAX_AGE_MS: ${DURATION_STATUS_MAX_AGE_MS:-30000}
+      STATUS_WS_MAX_BUFFERED_BYTES: ${STATUS_WS_MAX_BUFFERED_BYTES:-262144}
+      TRUST_PROXY_HOPS: ${TRUST_PROXY_HOPS:-1}
+      SINGLEFLIGHT_MAX_KEYS: ${SINGLEFLIGHT_MAX_KEYS:-500}
+      MAX_METADATA_INFLIGHT: ${MAX_METADATA_INFLIGHT:-256}
+      EXTRACTION_QUEUE_MAX_JOBS: ${EXTRACTION_QUEUE_MAX_JOBS:-200}
+      EXTRACTION_QUEUE_PLAYBACK_RESERVE: ${EXTRACTION_QUEUE_PLAYBACK_RESERVE:-50}
+      EXTRACTION_QUEUE_ADMISSION_LEASE_MS: ${EXTRACTION_QUEUE_ADMISSION_LEASE_MS:-900000}
+      DOWNLOAD_QUEUE_MAX_JOBS: ${DOWNLOAD_QUEUE_MAX_JOBS:-100}
+      DOWNLOAD_QUEUE_MAX_JOBS_PER_OWNER: ${DOWNLOAD_QUEUE_MAX_JOBS_PER_OWNER:-5}
+      DOWNLOAD_QUEUE_ADMISSION_LEASE_MS: ${DOWNLOAD_QUEUE_ADMISSION_LEASE_MS:-7200000}
+      DOWNLOAD_MAX_FORMAT_BYTES: ${DOWNLOAD_MAX_FORMAT_BYTES:-12884901888}
+      DOWNLOAD_MAX_VIDEO_BYTES: ${DOWNLOAD_MAX_VIDEO_BYTES:-21474836480}
+      DOWNLOAD_STORAGE_MAX_BYTES: ${DOWNLOAD_STORAGE_MAX_BYTES:-214748364800}
+      DOWNLOAD_MIN_FREE_BYTES: ${DOWNLOAD_MIN_FREE_BYTES:-2147483648}
+      DOWNLOAD_MIN_FREE_RATIO: ${DOWNLOAD_MIN_FREE_RATIO:-0.05}
+      DOWNLOAD_UNKNOWN_FORMAT_RESERVATION_BYTES: ${DOWNLOAD_UNKNOWN_FORMAT_RESERVATION_BYTES:-2147483648}
+      DOWNLOAD_PART_MAX_AGE_MS: ${DOWNLOAD_PART_MAX_AGE_MS:-21600000}
+      DOWNLOAD_MAINTENANCE_BATCH_SIZE: ${DOWNLOAD_MAINTENANCE_BATCH_SIZE:-64}
+      DOWNLOAD_MAINTENANCE_TIME_BUDGET_MS: ${DOWNLOAD_MAINTENANCE_TIME_BUDGET_MS:-5000}
+      DOWNLOAD_MAINTENANCE_INTERVAL_MS: ${DOWNLOAD_MAINTENANCE_INTERVAL_MS:-3600000}
+      DOWNLOAD_STORAGE_RECONCILE_INTERVAL_MS: ${DOWNLOAD_STORAGE_RECONCILE_INTERVAL_MS:-3600000}
+      DOWNLOAD_STORAGE_RECONCILE_BATCH_SIZE: ${DOWNLOAD_STORAGE_RECONCILE_BATCH_SIZE:-256}
+      DOWNLOAD_MANIFEST_CACHE_TTL_MS: ${DOWNLOAD_MANIFEST_CACHE_TTL_MS:-30000}
+      DOWNLOAD_MANIFEST_NEGATIVE_TTL_MS: ${DOWNLOAD_MANIFEST_NEGATIVE_TTL_MS:-5000}
+      QUEUE_METRICS_INTERVAL_MS: ${QUEUE_METRICS_INTERVAL_MS:-30000}
+      PAGINATION_MAX_PAGE: ${PAGINATION_MAX_PAGE:-2500}
+      OUTBOUND_MEDIA_GLOBAL_CONCURRENCY: ${OUTBOUND_MEDIA_GLOBAL_CONCURRENCY:-128}
+      OUTBOUND_MEDIA_MAX_QUEUE: ${OUTBOUND_MEDIA_MAX_QUEUE:-512}
+      OUTBOUND_MEDIA_QUEUE_TIMEOUT_MS: ${OUTBOUND_MEDIA_QUEUE_TIMEOUT_MS:-10000}
+      UNDICI_CONNECTIONS: ${UNDICI_CONNECTIONS:-16}
+      MAX_SEGMENT_FLIGHTS: ${MAX_SEGMENT_FLIGHTS:-128}
+      SEGMENT_FLIGHT_TIMEOUT_MS: ${SEGMENT_FLIGHT_TIMEOUT_MS:-45000}
+      MAX_VTT_BYTES: ${MAX_VTT_BYTES:-5242880}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
+      METRICS_SNAPSHOT_TTL_MS: ${METRICS_SNAPSHOT_TTL_MS:-1000}
     volumes:
       - app_data:/app/data
       - ./cookies.txt:/app/cookies.txt:ro
@@ -97,21 +179,68 @@ services:
   extraction-worker:
     build: .
     restart: unless-stopped
-    command: ["node", "extraction-worker.js"]
+    command: ["node", "dist/extraction-worker.js"]
     depends_on:
       redis:
         condition: service_healthy
+      redis-cache:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://myyoutube:${POSTGRES_PASSWORD:-changeme}@postgres:5432/myyoutube
+      SKIP_DATABASE_MIGRATIONS: "1"
       REDIS_URL: redis://redis:6379
+      QUEUE_REDIS_URL: redis://redis:6379
+      CACHE_REDIS_URL: redis://redis-cache:6379
       MAX_EXTRACTION_WORKERS: ${MAX_EXTRACTION_WORKERS:-2}
+      EXTRACTION_QUEUE_JOB_MAX_AGE_MS: ${EXTRACTION_QUEUE_JOB_MAX_AGE_MS:-180000}
+      RSS_REFRESH_QUEUE_ENABLED: "1"
+      RSS_REFRESH_CONCURRENCY: ${RSS_REFRESH_CONCURRENCY:-6}
     volumes:
       - ./cookies.txt:/app/cookies.txt:ro
     # Scale workers: docker compose up --scale extraction-worker=3
     deploy:
       replicas: ${EXTRACTION_REPLICAS:-1}
 
+  download-worker:
+    build: .
+    restart: unless-stopped
+    command: ["node", "dist/download-worker.js"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgres://myyoutube:${POSTGRES_PASSWORD:-changeme}@postgres:5432/myyoutube
+      SKIP_DATABASE_MIGRATIONS: "1"
+      REDIS_URL: redis://redis:6379
+      QUEUE_REDIS_URL: redis://redis:6379
+      DOWNLOAD_JOB_CONCURRENCY: ${DOWNLOAD_JOB_CONCURRENCY:-2}
+      DOWNLOAD_QUEUE_JOB_MAX_AGE_MS: ${DOWNLOAD_QUEUE_JOB_MAX_AGE_MS:-600000}
+      DOWNLOAD_FORMAT_GLOBAL_CONCURRENCY: ${DOWNLOAD_FORMAT_GLOBAL_CONCURRENCY:-4}
+      DOWNLOAD_FORMAT_SLOT_LEASE_MS: ${DOWNLOAD_FORMAT_SLOT_LEASE_MS:-120000}
+      DOWNLOAD_FORMAT_SLOT_WAIT_MS: ${DOWNLOAD_FORMAT_SLOT_WAIT_MS:-600000}
+      DOWNLOAD_MAX_FORMAT_BYTES: ${DOWNLOAD_MAX_FORMAT_BYTES:-12884901888}
+      DOWNLOAD_MAX_VIDEO_BYTES: ${DOWNLOAD_MAX_VIDEO_BYTES:-21474836480}
+      DOWNLOAD_STORAGE_MAX_BYTES: ${DOWNLOAD_STORAGE_MAX_BYTES:-214748364800}
+      DOWNLOAD_MIN_FREE_BYTES: ${DOWNLOAD_MIN_FREE_BYTES:-2147483648}
+      DOWNLOAD_MIN_FREE_RATIO: ${DOWNLOAD_MIN_FREE_RATIO:-0.05}
+      DOWNLOAD_UNKNOWN_FORMAT_RESERVATION_BYTES: ${DOWNLOAD_UNKNOWN_FORMAT_RESERVATION_BYTES:-2147483648}
+      DOWNLOAD_STORAGE_RESERVATION_LEASE_MS: ${DOWNLOAD_STORAGE_RESERVATION_LEASE_MS:-7200000}
+      DOWNLOAD_PART_MAX_AGE_MS: ${DOWNLOAD_PART_MAX_AGE_MS:-21600000}
+    volumes:
+      - app_data:/app/data
+
 volumes:
   pg_data:
   redis_data:
-  minio_data:
   app_data:
+  thumbnail_cache:

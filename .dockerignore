@@ -1,8 +1,16 @@
 node_modules
 data
+tmp
+playwright-report
+test-results
+tests
+docs
+playwright*.config.mjs
 *.dump
 *.mp4
 *.webm
 .env
 .git
 .claude
+.agents
+.codex

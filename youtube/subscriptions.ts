@@ -2,41 +2,58 @@
  * Subscription management — fetching and caching user subscriptions.
  */
 import db from '../db.js';
-import { cache, SUB_TTL } from './shared.js';
+import {
+  buildCursorNavigation,
+  decodeSubscriptionCursor,
+  encodeSubscriptionCursor,
+} from '../lib/cursor-pagination.js';
+import { cache } from './shared.js';
+import { invalidateTodayCache } from './today.js';
 
-// Get all subscriptions — memory cache -> SQLite -> empty
-async function getAllSubscriptions(userId) {
-  const cached = cache.subscriptions.get(userId);
-  if (cached && Date.now() < cached.expires) return cached.data;
-  if (cached) return cached.data; // serve stale
+const SUBSCRIPTIONS_PAGE_SIZE = 20;
 
-  const rows = db.getSubscriptions(userId);
-  if (rows.length > 0) {
-    cache.subscriptions.set(userId, { data: rows, expires: Date.now() + SUB_TTL });
-  }
-  return rows;
+async function getSubscriptionCursorPage(userId: string, query: string, rawCursor: unknown) {
+  const cursor = decodeSubscriptionCursor(rawCursor);
+  const direction = cursor?.direction || 'next';
+  const page = await db.getSubscriptionsCursorPage(
+    userId,
+    query,
+    SUBSCRIPTIONS_PAGE_SIZE,
+    cursor,
+    direction,
+  );
+  const navigation = buildCursorNavigation(
+    page.items,
+    page.hasMore,
+    cursor !== null,
+    direction,
+    (item, nextDirection) => encodeSubscriptionCursor(item.title, item.channelId, nextDirection),
+  );
+  return { items: page.items, ...navigation };
 }
 
-// Numeric pagination (20/page) from getAllSubscriptions
-async function getSubscriptionsPage(userId, page) {
-  const all = await getAllSubscriptions(userId);
-  const perPage = 20;
-  const p = Math.max(1, parseInt(page) || 1);
-  const start = (p - 1) * perPage;
-  const items = all.slice(start, start + perPage);
-  const totalPages = Math.ceil(all.length / perPage);
+async function getSubscriptionsPage(userId: string, cursor: unknown) {
+  return getSubscriptionCursorPage(userId, '', cursor);
+}
+
+async function getSubscriptionSearchPage(userId: string, query: string, cursor: unknown) {
+  const normalizedQuery = String(query || '').trim().slice(0, 200);
   return {
-    items,
-    nextPage: p < totalPages ? p + 1 : null,
-    prevPage: p > 1 ? p - 1 : null,
-    totalResults: all.length
+    ...await getSubscriptionCursorPage(userId, normalizedQuery, cursor),
+    searchQuery: normalizedQuery,
   };
 }
 
-function invalidateSubCaches(userId) {
-  cache.subscriptions.delete(userId);
-  cache.todayVideos.delete(userId);
-  cache.exploreVideos.delete(userId);
+async function invalidateSubCaches(userId: string) {
+  await Promise.all([
+    cache.subscriptions.deleteAsync(userId),
+    invalidateTodayCache(userId),
+    cache.exploreVideos.deleteAsync(userId),
+  ]);
 }
 
-export { getAllSubscriptions, getSubscriptionsPage, invalidateSubCaches };
+export {
+  getSubscriptionsPage,
+  getSubscriptionSearchPage,
+  invalidateSubCaches,
+};

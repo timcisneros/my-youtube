@@ -1,0 +1,26 @@
+<%- include('player/video-container') %>
+
+<script>
+<% if (typeof inlineMPD !== 'undefined' && inlineMPD) { %>
+window.__inlineMPD = <%- JSON.stringify(inlineMPD).replace(/</g, '\\u003c') %>;
+<% } %>
+window.__playerBootstrap = <%- JSON.stringify({
+  videoId: video.videoId,
+  streamToken,
+  playerDrmServers: typeof playerDrmServers !== 'undefined' ? playerDrmServers : {},
+  downloadedHeight: typeof downloadedHeight !== 'undefined' ? downloadedHeight : 0,
+  liveStatus: video.liveStatus || '',
+  playlistPrevUrl: typeof playlist !== 'undefined' && playlist ? playlist.prevUrl : '',
+  playlistNextUrl: typeof playlist !== 'undefined' && playlist ? playlist.nextUrl : '',
+  requestedPlaylistId: typeof requestedPlaylistId !== 'undefined' ? requestedPlaylistId : '',
+  requestedPlaylistIndex: typeof requestedPlaylistIndex !== 'undefined' ? requestedPlaylistIndex : 0,
+  title: video.title || video.videoId,
+  channelTitle: video.channelTitle || '',
+  inlineVia: typeof inlineVia !== 'undefined' ? inlineVia : '',
+  duration: video.duration || 0,
+  startTime: startTime || 0,
+  savedPosition: typeof savedPosition !== 'undefined' ? savedPosition : 0,
+  nativePlayerUrl: runtimeAssetUrl('native-player-engine.min.js'),
+}).replace(/</g, '\\u003c') %>;
+</script>
+</main>

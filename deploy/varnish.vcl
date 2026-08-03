@@ -45,6 +45,14 @@ sub vcl_recv {
         return (pass);
     }
 
+    # Public avatar proxies are safe to share. Handle these before the broad
+    # API/channel pass rules below and collapse them into the normal cache key.
+    if (req.url ~ "^/channel/[^/]+/avatar$" ||
+        req.url ~ "^/api/comments/avatar/") {
+        unset req.http.Cookie;
+        return (hash);
+    }
+
     # --- Pass-through rules (never cache) ---
 
     # API and auth requests — always pass through
@@ -84,7 +92,9 @@ sub vcl_recv {
     # Strip cookies for cacheable requests (posters, thumbnails, static assets)
     # This allows Varnish to cache regardless of session cookies
     if (req.url ~ "^/api/stream/[^/]+/(poster|thumb)" ||
-        req.url ~ "^/api/stream/[^/]+/storyboard/" ||
+        req.url ~ "^/api/stream/[^/]+/storyboard/[0-9]+$" ||
+        req.url ~ "^/(app|native-player-engine(?:\\.min)?|player-(?:page|telemetry)(?:\\.min)?|idb-helpers)\\.js(?:\\?|$)" ||
+        req.url ~ "^/(style\\.css|manifest\\.json|favicon\\.svg)(?:\\?|$)" ||
         req.url ~ "^/public/" ||
         req.url ~ "^/vendor/" ||
         req.url ~ "^/fonts/") {
@@ -107,6 +117,13 @@ sub vcl_hash {
 # --- Backend response handling ---
 
 sub vcl_backend_response {
+    if ((bereq.url ~ "^/channel/[^/]+/avatar$" || bereq.url ~ "^/api/comments/avatar/") &&
+        (beresp.status == 400 || beresp.status == 404)) {
+        set beresp.ttl = 30s;
+        unset beresp.http.Set-Cookie;
+        return (deliver);
+    }
+
     # Don't cache error responses
     if (beresp.status >= 400) {
         set beresp.ttl = 0s;
@@ -123,8 +140,16 @@ sub vcl_backend_response {
         return (deliver);
     }
 
+    if (bereq.url ~ "^/channel/[^/]+/avatar$" || bereq.url ~ "^/api/comments/avatar/") {
+        set beresp.ttl = 24h;
+        set beresp.grace = 6h;
+        unset beresp.http.Set-Cookie;
+        set beresp.http.X-Varnish-Cache = "avatar";
+        return (deliver);
+    }
+
     # --- Storyboard sheets: cache 24 hours ---
-    if (bereq.url ~ "^/api/stream/[^/]+/storyboard/") {
+    if (bereq.url ~ "^/api/stream/[^/]+/storyboard/[0-9]+$") {
         set beresp.ttl = 24h;
         set beresp.grace = 6h;
         unset beresp.http.Set-Cookie;
@@ -133,8 +158,16 @@ sub vcl_backend_response {
     }
 
     # --- Static assets: cache 7 days ---
-    if (bereq.url ~ "^/public/" || bereq.url ~ "^/vendor/" || bereq.url ~ "^/fonts/") {
-        set beresp.ttl = 7d;
+    if (bereq.url ~ "^/(app|native-player-engine(?:\\.min)?|player-(?:page|telemetry)(?:\\.min)?|idb-helpers)\\.js(?:\\?|$)" ||
+        bereq.url ~ "^/(style\\.css|manifest\\.json|favicon\\.svg)(?:\\?|$)" ||
+        bereq.url ~ "^/public/" || bereq.url ~ "^/vendor/" || bereq.url ~ "^/fonts/") {
+        if (bereq.url ~ "[?&]v=[0-9a-f]{16}(?:&|$)") {
+            set beresp.ttl = 365d;
+            set beresp.http.Cache-Control = "public, max-age=31536000, immutable";
+        } else {
+            set beresp.ttl = 1h;
+            set beresp.http.Cache-Control = "no-cache";
+        }
         set beresp.grace = 1d;
         unset beresp.http.Set-Cookie;
         set beresp.http.X-Varnish-Cache = "static";

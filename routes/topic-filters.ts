@@ -5,13 +5,13 @@ import { cache } from '../youtube/shared.js';
 
 const router = Router();
 
-router.post('/', ensureAuth, (req, res) => {
+router.post('/', ensureAuth, async (req, res) => {
   const { topic, filter } = req.body;
   if (!topic || typeof topic !== 'string') return res.status(400).json({ error: 'topic required' });
   if (filter !== 'boost' && filter !== 'suppress') return res.status(400).json({ error: 'filter must be boost or suppress' });
   const normalized = topic.toLowerCase().trim();
   if (normalized.length < 2) return res.status(400).json({ error: 'topic must be at least 2 characters' });
-  db.setTopicFilter(req.session.userId, normalized, filter);
+  await db.setTopicFilter(req.session.userId, normalized, filter);
   cache.exploreVideos.delete(req.session.userId);
   res.json({ ok: true });
 });
@@ -21,10 +21,10 @@ router.get('/', ensureAuth, async (req, res) => {
   res.json(filters);
 });
 
-router.delete('/', ensureAuth, (req, res) => {
+router.delete('/', ensureAuth, async (req, res) => {
   const { topic } = req.body;
   if (!topic || typeof topic !== 'string') return res.status(400).json({ error: 'topic required' });
-  db.removeTopicFilter(req.session.userId, topic.toLowerCase().trim());
+  await db.removeTopicFilter(req.session.userId, topic.toLowerCase().trim());
   cache.exploreVideos.delete(req.session.userId);
   res.json({ ok: true });
 });

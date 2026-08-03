@@ -239,15 +239,75 @@
       var autoplayAttemptedMuted = false;
       var autoplayPolicyMuted = false;
       var autoplaySettled = false;
+      var handledPlayerFailureGeneration = -1;
+      var playerLoadTransactionGeneration = 0;
+      var activePlayerLoadTransaction = null;
       var playlistPrevUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.prevUrl : '') %>;
       var playlistNextUrl = <%- JSON.stringify(typeof playlist !== 'undefined' && playlist ? playlist.nextUrl : '') %>;
       var requestedPlaylistId = <%- JSON.stringify(typeof requestedPlaylistId !== 'undefined' ? requestedPlaylistId : '') %>;
       var requestedPlaylistIndex = <%= typeof requestedPlaylistIndex !== 'undefined' ? requestedPlaylistIndex : 0 %>;
+      var startupResumeTime = Number(<%= startTime || 0 %> || <%= typeof savedPosition !== 'undefined' ? savedPosition : 0 %>) || 0;
+      if (isServerLive || startupResumeTime <= 5) startupResumeTime = 0;
+
+      function playerLoadAbortError() {
+        var err = new Error('player-load-aborted');
+        err.name = 'AbortError';
+        return err;
+      }
+
+      function isCurrentPlayerLoadTransaction(transaction) {
+        return !!(
+          transaction
+          && activePlayerLoadTransaction === transaction
+          && !transaction.signal.aborted
+          && !engine.destroyed
+          && video.isConnected
+          && container.contains(video)
+        );
+      }
+
+      function requireCurrentPlayerLoadTransaction(transaction) {
+        if (!isCurrentPlayerLoadTransaction(transaction)) throw playerLoadAbortError();
+        return transaction;
+      }
+
+      function beginPlayerLoadTransaction() {
+        if (activePlayerLoadTransaction && !activePlayerLoadTransaction.signal.aborted) {
+          activePlayerLoadTransaction.controller.abort();
+        }
+        var controller = new AbortController();
+        activePlayerLoadTransaction = {
+          generation: ++playerLoadTransactionGeneration,
+          controller: controller,
+          signal: controller.signal
+        };
+        return activePlayerLoadTransaction;
+      }
+
+      function isPlayerLoadAbort(err, transaction) {
+        return !!(err && err.name === 'AbortError') || !isCurrentPlayerLoadTransaction(transaction);
+      }
+
+      addPlayerCleanup(function () {
+        if (activePlayerLoadTransaction && !activePlayerLoadTransaction.signal.aborted) {
+          activePlayerLoadTransaction.controller.abort();
+        }
+        activePlayerLoadTransaction = null;
+      });
+
+      function setMediaSessionAction(action, handler) {
+        if (!('mediaSession' in navigator) || !navigator.mediaSession.setActionHandler) return false;
+        try {
+          navigator.mediaSession.setActionHandler(action, handler);
+          return true;
+        } catch (e) {
+          return false;
+        }
+      }
 
       function updatePlaylistMediaActions() {
-        if (!('mediaSession' in navigator)) return;
-        try { navigator.mediaSession.setActionHandler('previoustrack', playlistPrevUrl ? function () { window.location.href = playlistPrevUrl; } : null); } catch (e) {}
-        try { navigator.mediaSession.setActionHandler('nexttrack', playlistNextUrl ? function () { window.location.href = playlistNextUrl; } : null); } catch (e) {}
+        setMediaSessionAction('previoustrack', playlistPrevUrl ? function () { window.location.href = playlistPrevUrl; } : null);
+        setMediaSessionAction('nexttrack', playlistNextUrl ? function () { window.location.href = playlistNextUrl; } : null);
       }
 
       function renderPlaylistContext(data) {
@@ -485,25 +545,31 @@
       }
 
       var dlPollCount = 0;
-      function pollDlStatus() {
-        if (dlPollTimer) return;
-        dlPollCount = 0;
-        dlPollTimer = setInterval(function () {
+      function scheduleDlPoll(delay) {
+        if (dlPollTimer) clearTimeout(dlPollTimer);
+        dlPollTimer = setTimeout(function () {
+          dlPollTimer = null;
           dlPollCount++;
-          if (dlPollCount > 300) { clearInterval(dlPollTimer); dlPollTimer = null; return; }
+          if (dlPollCount > 300) return;
+          if (document.visibilityState === 'hidden') {
+            scheduleDlPoll(10000);
+            return;
+          }
           fetch('/api/stream/' + dlVideoId + '/cache/status?token=' + streamToken)
             .then(function (r) { return r.json(); })
             .then(function (d) {
               updateDlButton(d.status, d.percent);
-              if (d.status === 'complete') {
-                clearInterval(dlPollTimer); dlPollTimer = null;
-                if (typeof prepareForOffline === 'function') prepareForOffline(dlVideoId);
-              } else if (d.status === 'error') {
-                clearInterval(dlPollTimer); dlPollTimer = null;
+              if (d.status !== 'complete' && d.status !== 'error') {
+                scheduleDlPoll(Math.min(10000, 2000 + dlPollCount * 250));
               }
             })
-            .catch(function () {});
-        }, 2000);
+            .catch(function () { scheduleDlPoll(Math.min(10000, 2000 + dlPollCount * 250)); });
+        }, delay);
+      }
+      function pollDlStatus() {
+        if (dlPollTimer) return;
+        dlPollCount = 0;
+        scheduleDlPoll(2000);
       }
 
       fetch('/api/stream/' + dlVideoId + '/cache/status?token=' + streamToken)
@@ -538,26 +604,35 @@
 
       // --- Media Session API (OS-level controls: lock screen, notification center, PiP) ---
       if ('mediaSession' in navigator) {
-        navigator.mediaSession.metadata = new MediaMetadata({
-          title: '<%= video.title.replace(/'/g, "\\'").replace(/\n/g, " ") %>',
-          artist: '<%= (video.channelTitle || "").replace(/'/g, "\\'") %>',
-          artwork: [
-            { src: '/api/stream/<%= video.videoId %>/poster', sizes: '1280x720', type: 'image/jpeg' },
-            { src: '/api/stream/<%= video.videoId %>/thumb', sizes: '320x180', type: 'image/jpeg' }
-          ]
-        });
-        navigator.mediaSession.setActionHandler('play', function () { video.play(); });
-        navigator.mediaSession.setActionHandler('pause', function () { video.pause(); });
-        navigator.mediaSession.setActionHandler('seekbackward', function () { playerSeekTo(Math.max(0, video.currentTime - 10)); });
-        navigator.mediaSession.setActionHandler('seekforward', function () { playerSeekTo(Math.min(video.duration || Infinity, video.currentTime + 10)); });
-        navigator.mediaSession.setActionHandler('seekto', function (d) { if (d.seekTime != null) playerSeekTo(d.seekTime); });
+        if (typeof window.MediaMetadata === 'function') {
+          try {
+            navigator.mediaSession.metadata = new MediaMetadata({
+              title: '<%= video.title.replace(/'/g, "\\'").replace(/\n/g, " ") %>',
+              artist: '<%= (video.channelTitle || "").replace(/'/g, "\\'") %>',
+              artwork: [
+                { src: '/api/stream/<%= video.videoId %>/poster', sizes: '1280x720', type: 'image/jpeg' },
+                { src: '/api/stream/<%= video.videoId %>/thumb', sizes: '320x180', type: 'image/jpeg' }
+              ]
+            });
+          } catch (e) {}
+        }
+        setMediaSessionAction('play', function () { video.play().catch(function () {}); });
+        setMediaSessionAction('pause', function () { video.pause(); });
+        setMediaSessionAction('seekbackward', function () { playerSeekTo(Math.max(0, video.currentTime - 10)); });
+        setMediaSessionAction('seekforward', function () { playerSeekTo(Math.min(video.duration || Infinity, video.currentTime + 10)); });
+        setMediaSessionAction('seekto', function (d) { if (d.seekTime != null) playerSeekTo(d.seekTime); });
         updatePlaylistMediaActions();
+        addPlayerCleanup(function () {
+          ['play', 'pause', 'seekbackward', 'seekforward', 'seekto', 'previoustrack', 'nexttrack'].forEach(function (action) {
+            setMediaSessionAction(action, null);
+          });
+          try { navigator.mediaSession.metadata = null; } catch (e) {}
+        });
       }
 
       // Resume playback when restored from browser bfcache (back from external site)
       var onPlayerPageShow = function (e) {
         if (e.persisted && wantsAutoplay && video.paused) {
-          video.currentTime = 0;
           video.play().catch(function () {});
         }
       };
@@ -566,6 +641,11 @@
 
       // Show spinner during rebuffering (debounced to avoid flash on quick seeks)
       var bufferTimer = 0;
+      function clearBufferingIndicator(force) {
+        clearTimeout(bufferTimer);
+        bufferTimer = 0;
+        if (force || !engine.isRecovering()) container.classList.remove('player-buffering');
+      }
       video.addEventListener('waiting', function () {
         if (video.ended) return;
         if (engine.isRecovering()) {
@@ -581,21 +661,17 @@
         if (!bufferTimer) bufferTimer = setPlayerTimeout(function () { container.classList.add('player-buffering'); }, 300);
       });
       video.addEventListener('playing', function () {
-        clearTimeout(bufferTimer); bufferTimer = 0;
-        if (!engine.isRecovering()) container.classList.remove('player-buffering');
+        clearBufferingIndicator(false);
       });
       video.addEventListener('canplay', function () {
-        clearTimeout(bufferTimer); bufferTimer = 0;
-        if (!engine.isRecovering()) container.classList.remove('player-buffering');
+        clearBufferingIndicator(false);
       });
       video.addEventListener('seeked', function () {
-        clearTimeout(bufferTimer); bufferTimer = 0;
-        if (!engine.isRecovering() && !video.paused) container.classList.remove('player-buffering');
+        if (!video.paused) clearBufferingIndicator(false);
       });
-      video.addEventListener('ended', function () {
-        clearTimeout(bufferTimer); bufferTimer = 0;
-        container.classList.remove('player-buffering');
-      });
+      video.addEventListener('pause', function () { clearBufferingIndicator(true); });
+      video.addEventListener('emptied', function () { clearBufferingIndicator(true); });
+      video.addEventListener('ended', function () { clearBufferingIndicator(true); });
 
       // --- Chapter markers ---
       (function () {
@@ -785,6 +861,10 @@
       function _onExtractionDone(fn) {
         if (_extractionDone) { fn(); return; }
         _extractionDoneListeners.push(fn);
+        return function () {
+          var idx = _extractionDoneListeners.indexOf(fn);
+          if (idx !== -1) _extractionDoneListeners.splice(idx, 1);
+        };
       }
       function _fireExtractionDone() {
         _extractionDone = true;
@@ -873,8 +953,80 @@
       }
       window._stopStatusPoll = stopStatusPoll;
 
-      function loadVideo(retries) {
+      function fetchWithPlayerTimeout(url, timeoutMs, externalSignal) {
+        var controller = new AbortController();
+        var timedOut = false;
+        function abortFromTransaction() { controller.abort(); }
+        if (externalSignal) {
+          if (externalSignal.aborted) controller.abort();
+          else externalSignal.addEventListener('abort', abortFromTransaction, { once: true });
+        }
+        var timer = setTimeout(function () {
+          timedOut = true;
+          controller.abort();
+        }, timeoutMs);
+        return fetch(url, { signal: controller.signal }).catch(function (err) {
+          if (timedOut) {
+            var timeoutErr = new Error('Manifest request timed out');
+            timeoutErr.name = 'TimeoutError';
+            throw timeoutErr;
+          }
+          throw err;
+        }).finally(function () {
+          clearTimeout(timer);
+          if (externalSignal) externalSignal.removeEventListener('abort', abortFromTransaction);
+        });
+      }
+
+      function waitForPlayerLoadDelay(delayMs, transaction) {
+        return new Promise(function (resolve, reject) {
+          try { requireCurrentPlayerLoadTransaction(transaction); } catch (err) { reject(err); return; }
+          var settled = false;
+          var timer = setPlayerTimeout(function () { finish(); }, delayMs);
+          function cleanup() {
+            clearPlayerTimeout(timer);
+            transaction.signal.removeEventListener('abort', abort);
+          }
+          function finish(err) {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (err) reject(err);
+            else resolve();
+          }
+          function abort() { finish(playerLoadAbortError()); }
+          transaction.signal.addEventListener('abort', abort, { once: true });
+        });
+      }
+
+      function waitForExtractionCompletion(transaction) {
+        return new Promise(function (resolve, reject) {
+          try { requireCurrentPlayerLoadTransaction(transaction); } catch (err) { reject(err); return; }
+          var settled = false;
+          var removeExtractionListener = null;
+          var timer = setPlayerTimeout(function () { finish(); }, 30000);
+          function cleanup() {
+            clearPlayerTimeout(timer);
+            if (removeExtractionListener) removeExtractionListener();
+            transaction.signal.removeEventListener('abort', abort);
+          }
+          function finish(err) {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (err) reject(err);
+            else resolve();
+          }
+          function abort() { finish(playerLoadAbortError()); }
+          transaction.signal.addEventListener('abort', abort, { once: true });
+          removeExtractionListener = _onExtractionDone(function () { finish(); });
+        });
+      }
+
+      function loadVideo(retries, transaction) {
         retries = retries || 0;
+        transaction = transaction || beginPlayerLoadTransaction();
+        try { requireCurrentPlayerLoadTransaction(transaction); } catch (err) { return Promise.reject(err); }
         // Only use ?refresh=1 on the very first attempt -- retries reuse cached extraction
         var loadUrl = (retries === 0) ? manifestUrl : manifestBaseUrl;
         // If an inline MPD was embedded in the HTML, use it as a data URI to
@@ -885,29 +1037,42 @@
           loadUrl = 'data:application/dash+xml;base64,' + btoa(inlineMpd);
           // Inline MPD means extraction already completed — set via directly
           stopStatusPoll();
+          _fireExtractionDone();
           <% if (typeof inlineVia !== 'undefined' && inlineVia) { %>finalVia = '<%= inlineVia %>';<% } %>
           setStreamVia('buffering...');
         } else {
           startStatusPoll();
         }
-        return player.load(loadUrl).catch(function (dashErr) {
+        return player.load(loadUrl, startupResumeTime).then(function (value) {
+          requireCurrentPlayerLoadTransaction(transaction);
+          return value;
+        }).catch(function (dashErr) {
+          if (isPlayerLoadAbort(dashErr, transaction)) throw playerLoadAbortError();
           // Check if server returned HLS/progressive JSON (don't use ?refresh=1 here --
           // caches were just populated by the player.load above)
-          return fetch(manifestBaseUrl).then(function (resp) {
+          return fetchWithPlayerTimeout(manifestBaseUrl, 15000, transaction.signal).then(function (resp) {
+            requireCurrentPlayerLoadTransaction(transaction);
             var ct = resp.headers.get('content-type') || '';
             if (ct.includes('json')) {
               return resp.json().then(function (data) {
+                requireCurrentPlayerLoadTransaction(transaction);
                 if (data.hls) {
                   stopStatusPoll();
                   finalVia = (data.via || 'yt-dlp') + '/hls';
                   setStreamVia('buffering...');
-                  return player.load(data.hls, undefined, 'application/x-mpegurl');
+                  return player.load(data.hls, startupResumeTime, 'application/x-mpegurl').then(function (value) {
+                    requireCurrentPlayerLoadTransaction(transaction);
+                    return value;
+                  });
                 }
                 if (data.progressive) {
                   stopStatusPoll();
                   finalVia = (data.via || 'yt-dlp') + '/progressive';
                   setStreamVia('buffering...');
-                  return player.load(data.progressive, undefined, 'video/mp4');
+                  return player.load(data.progressive, startupResumeTime, 'video/mp4').then(function (value) {
+                    requireCurrentPlayerLoadTransaction(transaction);
+                    return value;
+                  });
                 }
                 stopStatusPoll();
                 var err = new Error(data.error || 'No suitable formats found');
@@ -921,18 +1086,17 @@
             throw dashErr;
           });
         }).catch(function (err) {
+          if (isPlayerLoadAbort(err, transaction)) throw playerLoadAbortError();
           if (err.permanent) throw err;
           // Only retry player load failures (not server extraction errors)
           if (retries < 2 && !err.serverError) {
             // If extraction is still in progress, wait for it to finish before retrying
             if (!_extractionDone) {
-              return new Promise(function (resolve) {
-                var timer = setPlayerTimeout(function () { resolve(); }, 30000);
-                _onExtractionDone(function () { clearPlayerTimeout(timer); resolve(); });
-              }).then(function () { return loadVideo(retries + 1); });
+              return waitForExtractionCompletion(transaction)
+                .then(function () { return loadVideo(retries + 1, transaction); });
             }
-            return new Promise(function (resolve) { setPlayerTimeout(resolve, 1000 * (retries + 1)); })
-              .then(function () { return loadVideo(retries + 1); });
+            return waitForPlayerLoadDelay(1000 * (retries + 1), transaction)
+              .then(function () { return loadVideo(retries + 1, transaction); });
           }
           throw err;
         });
@@ -953,15 +1117,19 @@
 
       var expectedDuration = <%= (typeof video !== 'undefined' && video.duration) || 0 %>;
       video.addEventListener('ended', function () {
-        if (engine.isRecovering()) return;
-        var realDur = expectedDuration || video.duration;
+        var stats = safePlayerCall(function () { return player.getStats ? player.getStats() : null; }) || {};
+        var providerFinalDuration = Number(stats.vodFinalDuration) || 0;
+        var providerEndedCleanly = Number(stats.vodEndOfStreamCount) > 0
+          && providerFinalDuration > 0
+          && video.currentTime >= providerFinalDuration - 1;
+        var realDur = providerEndedCleanly ? providerFinalDuration : (expectedDuration || video.duration);
         console.log('[player] ended at ' + video.currentTime.toFixed(1) + 's, video.duration=' + video.duration + ', expected=' + expectedDuration);
         if (!realDur || !isFinite(realDur)) {
           if (wantsAutoplay && playlistNextUrl && !isLivePlayback()) window.location.href = playlistNextUrl;
           return;
         }
         if (video.currentTime < realDur - 5) {
-          engine.reportStall();
+          if (!engine.isRecovering()) engine.reportStall();
           return;
         }
         if (wantsAutoplay && playlistNextUrl && !isLivePlayback()) window.location.href = playlistNextUrl;
@@ -972,6 +1140,10 @@
       var stallLastCheck = 0;
       var stallTimer = null;
       function startStallWatch() {
+        // Current native engines own startup and playback stall recovery so a
+        // freeze before the first `playing` event is covered too. Retain this
+        // timer only as a compatibility fallback for older cached engines.
+        if (engine._internalStallWatch) return;
         if (stallTimer) return;
         stallTimer = setInterval(function () {
           if (video.paused || video.ended || engine.isRecovering()) {
@@ -1010,7 +1182,24 @@
         if (e) console.error('[video element] code=' + e.code + ' message=' + e.message);
       });
 
-      attachPromise.then(function () { return loadVideo(); }).then(function () {
+      function onPlayerTerminalError(event) {
+        var detail = event && event.detail ? event.detail : {};
+        // Load-time terminal errors reject player.load() and are handled after
+        // native alternate-format and extraction retries are exhausted.
+        if (detail.phase === 'load') return;
+        var err = detail.error || new Error(detail.reason || 'Native playback failed');
+        if (detail.loadGeneration != null) err.loadGeneration = detail.loadGeneration;
+        handlePlayerFailure(err);
+      }
+      if (player.addEventListener) player.addEventListener('error', onPlayerTerminalError);
+      addPlayerCleanup(function () {
+        if (player.removeEventListener) player.removeEventListener('error', onPlayerTerminalError);
+      });
+
+      var activatedLoadGeneration = -1;
+      function activateSuccessfulLoad(options) {
+        options = options || {};
+        var successfulLoadGeneration = engine._loadGeneration;
         stopStatusPoll();
         // Clean retry param from URL after successful load
         if (retryCount > 0) {
@@ -1021,57 +1210,100 @@
         }
         var revealed = false;
         function reveal() {
-          if (revealed) return;
+          if (
+            revealed
+            || activatedLoadGeneration === successfulLoadGeneration
+            || engine._state === 'error'
+            || engine._loadGeneration !== successfulLoadGeneration
+            || handledPlayerFailureGeneration === successfulLoadGeneration
+            || !video.isConnected
+            || !container.contains(video)
+          ) return;
           revealed = true;
+          activatedLoadGeneration = successfulLoadGeneration;
           _playerReady = true;
+          engine.videoUnavailable = false;
+          container.classList.remove('player-fallback');
           container.classList.add('player-ready');
           if (finalVia) setStreamVia(finalVia);
           if (window._stopLoadTimer) window._stopLoadTimer();
           if (window._finishLoadingBar) window._finishLoadingBar();
           var idleCb = window.requestIdleCallback || function (fn) { setPlayerTimeout(fn, 100); };
-          idleCb(function () { if (window._loadStoryboard) window._loadStoryboard(); });
           if (!isLivePlayback()) {
             idleCb(function () { if (window._loadChapters) window._loadChapters(); });
-            if (window._loadSubtitles) window._loadSubtitles();
           }
           // Resume from ?t= param, saved watch position, or start
-          var resumeTime = <%= startTime || 0 %> || <%= typeof savedPosition !== 'undefined' ? savedPosition : 0 %>;
-          if (resumeTime > 5 && !engine.isLive) {
-            video.currentTime = resumeTime;
-          }
+          var resumeTime = startupResumeTime;
           // Save watch position periodically
           if (window._watchTimeSaveTimer) clearInterval(window._watchTimeSaveTimer);
+          var lastPersistedWatchPosition = resumeTime;
           var _watchTimeSaveTimer = window._watchTimeSaveTimer = setInterval(function () {
             if (video.paused || engine.isRecovering() || engine.isLive) return;
             var pos = video.currentTime;
             var dur = video.duration;
-            if (pos > 5 && dur > 0) {
+            if (pos > 5 && dur > 0 && Math.abs(pos - lastPersistedWatchPosition) >= 10) {
+              lastPersistedWatchPosition = pos;
               fetch('/api/watch-time/<%= video.videoId %>', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ position: pos, duration: dur })
               }).catch(function () {});
             }
-          }, 15000);
-          // Save on page unload
-          var saveWatchTimeBeforeUnload = function () {
+          }, 30000);
+          // pagehide preserves bfcache eligibility unlike beforeunload and also
+          // covers ordinary full-document navigation.
+          var saveWatchTimeOnExit = function () {
             if (video.currentTime > 5 && video.duration > 0 && !engine.isLive) {
               navigator.sendBeacon('/api/watch-time/<%= video.videoId %>',
                 new Blob([JSON.stringify({ position: video.currentTime, duration: video.duration })], { type: 'application/json' }));
             }
           };
-          window.addEventListener('beforeunload', saveWatchTimeBeforeUnload);
-          addPlayerCleanup(function () { window.removeEventListener('beforeunload', saveWatchTimeBeforeUnload); });
+          window.addEventListener('pagehide', saveWatchTimeOnExit);
+          addPlayerCleanup(function () {
+            window.removeEventListener('pagehide', saveWatchTimeOnExit);
+            saveWatchTimeOnExit();
+          });
+          if (options.reconnect) {
+            autoplaySettled = false;
+            autoplayRequestPending = false;
+            autoplayRetryAttached = false;
+          }
           requestAutoplay('reveal');
           scheduleSupplementalPlayerDataFallback();
+          if (typeof options.onReveal === 'function') options.onReveal();
         }
-        if (video.readyState >= 2) {
-          reveal();
-        } else {
-          video.addEventListener('loadeddata', reveal, { once: true });
-          setPlayerTimeout(reveal, 2000);
+        // player.load() now resolves only after the current generation has a
+        // real playable startup range (or a native media-readiness event).
+        reveal();
+      }
+
+      attachPromise.then(function () { return loadVideo(); }).then(function () {
+        activateSuccessfulLoad();
+      }).catch(handlePlayerFailure);
+
+      function replacePlayerWithError(message) {
+        var errorDiv = document.createElement('div');
+        errorDiv.className = 'player-error';
+        errorDiv.textContent = String(message || 'Failed to load video');
+        while (container.firstChild) container.removeChild(container.firstChild);
+        container.appendChild(errorDiv);
+        return errorDiv;
+      }
+
+      function handlePlayerFailure(err) {
+        err = err || new Error('Native playback failed');
+        if (err.name === 'AbortError' || engine.destroyed || !video.isConnected || !container.contains(video)) return;
+        var failureGeneration = err.loadGeneration == null ? engine._loadGeneration : err.loadGeneration;
+        if (failureGeneration !== engine._loadGeneration) return;
+        if (handledPlayerFailureGeneration === failureGeneration) return;
+        handledPlayerFailureGeneration = failureGeneration;
+        autoplaySettled = true;
+        autoplayRequestPending = false;
+        autoplayRetryAttached = false;
+        if (autoplayRetryTimer) {
+          clearPlayerTimeout(autoplayRetryTimer);
+          autoplayRetryTimer = 0;
         }
-      }).catch(function (err) {
         console.error('Player load error:', err);
         stopStatusPoll();
         setStreamVia('');
@@ -1080,26 +1312,36 @@
         if (window._finishLoadingBar) {
           window._finishLoadingBar();
         }
+        _playerReady = false;
+        container.classList.remove('player-ready');
+        container.classList.remove('player-buffering');
         container.classList.add('player-fallback');
         // Upcoming live event / premiere — show poster with countdown
         if (err.permanent && err.scheduledStart) {
           var countdownEnd = new Date(err.scheduledStart).getTime();
-          container.innerHTML = '';
+          if (!isFinite(countdownEnd)) {
+            replacePlayerWithError('Failed to load video: ' + (err.message || err));
+            return;
+          }
+          var oldRecoverySurface = container.querySelector('.player-recovery-surface');
+          if (oldRecoverySurface) oldRecoverySurface.remove();
+          var recoverySurface = document.createElement('div');
+          recoverySurface.className = 'player-recovery-surface';
           var posterImg = document.createElement('img');
+          posterImg.className = 'player-recovery-poster';
           posterImg.src = '/api/stream/<%= video.videoId %>/poster';
-          posterImg.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;object-fit:contain';
-          container.appendChild(posterImg);
+          recoverySurface.appendChild(posterImg);
           var overlay = document.createElement('div');
-          overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:rgba(0,0,0,0.6)';
+          overlay.className = 'player-recovery-overlay';
           var countdownLabel = document.createElement('div');
-          countdownLabel.style.cssText = 'color:#fff;font-size:0.85rem;margin-bottom:8px;opacity:0.8';
+          countdownLabel.className = 'player-recovery-label';
           countdownLabel.textContent = 'Live in';
           overlay.appendChild(countdownLabel);
           var countdownEl = document.createElement('div');
-          countdownEl.style.cssText = 'color:#fff;font-size:2rem;font-variant-numeric:tabular-nums;letter-spacing:0.02em';
+          countdownEl.className = 'player-recovery-countdown';
           overlay.appendChild(countdownEl);
-          container.appendChild(overlay);
-          container.style.position = 'relative';
+          recoverySurface.appendChild(overlay);
+          container.appendChild(recoverySurface);
           function fmtCountdown(sec) {
             var h = Math.floor(sec / 3600);
             var m = Math.floor((sec % 3600) / 60);
@@ -1114,13 +1356,21 @@
             countdownEl.textContent = '';
             // Force fresh extraction by using ?refresh=1
             manifestUrl = manifestBaseUrl + '&refresh=1';
-            container.classList.remove('player-fallback');
             engine.videoUnavailable = false;
+            if (window._resetLoadTimer) window._resetLoadTimer();
+            if (window._startLoadTimer) window._startLoadTimer();
+            if (window._startLoadBar) window._startLoadBar();
             loadVideo().then(function () {
-              // Success — remove the countdown overlay
-              if (overlay.parentElement) overlay.parentElement.removeChild(overlay);
-              if (posterImg.parentElement) posterImg.parentElement.removeChild(posterImg);
+              activateSuccessfulLoad({
+                reconnect: true,
+                onReveal: function () {
+                  if (recoverySurface.parentElement) recoverySurface.parentElement.removeChild(recoverySurface);
+                }
+              });
             }).catch(function (retryErr) {
+              stopStatusPoll();
+              if (window._stopLoadTimer) window._stopLoadTimer();
+              if (window._finishLoadingBar) window._finishLoadingBar();
               container.classList.add('player-fallback');
               if (connectAttempts < 5) {
                 // Stream not ready yet — wait and retry
@@ -1134,7 +1384,7 @@
                 countdownEl.textContent = '';
                 var manualBtn = document.createElement('button');
                 manualBtn.textContent = 'Retry';
-                manualBtn.style.cssText = 'margin-top:16px;padding:8px 24px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer;font-size:0.9rem';
+                manualBtn.className = 'player-recovery-retry';
                 manualBtn.addEventListener('click', function () {
                   manualBtn.remove();
                   connectAttempts = 0;
@@ -1155,13 +1405,9 @@
           }
           tickCountdown();
         } else if (err.permanent) {
-          container.innerHTML = '<div class="player-error">Failed to load video: ' + (err.message || err) + '</div>';
+          replacePlayerWithError('Failed to load video: ' + (err.message || err));
         } else if (retryCount === 0) {
-          var retryDiv = document.createElement('div');
-          retryDiv.className = 'player-error';
-          var errMsg = document.createElement('span');
-          errMsg.textContent = 'Failed to load video: ' + (err.message || err);
-          retryDiv.appendChild(errMsg);
+          var retryDiv = replacePlayerWithError('Failed to load video: ' + (err.message || err));
           var retryBtn = document.createElement('button');
           retryBtn.textContent = 'Retry';
           retryBtn.style.cssText = 'margin-top:12px;padding:6px 18px;background:#333;color:#fff;border:1px solid #555;border-radius:4px;cursor:pointer';
@@ -1173,11 +1419,9 @@
             window.location.href = url.toString();
           });
           retryDiv.appendChild(retryBtn);
-          container.innerHTML = '';
-          container.appendChild(retryDiv);
         } else if (retryCount === 1) {
           // Second attempt: refresh cookies and retry automatically
-          container.innerHTML = '<div class="player-error">Refreshing cookies and retrying...</div>';
+          replacePlayerWithError('Refreshing cookies and retrying...');
           fetch('/api/cookies/refresh-auto', { method: 'POST' })
             .then(function () {
               var url = new URL(window.location);
@@ -1190,9 +1434,9 @@
               window.location.href = url.toString();
             });
         } else {
-          container.innerHTML = '<div class="player-error">Failed to load video: ' + (err.message || err) + '</div>';
+          replacePlayerWithError('Failed to load video: ' + (err.message || err));
         }
-      });
+      }
 
 <%- include('player/keyboard-shortcuts') %>
     }
@@ -1222,7 +1466,8 @@
       }
       playerEngineRetryAttempted = true;
       var retryScript = document.createElement('script');
-      retryScript.src = '/native-player-engine.js?v=17&retry=1';
+      var nativePlayerUrl = String(bootstrap.nativePlayerUrl || '/native-player-engine.min.js');
+      retryScript.src = nativePlayerUrl + (nativePlayerUrl.indexOf('?') === -1 ? '?' : '&') + 'retry=1';
       retryScript.onload = tryInitPlayer;
       retryScript.onerror = showPlayerBootstrapError;
       document.head.appendChild(retryScript);
@@ -1245,15 +1490,17 @@
           var channelEl = document.querySelector('.player-channel');
           if (titleEl && d.title) titleEl.textContent = d.title;
           if (channelEl && d.channelTitle) channelEl.textContent = d.channelTitle;
-          if ('mediaSession' in navigator && navigator.mediaSession.metadata && (d.title || d.channelTitle)) {
-            navigator.mediaSession.metadata = new MediaMetadata({
-              title: d.title || titleEl && titleEl.textContent || '<%= video.videoId %>',
-              artist: d.channelTitle || channelEl && channelEl.textContent || '',
-              artwork: [
-                { src: '/api/stream/<%= video.videoId %>/poster', sizes: '1280x720', type: 'image/jpeg' },
-                { src: '/api/stream/<%= video.videoId %>/thumb', sizes: '320x180', type: 'image/jpeg' }
-              ]
-            });
+          if ('mediaSession' in navigator && navigator.mediaSession.metadata && typeof window.MediaMetadata === 'function' && (d.title || d.channelTitle)) {
+            try {
+              navigator.mediaSession.metadata = new MediaMetadata({
+                title: d.title || titleEl && titleEl.textContent || '<%= video.videoId %>',
+                artist: d.channelTitle || channelEl && channelEl.textContent || '',
+                artwork: [
+                  { src: '/api/stream/<%= video.videoId %>/poster', sizes: '1280x720', type: 'image/jpeg' },
+                  { src: '/api/stream/<%= video.videoId %>/thumb', sizes: '320x180', type: 'image/jpeg' }
+                ]
+              });
+            } catch (e) {}
           }
 
           // Stats — rebuild views + likes, preserve date from initial render if details lacks it

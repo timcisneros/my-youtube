@@ -1071,7 +1071,7 @@ async function configureConditions(browserName, page, network, device) {
 async function prewarmBenchmarkServer(baseURL) {
   const paths = [
     '/__player-benchmark',
-    '/native-player-engine.js?v=17',
+    '/native-player-engine.js?v=18',
     '/__player-benchmark/mux-player.js',
     '/api/stream/PLAYERTEST1/dash.mpd',
     '/api/stream/PLAYERTEST1/hls.m3u8?fixtureHls=benchmark-groups',
@@ -1180,7 +1180,7 @@ function classifyCompletedBenchmarkNetworkIoSuspension({
 
 function validateCollectionFailureClassification() {
   const nativeRequest = {
-    url: 'http://127.0.0.1:3012/native-player-engine.js?v=17',
+    url: 'http://127.0.0.1:3012/native-player-engine.js?v=18',
     type: 'Script',
     status: 200,
     encodedBytes: 0,

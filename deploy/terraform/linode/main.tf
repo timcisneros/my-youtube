@@ -10,7 +10,6 @@
 #   - 1x web instance (g6-standard-2: 2 vCPU, 4GB RAM)
 #   - 1x extraction worker (g6-standard-4: 4 vCPU, 8GB RAM)
 #   - 1x database instance (g6-standard-2: 2 vCPU, 4GB RAM) running PostgreSQL + Redis
-#   - 1x storage instance (g6-standard-2: 2 vCPU, 4GB RAM) running MinIO
 #   - VLAN for private networking
 #   - Firewall rules restricting access
 #   - Volumes for persistent data
@@ -133,28 +132,10 @@ resource "linode_firewall" "internal" {
     ipv4     = ["10.0.1.0/24"]
   }
 
-  # MinIO API
-  inbound {
-    label    = "minio-api"
-    action   = "ACCEPT"
-    protocol = "TCP"
-    ports    = "9000"
-    ipv4     = ["10.0.1.0/24"]
-  }
-
-  # MinIO Console from admin only
-  inbound {
-    label    = "minio-console"
-    action   = "ACCEPT"
-    protocol = "TCP"
-    ports    = "9001"
-    ipv4     = var.ssh_allowed_ips
-  }
-
   inbound_policy  = "DROP"
   outbound_policy = "ACCEPT"
 
-  linodes = [linode_instance.database.id, linode_instance.storage.id]
+  linodes = [linode_instance.database.id]
 }
 
 # --- Instances ---
@@ -286,78 +267,6 @@ resource "linode_instance" "database" {
   }
 }
 
-resource "linode_instance" "storage" {
-  label           = "myyoutube-storage"
-  type            = var.storage_instance_type
-  image           = "linode/ubuntu24.04"
-  region          = var.region
-  authorized_keys = [var.ssh_public_key]
-  tags            = ["myyoutube", "storage"]
-
-  interface {
-    purpose = "public"
-  }
-
-  interface {
-    purpose      = "vlan"
-    label        = "myyoutube-vlan"
-    ipam_address = "10.0.1.40/24"
-  }
-
-  metadata {
-    user_data = base64encode(<<-EOT
-      #!/bin/bash
-      set -e
-      apt-get update
-
-      # Install MinIO
-      curl -L https://dl.min.io/server/minio/release/linux-amd64/minio -o /usr/local/bin/minio
-      chmod +x /usr/local/bin/minio
-
-      # Install MinIO client
-      curl -L https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-      chmod +x /usr/local/bin/mc
-
-      # Create minio user and data directory
-      useradd -r -m -s /bin/false minio
-      mkdir -p /data/minio
-      chown minio:minio /data/minio
-
-      # Systemd service for MinIO
-      cat > /etc/systemd/system/minio.service << 'UNIT'
-      [Unit]
-      Description=MinIO Object Storage
-      After=network.target
-
-      [Service]
-      Type=simple
-      User=minio
-      Group=minio
-      ExecStart=/usr/local/bin/minio server /data/minio --address ":9000" --console-address ":9001"
-      Environment=MINIO_ROOT_USER=${var.s3_access_key}
-      Environment=MINIO_ROOT_PASSWORD=${var.s3_secret_key}
-      Restart=always
-      RestartSec=5
-      LimitNOFILE=65535
-
-      [Install]
-      WantedBy=multi-user.target
-      UNIT
-
-      systemctl daemon-reload
-      systemctl enable --now minio
-
-      # Wait for MinIO to start, then create bucket
-      sleep 5
-      mc alias set local http://localhost:9000 ${var.s3_access_key} ${var.s3_secret_key}
-      mc mb --ignore-existing local/myyoutube
-
-      echo "Storage server provisioned."
-    EOT
-    )
-  }
-}
-
 # --- Volumes (persistent storage) ---
 # Volumes are attached directly to instances via linode_id.
 # The volume device path will be available at /dev/disk/by-id/scsi-0Linode_Volume_<label>
@@ -367,11 +276,4 @@ resource "linode_volume" "db_data" {
   region    = var.region
   size      = var.db_volume_size
   linode_id = linode_instance.database.id
-}
-
-resource "linode_volume" "minio_data" {
-  label     = "myyoutube-minio-data"
-  region    = var.region
-  size      = var.storage_volume_size
-  linode_id = linode_instance.storage.id
 }

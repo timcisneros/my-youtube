@@ -1,0 +1,55 @@
+name: Staging player canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: Staging deployment base URL (falls back to PLAYER_CANARY_BASE_URL repository variable)
+        required: false
+        type: string
+      video_ids:
+        description: Comma-separated category:video-id samples (falls back to PLAYER_CANARY_VIDEO_IDS)
+        required: false
+        type: string
+      samples:
+        description: Samples per video (falls back to PLAYER_CANARY_SAMPLES or 2)
+        required: false
+        type: string
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    if: >-
+      ${{ (inputs.base_url != '' || vars.PLAYER_CANARY_BASE_URL != '') &&
+          (inputs.video_ids != '' || vars.PLAYER_CANARY_VIDEO_IDS != '') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PLAYER_CANARY_BASE_URL: ${{ inputs.base_url || vars.PLAYER_CANARY_BASE_URL }}
+      PLAYER_CANARY_VIDEO_IDS: ${{ inputs.video_ids || vars.PLAYER_CANARY_VIDEO_IDS }}
+      PLAYER_CANARY_SAMPLES: ${{ inputs.samples || vars.PLAYER_CANARY_SAMPLES || '2' }}
+      PLAYER_CANARY_REQUIRE_CATEGORIES: "1"
+      PLAYER_CANARY_REQUIRE_METRICS: "1"
+      PLAYER_CANARY_METRICS_TOKEN: ${{ secrets.PLAYER_CANARY_METRICS_TOKEN }}
+      PLAYER_CANARY_COOKIE: ${{ secrets.PLAYER_CANARY_COOKIE }}
+      PLAYER_CANARY_OUTPUT: tmp/player-canary/latest.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run canary:player
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: player-canary-${{ github.run_id }}
+          path: tmp/player-canary/latest.json
+          if-no-files-found: warn
+          retention-days: 30

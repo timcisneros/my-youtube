@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { ensureAuth } from '../auth.js';
 import db from '../db.js';
 import { cache } from '../youtube/shared.js';
-import { getExploreVideos, getDurationsAndLiveStatuses } from '../youtube/index.js';
+import { formatDuration, getExploreVideos, getDurationsAndLiveStatuses } from '../youtube/index.js';
 
 const router = Router();
 
@@ -13,21 +13,39 @@ router.get('/', ensureAuth, async (req, res) => {
   const dataP = getExploreVideos(req.session.userId, sessionStartMs);
   await res.flushShell({ activeTab: 'explore' });
   try {
-    const { videos, newVideoIds } = await dataP;
+    const {
+      videos,
+      newVideoIds,
+      boostedChannelIds,
+      queuedVideoIds,
+      mutedChannelIds,
+      ratings,
+      topicFilters,
+      durationSeconds,
+      liveStatuses: rankedLiveStatuses,
+    } = await dataP;
     const sessionId = sidParam || Date.now().toString(36);
-    void Promise.resolve(db.startExploreSession(req.session.userId, sessionId));
+    void Promise.resolve(db.startExploreSession(req.session.userId, sessionId)).catch(() => {});
     const allIds = videos.map(v => v.videoId);
-    const { durations, liveStatuses } = getDurationsAndLiveStatuses(allIds);
-    const boostedIds = await Promise.resolve(db.getBoostedChannelIds(req.session.userId));
-    const boostedSet = new Set(boostedIds);
-    const queuedIds = await Promise.resolve(db.getQueuedVideoIds(req.session.userId));
-    const queuedSet = new Set(queuedIds);
-    const mutedIds = await Promise.resolve(db.getMutedChannelIds(req.session.userId));
-    const mutedSet = new Set(mutedIds);
-    const ratingRows = await Promise.resolve(db.getVideoRatings(req.session.userId));
-    const ratedMap = new Map(ratingRows.map(r => [r.video_id, r.rating]));
+    let durations: Record<string, string>;
+    let liveStatuses: Record<string, string>;
+    if (durationSeconds && rankedLiveStatuses) {
+      durations = {};
+      for (const id of allIds) {
+        const duration = durationSeconds[id];
+        if (duration > 0) durations[id] = formatDuration(duration);
+      }
+      liveStatuses = rankedLiveStatuses;
+    } else {
+      // Compatibility for snapshots produced by an older worker during a
+      // rolling deployment. New snapshots already carry render metadata.
+      ({ durations, liveStatuses } = await getDurationsAndLiveStatuses(allIds));
+    }
+    const boostedSet = new Set(boostedChannelIds);
+    const queuedSet = new Set(queuedVideoIds);
+    const mutedSet = new Set(mutedChannelIds);
+    const ratedMap = new Map(ratings.map(r => [r.video_id, r.rating]));
     const newSet = new Set(newVideoIds);
-    const topicFilters = await Promise.resolve(db.getTopicFilters(req.session.userId));
     await res.streamContent('explore', { videos, durations, liveStatuses, boostedSet, queuedSet, mutedSet, ratedMap, newSet, topicFilters, sessionId });
   } catch (err) {
     console.error('Explore error:', err.message);

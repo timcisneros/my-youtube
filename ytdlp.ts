@@ -2,15 +2,23 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { execFile } from 'child_process';
-import { createRequire } from 'module';
+import { createRequire } from 'node:module';
 import { promisify } from 'util';
+import { randomUUID } from 'node:crypto';
+import { acquireLock, releaseLock, renewLock } from './lib/cache.js';
+import { projectPath } from './lib/project-paths.js';
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
-const { constants: ytdlpConstants } = require('youtube-dl-exec') as { constants: { YOUTUBE_DL_PATH?: string } };
+let developmentYtdlpBin = '';
+try {
+  developmentYtdlpBin = require('youtube-dl-exec').constants?.YOUTUBE_DL_PATH || '';
+} catch {
+  // Production installs use the operator/container-managed yt-dlp binary.
+}
 
-const COOKIES_FILE = path.join(import.meta.dirname, 'cookies.txt');
+const COOKIES_FILE = projectPath('cookies.txt');
 const BROWSER = process.env.YT_COOKIES_FROM_BROWSER || '';
-const YTDLP_BIN = process.env.YTDLP_BIN || ytdlpConstants.YOUTUBE_DL_PATH || 'yt-dlp';
+const YTDLP_BIN = process.env.YTDLP_BIN || developmentYtdlpBin || 'yt-dlp';
 const home = os.homedir();
 
 // Known browser cookie DB locations. Chromium-compatible apps can use an
@@ -50,44 +58,65 @@ function ytdlpArgs() {
   return args;
 }
 
-function chromiumBrowserSpecs() {
+const BROWSER_DISCOVERY_TTL_MS = Math.max(5_000,
+  Number(process.env.BROWSER_DISCOVERY_TTL_MS) || 60_000);
+let browserDiscoveryCache: { specs: string[]; expiresAt: number } | null = null;
+let browserDiscoveryInflight: Promise<string[]> | null = null;
+
+async function chromiumBrowserSpecs() {
   const specs: string[] = [];
   const seen = new Set<string>();
-  for (const candidate of CHROMIUM_ROOTS) {
-    if (!fs.existsSync(candidate.root)) continue;
-    let entries: string[] = [];
+  await Promise.all(CHROMIUM_ROOTS.map(async candidate => {
+    let entries: fs.Dirent[] = [];
     try {
-      entries = fs.readdirSync(candidate.root);
+      entries = await fs.promises.readdir(candidate.root, { withFileTypes: true });
     } catch {
-      continue;
+      return;
     }
-    for (const entry of entries) {
-      const profilePath = path.join(candidate.root, entry);
-      if (!fs.existsSync(path.join(profilePath, 'Cookies'))) continue;
-      const spec = entry === 'Default' && !candidate.root.includes('net.imput.helium')
+    await Promise.all(entries.filter(entry => entry.isDirectory()).map(async entry => {
+      const profilePath = path.join(candidate.root, entry.name);
+      try {
+        await fs.promises.access(path.join(profilePath, 'Cookies'));
+      } catch {
+        return;
+      }
+      const spec = entry.name === 'Default' && !candidate.root.includes('net.imput.helium')
         ? candidate.browser
         : `${candidate.browser}:${profilePath}`;
       if (!seen.has(spec)) {
         seen.add(spec);
         specs.push(spec);
       }
-    }
-  }
+    }));
+  }));
   return specs;
 }
 
 // Which browsers/profiles have accessible cookie databases
-function availableBrowsers() {
-  const specs = chromiumBrowserSpecs();
-  if (fs.existsSync(FIREFOX_ROOT)) specs.push('firefox');
-  return specs;
+async function availableBrowsers() {
+  if (browserDiscoveryCache && browserDiscoveryCache.expiresAt > Date.now()) {
+    return [...browserDiscoveryCache.specs];
+  }
+  if (browserDiscoveryInflight !== null) return browserDiscoveryInflight.then(specs => [...specs]);
+  browserDiscoveryInflight = Promise.all([
+    chromiumBrowserSpecs(),
+    fs.promises.access(FIREFOX_ROOT).then(() => true, () => false),
+  ]).then(([specs, hasFirefox]) => {
+    if (hasFirefox) specs.push('firefox');
+    specs.sort();
+    browserDiscoveryCache = { specs, expiresAt: Date.now() + BROWSER_DISCOVERY_TTL_MS };
+    return specs;
+  }).finally(() => {
+    browserDiscoveryInflight = null;
+  });
+  return browserDiscoveryInflight.then(specs => [...specs]);
 }
 
 // Args using fresh browser cookies (bypasses stale cookies.txt).
 // Returns base args array or null if no browser is available.
-function ytdlpBrowserArgs() {
+async function ytdlpBrowserArgs() {
   if (BROWSER) return ['--no-warnings', '--user-agent', 'Mozilla/5.0', '--cookies-from-browser', BROWSER];
-  const available = availableBrowsers();
+  const available = await availableBrowsers();
   if (available.length === 0) return null;
   return ['--no-warnings', '--user-agent', 'Mozilla/5.0', '--cookies-from-browser', available[0]];
 }
@@ -95,36 +124,62 @@ function ytdlpBrowserArgs() {
 // Refresh cookies.txt from the best available browser (fire-and-forget).
 // Called automatically when bot detection triggers a successful browser-cookie retry.
 let _refreshing = false;
-async function refreshCookiesFile() {
-  if (_refreshing) return;
-  const available = availableBrowsers();
-  if (available.length === 0) return;
+interface CookieRefreshOptions {
+  signal?: AbortSignal;
+  withSlot?: <T>(task: () => Promise<T>, options?: { signal?: AbortSignal; priority?: string }) => Promise<T>;
+}
+
+async function refreshCookiesFile(options: CookieRefreshOptions = {}) {
+  if (_refreshing) return false;
+  const available = await availableBrowsers();
+  if (available.length === 0) return false;
+  const lockKey = 'cookie-file-refresh';
+  const lockToken = await acquireLock(lockKey, 45_000);
+  if (!lockToken) return false;
+  if (_refreshing) {
+    await releaseLock(lockKey, lockToken);
+    return false;
+  }
   _refreshing = true;
+  const tmpPath = `${COOKIES_FILE}.tmp-${process.pid}-${randomUUID()}`;
+  const renewTimer = setInterval(() => {
+    void renewLock(lockKey, lockToken, 45_000);
+  }, 15_000);
+  renewTimer.unref?.();
   try {
-    const tmpPath = COOKIES_FILE + '.tmp';
-    await execFileAsync(YTDLP_BIN, [
-      '--cookies-from-browser', available[0],
-      '--cookies', tmpPath,
-      '--skip-download', '--', 'dQw4w9WgXcQ'
-    ], { timeout: 15000 });
-    if (fs.existsSync(tmpPath)) {
+    const task = () => execFileAsync(YTDLP_BIN, [
+        '--cookies-from-browser', available[0],
+        '--cookies', tmpPath,
+        '--skip-download', '--', 'dQw4w9WgXcQ'
+      ], { timeout: 15000, signal: options.signal });
+    if (options.withSlot) await options.withSlot(task, { priority: 'background', signal: options.signal });
+    else await task();
+    try {
+      await fs.promises.access(tmpPath);
       // Sanitize: yt-dlp sometimes concatenates multiple cookie entries on one line.
       // Keep only lines with exactly 7 tab-separated fields (valid Netscape format)
       // and comment/blank lines.
-      const raw = fs.readFileSync(tmpPath, 'utf8');
+      const raw = await fs.promises.readFile(tmpPath, 'utf8');
       const clean = raw.split('\n').filter(line => {
         if (!line || line.startsWith('#') || line.startsWith('//')) return true;
         return line.split('\t').length === 7;
       }).join('\n');
-      fs.writeFileSync(tmpPath, clean);
-      fs.renameSync(tmpPath, COOKIES_FILE);
+      await fs.promises.writeFile(tmpPath, clean);
+      await fs.promises.rename(tmpPath, COOKIES_FILE);
       console.log(`[ytdlp] cookies.txt refreshed from ${available[0]}`);
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return false;
     }
   } catch (err) {
-    console.warn('[ytdlp] cookie refresh failed:', err.message);
-    try { fs.unlinkSync(COOKIES_FILE + '.tmp'); } catch {}
+    console.warn('[ytdlp] cookie refresh failed:', (err as Error).message);
+    return false;
   } finally {
+    clearInterval(renewTimer);
+    await fs.promises.rm(tmpPath, { force: true }).catch(() => {});
     _refreshing = false;
+    await releaseLock(lockKey, lockToken);
   }
 }
 

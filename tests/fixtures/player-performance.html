@@ -403,7 +403,7 @@
       var script = document.createElement('script');
       script.src = implementation === 'mux'
         ? '/__player-benchmark/mux-player.js'
-        : '/native-player-engine.js?v=17';
+        : '/native-player-engine.js?v=18';
       script.onload = function () {
         result.scriptReadyMs = performance.now();
         resolve();

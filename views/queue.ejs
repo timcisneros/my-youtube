@@ -21,6 +21,12 @@
         <% } %>
       </div>
     <% } %>
+    <% if (prevCursor || nextCursor) { %>
+      <nav class="pagination" aria-label="Queue pages">
+        <% if (prevCursor) { %><a href="/queue?cursor=<%= encodeURIComponent(prevCursor) %>">&larr; Previous</a><% } %>
+        <% if (nextCursor) { %><a href="/queue?cursor=<%= encodeURIComponent(nextCursor) %>">Next &rarr;</a><% } %>
+      </nav>
+    <% } %>
     <script>
     (function() {
       document.querySelectorAll('.queue-remove').forEach(function(btn) {

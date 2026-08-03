@@ -42,86 +42,116 @@ if (navigator.storage && navigator.storage.persist) {
   navigator.storage.persist().catch(function () {});
 }
 
-// Handle SW fallback responses (server unreachable).
-// The SW sets X-SW-Fallback header when serving /offline as a substitute.
-// For downloads, render from localStorage. For other pages, render the fallback HTML.
-function handleFallback(html) {
-  var main = document.querySelector('main');
-  if (!main) {
-    resetShellLoadState();
-    if (window._finishLoadingBar) window._finishLoadingBar();
-    return;
+// Migrate the old synchronous localStorage catalog once, then keep all offline
+// library state beside the media chunks in IndexedDB. Per-record writes avoid
+// reparsing and serializing a user's complete library on every page visit.
+var _legacyOfflineCatalogMigration = null;
+function migrateLegacyOfflineCatalog() {
+  if (_legacyOfflineCatalogMigration) return _legacyOfflineCatalogMigration;
+  if (typeof IDBHelpers === 'undefined' || !IDBHelpers.upsertDownloadRecords) {
+    return Promise.resolve();
   }
-  // Downloads: render from localStorage
-  if (window.location.pathname === '/downloads') {
-    resetShellLoadState();
+  var legacyDownloads = [];
+  var legacyPrepared = {};
+  try { legacyDownloads = JSON.parse(localStorage.getItem('offline_downloads') || '[]'); } catch (e) {}
+  try { legacyPrepared = JSON.parse(localStorage.getItem('offline_prefetched') || '{}'); } catch (e) {}
+  var records = Array.isArray(legacyDownloads) ? legacyDownloads.map(function (item) {
+    return {
+      video_id: item && item.video_id,
+      title: item && item.title,
+      channel_title: item && item.channel_title,
+      prepared: item && legacyPrepared[item.video_id] ? 1 : 0
+    };
+  }).filter(function (item) { return item.video_id; }) : [];
+  _legacyOfflineCatalogMigration = IDBHelpers.upsertDownloadRecords(records).then(function () {
     try {
-      var data = localStorage.getItem('offline_downloads');
-      if (data) {
-        var downloads = JSON.parse(data);
-        if (downloads && downloads.length) {
-          var grid = '<h1>Downloads</h1><div class="video-grid">';
-          for (var i = 0; i < downloads.length; i++) {
-            var dl = downloads[i];
-            grid += '<div class="video-card download-card" data-video-id="' + dl.video_id + '">'
-              + '<a href="/watch?v=' + dl.video_id + '">'
-              + '<div class="video-thumb-wrap">'
-              + '<img data-src="/api/stream/' + dl.video_id + '/thumb" class="video-thumb lazy-thumb">'
-              + '</div>'
-              + '<div class="video-info">'
-              + '<div class="video-title">' + escapeHtml(dl.title) + '</div>'
-              + '<div class="video-channel">' + escapeHtml(dl.channel_title) + '</div>'
-              + '</div></a></div>';
-          }
-          grid += '</div>';
-          main.innerHTML = grid;
-          loadThumbnails();
-          return;
-        }
-      }
+      localStorage.removeItem('offline_downloads');
+      localStorage.removeItem('offline_prefetched');
     } catch (e) {}
+  }).catch(function (error) {
+    _legacyOfflineCatalogMigration = null;
+    throw error;
+  });
+  return _legacyOfflineCatalogMigration;
+}
+
+var OFFLINE_DOWNLOAD_PAGE_SIZE = 50;
+
+function preparedOfflineDownloadPage(cursor) {
+  if (typeof IDBHelpers === 'undefined' || !IDBHelpers.getPreparedDownloadPage) {
+    return Promise.resolve({ items: [], nextCursor: null });
   }
-  // Watch page: render minimal player — MPD + segments may be cached by SW
-  var videoMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]{11})/);
-  if (window.location.pathname === '/watch' && videoMatch) {
-    var videoId = videoMatch[1];
-    var title = '';
-    setNavStreamVia('offline...');
-    try {
-      var dlData = localStorage.getItem('offline_downloads');
-      if (dlData) {
-        var dls = JSON.parse(dlData);
-        for (var j = 0; j < dls.length; j++) {
-          if (dls[j].video_id === videoId) { title = dls[j].title; break; }
-        }
-      }
-    } catch (e) {}
-    main.innerHTML = '<div class="player-embed" id="player-container">'
-      + '<div class="player-loading"><div class="player-spinner"></div></div>'
-      + '<video id="player" class="player-video" poster="/api/stream/' + videoId + '/poster"></video>'
-      + '</div>'
-      + '<div class="player-primary"><h1 class="player-title">' + escapeHtml(title || videoId) + '</h1></div>';
-    if (window.PlayerEngine) {
-      var video = document.getElementById('player');
-      var engine = new PlayerEngine(video, { videoId: videoId, streamToken: '' });
-      window._player = engine.getPlayer();
-      window._playerEngine = engine;
-      engine.init().then(function () { return engine.load(); }).then(function () {
-        setNavStreamVia('offline');
-        finishShellLoad();
-      }).catch(function (err) {
-        console.error('[player-engine] offline fallback load failed:', err);
-        setNavStreamVia('');
-        finishShellLoad();
-      });
-    } else {
-      setNavStreamVia('');
-      finishShellLoad();
+  return migrateLegacyOfflineCatalog().then(function () {
+    return IDBHelpers.getPreparedDownloadPage({
+      limit: OFFLINE_DOWNLOAD_PAGE_SIZE,
+      cursor: cursor || null
+    });
+  });
+}
+
+function downloadRecordsForIds(videoIds) {
+  if (typeof IDBHelpers === 'undefined' || !IDBHelpers.getDownloadRecords) {
+    return Promise.resolve([]);
+  }
+  return migrateLegacyOfflineCatalog().then(function () {
+    return IDBHelpers.getDownloadRecords(videoIds || []);
+  });
+}
+
+function offlineDownloadCardHtml(download) {
+  var videoId = String(download && download.video_id || '');
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(videoId)) return '';
+  return '<div class="video-card download-card" data-video-id="' + videoId + '">'
+    + '<a href="/watch?v=' + encodeURIComponent(videoId) + '">'
+    + '<div class="video-thumb-wrap">'
+    + '<img data-src="/api/stream/' + encodeURIComponent(videoId) + '/thumb" class="video-thumb lazy-thumb">'
+    + '</div>'
+    + '<div class="video-info">'
+    + '<div class="video-title">' + escapeHtml(download.title) + '</div>'
+    + '<div class="video-channel">' + escapeHtml(download.channel_title) + '</div>'
+    + '</div></a></div>';
+}
+
+function renderOfflineDownloadPage(main, page, append) {
+  var items = page && Array.isArray(page.items) ? page.items : [];
+  if (!append) {
+    if (!items.length) {
+      main.innerHTML = '<h1>Downloads</h1><p class="empty">No videos are available offline on this device.</p>';
+      return;
     }
+    main.innerHTML = '<h1>Downloads</h1><div class="video-grid" id="offline-download-grid"></div>'
+      + '<button type="button" class="load-more-btn" id="offline-download-more">Load more</button>';
+  }
+  var grid = main.querySelector('#offline-download-grid');
+  if (!grid) return;
+  var html = '';
+  for (var i = 0; i < items.length; i++) html += offlineDownloadCardHtml(items[i]);
+  grid.insertAdjacentHTML('beforeend', html);
+  loadThumbnails();
+
+  var more = main.querySelector('#offline-download-more');
+  if (!more) return;
+  if (!page.nextCursor) {
+    more.remove();
     return;
   }
+  more.hidden = false;
+  more.disabled = false;
+  more.textContent = 'Load more';
+  more.onclick = function () {
+    more.disabled = true;
+    more.textContent = 'Loading...';
+    preparedOfflineDownloadPage(page.nextCursor).then(function (nextPage) {
+      renderOfflineDownloadPage(main, nextPage, true);
+    }).catch(function () {
+      more.disabled = false;
+      more.textContent = 'Retry';
+    });
+  };
+}
+
+function renderDefaultFallback(main, html) {
   resetShellLoadState();
-  // Default: render the /offline fallback page from SW
   if (html) {
     var doc = new DOMParser().parseFromString(html, 'text/html');
     var newMain = doc.querySelector('main');
@@ -133,12 +163,72 @@ function handleFallback(html) {
   }
 }
 
+function renderOfflineWatch(main, videoId, title) {
+  setNavStreamVia('offline...');
+  main.innerHTML = '<div class="player-embed" id="player-container">'
+    + '<div class="player-loading"><div class="player-spinner"></div></div>'
+    + '<video id="player" class="player-video" poster="/api/stream/' + videoId + '/poster"></video>'
+    + '</div>'
+    + '<div class="player-primary"><h1 class="player-title">' + escapeHtml(title || videoId) + '</h1></div>';
+  if (window.PlayerEngine) {
+    var video = document.getElementById('player');
+    var engine = new PlayerEngine(video, { videoId: videoId, streamToken: '' });
+    window._player = engine.getPlayer();
+    window._playerEngine = engine;
+    return engine.init().then(function () { return engine.load(); }).then(function () {
+      setNavStreamVia('offline');
+      finishShellLoad();
+    }).catch(function (err) {
+      console.error('[player-engine] offline fallback load failed:', err);
+      setNavStreamVia('');
+      finishShellLoad();
+    });
+  }
+  setNavStreamVia('');
+  finishShellLoad();
+  return Promise.resolve();
+}
+
+// Handle SW fallback responses (server unreachable). The SW sets
+// X-SW-Fallback when serving /offline as a substitute.
+function handleFallback(html) {
+  var main = document.querySelector('main');
+  if (!main) {
+    resetShellLoadState();
+    if (window._finishLoadingBar) window._finishLoadingBar();
+    return Promise.resolve();
+  }
+  // Only videos whose format files and bundle completed are advertised while
+  // offline. Server-side downloads that were not copied to this device remain
+  // available when the server is reachable.
+  if (window.location.pathname === '/downloads') {
+    resetShellLoadState();
+    return preparedOfflineDownloadPage(null).then(function (page) {
+      renderOfflineDownloadPage(main, page, false);
+    }).catch(function () { renderDefaultFallback(main, html); });
+  }
+  // Watch page: render minimal player — MPD + segments may be cached by SW
+  var videoMatch = window.location.search.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+  if (window.location.pathname === '/watch' && videoMatch) {
+    var videoId = videoMatch[1];
+    var recordPromise = typeof IDBHelpers !== 'undefined' && IDBHelpers.getDownloadRecord
+      ? migrateLegacyOfflineCatalog().then(function () { return IDBHelpers.getDownloadRecord(videoId); })
+      : Promise.resolve(null);
+    return recordPromise.then(function (record) {
+      return renderOfflineWatch(main, videoId, record && record.title || '');
+    }).catch(function () { return renderOfflineWatch(main, videoId, ''); });
+  }
+  renderDefaultFallback(main, html);
+  return Promise.resolve();
+}
+
 // Download a format file to IDB with streaming and resume support
 function downloadFormatToIDB(videoId, formatId, token) {
+  if (typeof IDBHelpers === 'undefined') return Promise.reject(new Error('IndexedDB helpers unavailable'));
   var key = videoId + ':' + formatId;
   var CHUNK_SIZE = IDBHelpers.CHUNK_SIZE; // 2MB
 
-  IDBHelpers.getMeta(key).then(function (meta) {
+  return IDBHelpers.getMeta(key).then(function (meta) {
     if (meta && meta.done && meta.chunkSize) return; // already downloaded with chunk format
 
     var downloadedChunks = (meta && meta.downloadedChunks) || 0;
@@ -148,9 +238,19 @@ function downloadFormatToIDB(videoId, formatId, token) {
       headers['Range'] = 'bytes=' + resumeOffset + '-';
     }
 
-    fetch('/api/stream/' + videoId + '/fmt/' + formatId + '?token=' + token, { headers: headers })
+    return fetch('/api/stream/' + videoId + '/fmt/' + formatId + '?token=' + token + '&offline=1', { headers: headers })
       .then(function (resp) {
-        if (!resp.ok && resp.status !== 206) return;
+        if (!resp.ok && resp.status !== 206) throw new Error('Offline format request failed: HTTP ' + resp.status);
+        // A server/CDN that ignores Range cannot be appended to a partial
+        // format: doing so corrupts all subsequent byte offsets. Restart just
+        // this format from zero while preserving the other format's progress.
+        if (resumeOffset > 0 && resp.status !== 206) {
+          if (resp.body) resp.body.cancel().catch(function () {});
+          return IDBHelpers.deleteFormat(key).then(function () {
+            return downloadFormatToIDB(videoId, formatId, token);
+          });
+        }
+        if (!resp.body) throw new Error('Offline format response had no body');
         var contentType = resp.headers.get('Content-Type') || 'application/octet-stream';
         var contentLength = resp.headers.get('Content-Length');
         var totalSize = resumeOffset + (contentLength ? parseInt(contentLength, 10) : 0);
@@ -161,6 +261,7 @@ function downloadFormatToIDB(videoId, formatId, token) {
         var bufferBytes = 0;
         var chunkIndex = downloadedChunks;
         var chunksSinceMetaUpdate = 0;
+        var receivedBytes = 0;
         var META_INTERVAL = 3; // update meta every 3 chunks
 
         function flushChunk(size) {
@@ -209,6 +310,9 @@ function downloadFormatToIDB(videoId, formatId, token) {
         function pump() {
           return reader.read().then(function (result) {
             if (result.done) {
+              // Content-Length is not guaranteed on streamed/ranged responses.
+              // The observed byte count is authoritative for the final range.
+              totalSize = resumeOffset + receivedBytes;
               // Write remaining buffer as final chunk
               var finalPromise = Promise.resolve();
               if (bufferBytes > 0) {
@@ -230,16 +334,16 @@ function downloadFormatToIDB(videoId, formatId, token) {
 
             buffer.push(result.value);
             bufferBytes += result.value.byteLength;
+            receivedBytes += result.value.byteLength;
 
-            // Flush full chunks
-            var flushPromise = Promise.resolve();
-            while (bufferBytes >= CHUNK_SIZE) {
-              flushPromise = flushPromise.then(function () {
-                return flushChunk(CHUNK_SIZE);
-              });
+            // Drain one full chunk at a time. The old synchronous `while`
+            // appended promises without executing flushChunk(), so bufferBytes
+            // never changed and the tab locked up once it reached 2 MB.
+            function flushFullChunks() {
+              if (bufferBytes < CHUNK_SIZE) return Promise.resolve();
+              return flushChunk(CHUNK_SIZE).then(flushFullChunks);
             }
-
-            return flushPromise.then(pump);
+            return flushFullChunks().then(pump);
           });
         }
 
@@ -258,24 +362,83 @@ function downloadFormatToIDB(videoId, formatId, token) {
           : Promise.resolve();
 
         return initPromise.then(pump);
-      })
-      .catch(function () {});
-  }).catch(function () {});
+      });
+  });
 }
 
 // Prepare a downloaded video for offline playback via the offline-bundle endpoint.
 // Sends bundle to SW for caching (watch page HTML + MPD), downloads format files to IDB.
-function prepareForOffline(videoId) {
-  fetch('/api/stream/' + videoId + '/offline-bundle')
+var _offlinePreparationInflight = {};
+var _offlinePreparationQueue = [];
+var _offlinePreparationActive = 0;
+var OFFLINE_PREPARATION_CONCURRENCY = 1;
+var OFFLINE_FORMAT_CONCURRENCY = 2;
+
+function drainOfflinePreparationQueue() {
+  while (_offlinePreparationActive < OFFLINE_PREPARATION_CONCURRENCY && _offlinePreparationQueue.length) {
+    var job = _offlinePreparationQueue.shift();
+    _offlinePreparationActive++;
+    Promise.resolve().then(job.run).then(job.resolve, job.reject).then(function () {
+      _offlinePreparationActive--;
+      drainOfflinePreparationQueue();
+    });
+  }
+}
+
+function enqueueOfflinePreparation(run) {
+  return new Promise(function (resolve, reject) {
+    _offlinePreparationQueue.push({ run: run, resolve: resolve, reject: reject });
+    drainOfflinePreparationQueue();
+  });
+}
+
+function withOfflinePreparationLock(run) {
+  // Keep separate tabs from copying the same large files at the same time.
+  if (navigator.locks && navigator.locks.request) {
+    return navigator.locks.request('my-youtube-offline-preparation', { mode: 'exclusive' }, run);
+  }
+  return run();
+}
+
+function downloadOfflineFormats(videoId, formats, token) {
+  var nextIndex = 0;
+  var workerCount = Math.min(OFFLINE_FORMAT_CONCURRENCY, formats.length);
+  var workers = [];
+
+  function worker() {
+    var index = nextIndex++;
+    if (index >= formats.length) return Promise.resolve();
+    return downloadFormatToIDB(videoId, formats[index], token).then(worker);
+  }
+
+  for (var i = 0; i < workerCount; i++) workers.push(worker());
+  return Promise.all(workers);
+}
+
+function cacheOfflineBundleInWorker(bundle) {
+  if (!navigator.serviceWorker) return Promise.reject(new Error('Service worker unavailable'));
+  return navigator.serviceWorker.ready.then(function (registration) {
+    var worker = navigator.serviceWorker.controller || registration.active;
+    if (!worker) throw new Error('Service worker is not active');
+    return new Promise(function (resolve, reject) {
+      var channel = new MessageChannel();
+      var timer = setTimeout(function () { reject(new Error('Offline bundle cache timed out')); }, 10000);
+      channel.port1.onmessage = function (event) {
+        clearTimeout(timer);
+        if (event.data && event.data.ok) resolve();
+        else reject(new Error(event.data && event.data.error || 'Offline bundle cache failed'));
+      };
+      worker.postMessage({ type: 'cache-offline-bundle', bundle: bundle }, [channel.port2]);
+    });
+  });
+}
+
+function runOfflinePreparation(videoId) {
+  return fetch('/api/stream/' + videoId + '/offline-bundle')
     .then(function (r) { return r.ok ? r.json() : null; })
     .then(function (bundle) {
-      if (!bundle || !bundle.mpd) return;
-      // Send bundle to SW for caching (watch page HTML + MPD + poster)
-      if (navigator.serviceWorker && navigator.serviceWorker.controller) {
-        navigator.serviceWorker.controller.postMessage({
-          type: 'cache-offline-bundle',
-          bundle: bundle
-        });
+      if (!bundle || !bundle.mpd || !bundle.formats || !bundle.formats.length) {
+        throw new Error('Offline bundle is incomplete');
       }
 
       // Check storage quota before downloading format files
@@ -287,56 +450,114 @@ function prepareForOffline(videoId) {
       }
 
       var startDownloads = function () {
-        if (typeof IDBHelpers === 'undefined') return;
-        for (var i = 0; i < bundle.formats.length; i++) {
-          downloadFormatToIDB(videoId, bundle.formats[i], bundle.streamToken);
-        }
+        if (typeof IDBHelpers === 'undefined') throw new Error('IndexedDB helpers unavailable');
+        return downloadOfflineFormats(videoId, bundle.formats, bundle.streamToken)
+          .then(function () { return cacheOfflineBundleInWorker(bundle); });
       };
 
-      // Warn if insufficient space (1.5x safety margin)
+      // Refuse partial writes under quota pressure. A failed preparation remains
+      // retryable and is never marked as prefetched below.
       if (totalFormatSize > 0 && navigator.storage && navigator.storage.estimate) {
-        navigator.storage.estimate().then(function (est) {
+        return navigator.storage.estimate().then(function (est) {
           var available = (est.quota || 0) - (est.usage || 0);
-          if (available < totalFormatSize * 1.5) {
-            console.warn('[offline] Low storage: need ~' + Math.round(totalFormatSize * 1.5 / 1048576) + 'MB, available ~' + Math.round(available / 1048576) + 'MB');
+          if (est.quota && available < totalFormatSize * 1.2) {
+            throw new Error('Not enough browser storage for this offline video');
           }
-          startDownloads();
-        }).catch(function () { startDownloads(); });
-      } else {
-        startDownloads();
+          return startDownloads();
+        });
       }
-    })
-    .catch(function () {});
+      return startDownloads();
+    });
+}
+
+function prepareForOffline(videoId) {
+  if (_offlinePreparationInflight[videoId]) return _offlinePreparationInflight[videoId];
+  var task = enqueueOfflinePreparation(function () {
+    return withOfflinePreparationLock(function () { return runOfflinePreparation(videoId); });
+  });
+  task = task.then(function (value) {
+    delete _offlinePreparationInflight[videoId];
+    return value;
+  }, function (error) {
+    delete _offlinePreparationInflight[videoId];
+    throw error;
+  });
+  _offlinePreparationInflight[videoId] = task;
+  return task;
+}
+
+function updateOfflinePreparationButton(button, state) {
+  if (!button) return;
+  button.classList.remove('preparing', 'ready', 'error');
+  button.disabled = false;
+  if (state === 'preparing') {
+    button.classList.add('preparing');
+    button.disabled = true;
+    button.textContent = 'Preparing offline...';
+  } else if (state === 'ready') {
+    button.classList.add('ready');
+    button.disabled = true;
+    button.textContent = 'Available offline';
+  } else if (state === 'error') {
+    button.classList.add('error');
+    button.textContent = 'Retry offline copy';
+  } else {
+    button.textContent = 'Make available offline';
+  }
+}
+
+function bindOfflinePreparationButtons(preparedRecords) {
+  var prepared = {};
+  (preparedRecords || []).forEach(function (record) { prepared[record.video_id] = true; });
+  document.querySelectorAll('.offline-prepare').forEach(function (button) {
+    var card = button.closest('.download-card');
+    var videoId = card && card.dataset.videoId;
+    if (!videoId) return;
+    updateOfflinePreparationButton(button, prepared[videoId] ? 'ready' : 'idle');
+    if (button.dataset.offlineBound) return;
+    button.dataset.offlineBound = '1';
+    button.addEventListener('click', function (event) {
+      event.preventDefault();
+      event.stopPropagation();
+      updateOfflinePreparationButton(button, 'preparing');
+      prepareForOffline(videoId).then(function () {
+        if (typeof IDBHelpers === 'undefined' || !IDBHelpers.setDownloadPrepared) {
+          throw new Error('IndexedDB catalog unavailable');
+        }
+        return IDBHelpers.setDownloadPrepared(videoId, true);
+      }).then(function () {
+        updateOfflinePreparationButton(button, 'ready');
+      }).catch(function (error) {
+        updateOfflinePreparationButton(button, 'error');
+        console.warn('[offline] preparation failed for ' + videoId + ':', error && error.message || error);
+      });
+    });
+  });
 }
 
 function cacheDownloadMetadata() {
   if (window.location.pathname !== '/downloads') return;
   var cards = document.querySelectorAll('.download-card');
-  if (!cards.length) return;
-  var downloads = [];
-  var prefetched = {};
-  try { prefetched = JSON.parse(localStorage.getItem('offline_prefetched') || '{}'); } catch (e) {}
-  var newPrefetches = false;
+  if (typeof IDBHelpers === 'undefined' || !IDBHelpers.upsertDownloadRecords) return;
+  var records = [];
   cards.forEach(function (card) {
     var videoId = card.dataset.videoId;
     var titleEl = card.querySelector('.video-title');
     var channelEl = card.querySelector('.video-channel');
-    downloads.push({
+    records.push({
       video_id: videoId,
       title: titleEl ? titleEl.textContent : '',
       channel_title: channelEl ? channelEl.textContent : ''
     });
-    // Prefetch completed downloads for offline playback
-    if (!prefetched[videoId] && card.querySelector('.download-badge.complete')) {
-      prepareForOffline(videoId);
-      prefetched[videoId] = 1;
-      newPrefetches = true;
-    }
   });
-  try {
-    localStorage.setItem('offline_downloads', JSON.stringify(downloads));
-    if (newPrefetches) localStorage.setItem('offline_prefetched', JSON.stringify(prefetched));
-  } catch (e) {}
+  migrateLegacyOfflineCatalog()
+    .then(function () { return IDBHelpers.upsertDownloadRecords(records); })
+    .then(function () { return downloadRecordsForIds(records.map(function (record) { return record.video_id; })); })
+    .then(bindOfflinePreparationButtons)
+    .catch(function (error) {
+      console.warn('[offline] catalog update failed:', error && error.message || error);
+      bindOfflinePreparationButtons([]);
+    });
 }
 
 // Relative time formatting ("8 hours ago", "3 days ago", etc.)
@@ -416,9 +637,17 @@ function loadThumbnails() {
 // Load video durations for all thumbnail badges on the page via SSE
 // Badges with durations already rendered server-side are skipped.
 // Missing durations stream in live as yt-dlp resolves them.
-var _durationSource = null;
+var _durationSources = [];
 var _durationObserver = null;
+function _closeDurationSources() {
+  _durationSources.forEach(function (source) { source.close(); });
+  _durationSources = [];
+}
 function loadDurations(refreshAll) {
+  // A fresh page/runtime owns a fresh set of streams. Individual chunks opened
+  // by this invocation must coexist, otherwise the 51st visible badge cancels
+  // the first 50-item request before it can finish.
+  _closeDurationSources();
   var badges = Array.from(document.querySelectorAll('.video-duration[data-video-id], .video-badge[data-video-id]'));
   var pending = refreshAll
     ? badges.filter(function (b) { return b.dataset.videoId; })
@@ -440,9 +669,10 @@ function loadDurations(refreshAll) {
       var ids = Object.keys(visibleIds);
       if (!ids.length) return;
       visibleIds = {};
-      // Chunk into batches of 50 (server limit)
-      for (var i = 0; i < ids.length; i += 50) {
-        var chunk = ids.slice(i, i + 50);
+      // Keep cosmetic enrichment batches small so abandoned navigations do not
+      // leave a large amount of metadata work behind on the server.
+      for (var i = 0; i < ids.length; i += 20) {
+        var chunk = ids.slice(i, i + 20);
         var batchMap = {};
         chunk.forEach(function (id) { batchMap[id] = allBadgeMap[id] || []; });
         _fetchDurations(chunk, batchMap);
@@ -464,7 +694,7 @@ function loadDurations(refreshAll) {
     return;
   }
 
-  // Fallback: fetch all at once, chunked to 50
+  // Fallback: fetch all at once, chunked to the server enrichment budget
   var ids = [];
   var badgeMap = {};
   pending.forEach(function (badge) {
@@ -472,8 +702,8 @@ function loadDurations(refreshAll) {
     if (!badgeMap[vid]) { badgeMap[vid] = []; ids.push(vid); }
     badgeMap[vid].push(badge);
   });
-  for (var i = 0; i < ids.length; i += 50) {
-    var chunk = ids.slice(i, i + 50);
+  for (var i = 0; i < ids.length; i += 20) {
+    var chunk = ids.slice(i, i + 20);
     var chunkMap = {};
     chunk.forEach(function (id) { chunkMap[id] = badgeMap[id]; });
     _fetchDurations(chunk, chunkMap);
@@ -481,10 +711,12 @@ function loadDurations(refreshAll) {
 }
 
 function _fetchDurations(ids, badgeMap) {
-  // Close any previous SSE connection (e.g. from pjax navigation)
-  if (_durationSource) { _durationSource.close(); _durationSource = null; }
   var es = new EventSource('/api/stream/durations-live?ids=' + ids.join(','));
-  _durationSource = es;
+  _durationSources.push(es);
+  function removeSource() {
+    var index = _durationSources.indexOf(es);
+    if (index !== -1) _durationSources.splice(index, 1);
+  }
   es.onmessage = function (e) {
     try {
       var d = JSON.parse(e.data);
@@ -504,17 +736,18 @@ function _fetchDurations(ids, badgeMap) {
   };
   es.addEventListener('done', function () {
     es.close();
-    if (_durationSource === es) _durationSource = null;
+    removeSource();
   });
   es.onerror = function () {
     es.close();
-    if (_durationSource === es) _durationSource = null;
+    removeSource();
   };
 }
 
 // Load watch progress bars for video thumbnails
-function loadWatchProgress() {
-  var els = document.querySelectorAll('[data-progress-id]');
+function loadWatchProgress(root) {
+  var scope = root && root.querySelectorAll ? root : document;
+  var els = scope.querySelectorAll('[data-progress-id]');
   if (!els.length) return;
   var ids = [];
   var elMap = {};
@@ -670,7 +903,7 @@ function loadWatchProgress() {
     window._captionCues = null;
     window._linkifyDescriptionTimestamps = null;
     if (window._stopStatusPoll) { window._stopStatusPoll(); window._stopStatusPoll = null; }
-    if (_durationSource) { _durationSource.close(); _durationSource = null; }
+    _closeDurationSources();
   }
 
   var navigationTimeoutMs = Number(window.__navigationTimeoutMs) || 12000;
@@ -1559,31 +1792,6 @@ function escapeHtml(str) {
   div.textContent = str;
   return div.innerHTML;
 }
-
-// Hover prefetch: start yt-dlp extraction when user dwells on a video card
-// so playback starts faster if they click. 200ms delay avoids firing during fast scrolls.
-(function () {
-  var prefetched = {};
-  var hoverTimer = null;
-  document.addEventListener('mouseenter', function (e) {
-    if (!e.target.closest) return;
-    var card = e.target.closest('.video-card');
-    if (!card) return;
-    var href = card.getAttribute('href') || (card.querySelector('a') && card.querySelector('a').getAttribute('href'));
-    if (!href) return;
-    var m = href.match(/[?&]v=([A-Za-z0-9_-]+)/);
-    if (!m || prefetched[m[1]]) return;
-    var videoId = m[1];
-    hoverTimer = setTimeout(function () {
-      prefetched[videoId] = true;
-      fetch('/api/stream/' + videoId + '/prefetch').catch(function () {});
-    }, 200);
-    card.addEventListener('mouseleave', function cancel() {
-      clearTimeout(hoverTimer);
-      card.removeEventListener('mouseleave', cancel);
-    }, { once: true });
-  }, true);
-})();
 
 // Load timer — measures time from click/navigation to video ready
 (function () {

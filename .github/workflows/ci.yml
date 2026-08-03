@@ -17,6 +17,35 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run check:player-page
       - run: npm run typecheck
       - run: npm run build
       - run: npm run test:all
+
+  postgres-performance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: myyoutube_performance
+          POSTGRES_USER: myyoutube
+          POSTGRES_PASSWORD: performance-only
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U myyoutube -d myyoutube_performance"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run benchmark:backend:pg
+        env:
+          PERFORMANCE_DATABASE_URL: postgres://myyoutube:performance-only@127.0.0.1:5432/myyoutube_performance

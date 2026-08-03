@@ -1,6 +1,6 @@
     <div class="player-embed" id="player-container">
       <div class="player-loading"><div class="player-spinner"></div></div>
-      <video id="player" class="player-video"
+      <video id="player" class="player-video" preload="auto"
         poster="/api/stream/<%= video.videoId %>/poster" fetchpriority="high"
       ></video>
     </div>

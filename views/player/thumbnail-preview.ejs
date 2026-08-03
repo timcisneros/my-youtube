@@ -26,6 +26,7 @@
         var previewSource = 'none';
         var storyboardLoaded = false;
         var storyboardFailed = false;
+        var storyboardLoadPromise = null;
         var iframeRequestId = 0;
         var iframePreviewPending = false;
         var lastIframePreviewKey = '';
@@ -188,7 +189,8 @@
         });
 
         window._loadStoryboard = function () {
-          return fetch('/api/stream/<%= video.videoId %>/storyboard?token=' + streamToken)
+          if (storyboardLoadPromise) return storyboardLoadPromise;
+          storyboardLoadPromise = fetch('/api/stream/<%= video.videoId %>/storyboard?token=' + streamToken)
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (data) {
               storyboardLoaded = true;
@@ -223,5 +225,16 @@
               setPreviewSource('none');
               return null;
             });
+          return storyboardLoadPromise;
         };
+
+        // Storyboards are supplemental and can require an extra API lookup plus
+        // an image. Start that work on the first real seek-preview interaction
+        // instead of on every successful playback.
+        function requestStoryboardOnInteraction() {
+          if (window._loadStoryboard) window._loadStoryboard();
+        }
+        seekBarContainer.addEventListener('pointerenter', requestStoryboardOnInteraction, { once: true, passive: true });
+        seekBarContainer.addEventListener('focusin', requestStoryboardOnInteraction, { once: true });
+        seekBarContainer.addEventListener('touchstart', requestStoryboardOnInteraction, { once: true, passive: true });
       })();

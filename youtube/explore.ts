@@ -2,11 +2,14 @@
  * Explore page — surfaces unwatched videos from subscribed channels,
  * ranked by a local algorithm using watch history, tags, and recency.
  */
-import db from '../db.js';
 import logger from '../lib/logger.js';
+import { acquireLock, releaseLock, renewLock } from '../lib/cache.js';
 import { cache, EXPLORE_TTL } from './shared.js';
 import { tokenize, computeExploreMetrics, ensureTopicDiversity } from './explore-metrics.js';
 import { performance } from 'node:perf_hooks';
+import { observeMetric, setMetricGauge } from '../lib/performance-metrics.js';
+import { runBoundedSingleFlight, SingleFlightCapacityError } from '../lib/bounded-singleflight.js';
+import type { DatabaseAPI } from '../types.js';
 
 interface ExploreVideo {
   videoId: string;
@@ -22,6 +25,22 @@ interface ExploreResult {
   videos: ExploreVideo[];
   continueWatching: ExploreVideo[]; // deprecated — kept for interface compat
   newVideoIds: string[];
+  boostedChannelIds: string[];
+  queuedVideoIds: string[];
+  mutedChannelIds: string[];
+  ratings: Array<{ video_id: string; rating: number }>;
+  topicFilters: Array<{ topic: string; filter: string }>;
+  durationSeconds: Record<string, number>;
+  liveStatuses: Record<string, string>;
+}
+
+function shuffledCopy<T>(values: readonly T[]) {
+  const shuffled = [...values];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled;
 }
 
 /** Typed configuration for all explore algorithm weights, thresholds, and slot counts. */
@@ -190,6 +209,13 @@ const SESSION_DUR_SCALE = 0.015;
 const TRENDING_WINDOW_HOURS = 24;
 const EMERGING_MAX_SUBS = 2;
 const EMERGING_MAX_IMPRESSIONS = 10;
+const NEW_SUB_RAMP_DAYS = 14;
+const EXPLORE_RICH_SCORE_CANDIDATE_LIMIT = Math.max(100, Number(process.env.EXPLORE_RICH_SCORE_CANDIDATE_LIMIT) || 2000);
+const EXPLORE_RICH_TEXT_CANDIDATE_LIMIT = Math.max(100, Number(process.env.EXPLORE_RICH_TEXT_CANDIDATE_LIMIT) || 800);
+const EXPLORE_PERSONAL_HISTORY_LIMIT = Math.min(1000, Math.max(100,
+  Number(process.env.EXPLORE_PERSONAL_HISTORY_LIMIT) || 500));
+const EXPLORE_COWATCH_MAX_AGE_DAYS = Math.max(7, Number(process.env.EXPLORE_COWATCH_MAX_AGE_DAYS) || 90);
+const EXPLORE_COWATCH_MAX_USERS = Math.max(10, Number(process.env.EXPLORE_COWATCH_MAX_USERS) || 500);
 
 const FAST_KEYWORDS = new Set([
   'news', 'breaking', 'react', 'reaction', 'reacting', 'drama', 'update',
@@ -244,19 +270,69 @@ function getTimeSlot(hour: number): number {
   return Math.floor(hour / 6); // 0=night, 1=morning, 2=afternoon, 3=evening
 }
 
-let lastPruneTime = 0;
+const exploreInflight = new Map<string, Promise<ExploreResult>>();
+const exploreSingleFlight = { name: 'explore_build', maxEntries: 100 } as const;
 
-function getExploreVideos(userId: string, sessionStartMs?: number, config: ExploreConfig = DEFAULT_EXPLORE_CONFIG): ExploreResult {
-  const cached = cache.exploreVideos.get(userId);
+interface ExploreBuildOptions {
+  database?: DatabaseAPI;
+  useCache?: boolean;
+  instrument?: boolean;
+}
+
+let defaultDatabasePromise: Promise<DatabaseAPI> | null = null;
+
+function getDefaultDatabase(): Promise<DatabaseAPI> {
+  if (defaultDatabasePromise === null) {
+    defaultDatabasePromise = import('../db.js').then(module => module.default);
+  }
+  return defaultDatabasePromise;
+}
+
+async function _buildExploreVideos(
+  userId: string,
+  sessionStartMs?: number,
+  config: ExploreConfig = DEFAULT_EXPLORE_CONFIG,
+  options: ExploreBuildOptions = {},
+): Promise<ExploreResult> {
+  const database = options.database || await getDefaultDatabase();
+  const useCache = options.useCache !== false;
+  const instrument = options.instrument !== false;
+  const cached = useCache ? await cache.exploreVideos.getAsync(userId) : null;
   if (cached && Date.now() < cached.expires) return cached.data;
 
   // Performance instrumentation — t0: start after cache miss
   const t0 = performance.now();
+  const now = Date.now();
+  // The same history and candidate text feeds several independent signals.
+  // Tokenizing once keeps those signals identical while avoiding repeated
+  // lowercase/regex/allocation work throughout a cold Explore build.
+  const tokenCache = new Map<string, string[]>();
+  const cachedTokens = (text: string): string[] => {
+    let tokens = tokenCache.get(text);
+    if (!tokens) {
+      tokens = tokenize(text);
+      tokenCache.set(text, tokens);
+    }
+    return tokens;
+  };
+  const deepCutBefore = new Date(now - DEEP_CUT_MIN_AGE_DAYS * 24 * 60 * 60 * 1000).toISOString();
 
   // Session quality feedback loop — adjust diversity/exploration slots if success rate is low
   let DEEP_CUT_SLOTS = config.baseDeepCutSlots;
   let EXPLORATION_SLOTS = config.baseExplorationSlots;
-  const recentSessions = db.getRecentExploreSessions(userId, 10);
+  // Keep one cold build below the default PostgreSQL pool budget. The RSS
+  // snapshot is one aggregate statement; issuing at most three top-level
+  // bootstrap operations leaves capacity for unrelated requests.
+  const [recentSessions, rssSnapshot, watchTimes] = await Promise.all([
+    database.getRecentExploreSessions(userId, 10),
+    database.getExploreRssSnapshotForUser(userId, 6, EXPLORE_RICH_SCORE_CANDIDATE_LIMIT, 365, deepCutBefore),
+    database.getExploreWatchTimes(userId, 365, EXPLORE_PERSONAL_HISTORY_LIMIT),
+  ]);
+  const [backfillSessions, recentSubDates] = await Promise.all([
+    database.getExploreSessionsForBackfill(userId),
+    database.getRecentSubscriptionDates(userId, NEW_SUB_RAMP_DAYS),
+  ]);
+  const rows = rssSnapshot.videos;
   if (recentSessions.length >= 3) {
     const successCount = recentSessions.filter(s => s.best_completion >= 0.3).length;
     const successRate = successCount / recentSessions.length;
@@ -267,79 +343,83 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     }
   }
 
-  // 1. Get all RSS cache entries — build flat video list
-  const rows = db.getAllRssCacheForUser(userId);
+  // 1. The database returns a stratified, eligibility-aware shortlist plus
+  // compact channel cadence summaries. This keeps SQLite event-loop work and
+  // PostgreSQL result transfer bounded before the rich ranker runs.
   const allVideos: ExploreVideo[] = [];
   const videoChannelMap = new Map<string, string>();
   const rssPublishMap = new Map<string, number>();
   const channelVideoCount = new Map<string, number>();
   const videoTitleMap = new Map<string, string>();
-  const channelPublishTimes = new Map<string, number[]>();
-
-  for (const row of rows) {
-    try {
-      const rssData = JSON.parse(row.data);
-      for (const item of rssData.items || []) {
-        const channelId = item.channelId || row.channel_id;
-        allVideos.push({
-          videoId: item.videoId,
-          title: item.title,
-          thumbnail: `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
-          channelTitle: row.sub_title || rssData.channelTitle || '',
-          channelId,
-          publishedAt: item.publishedAt,
-        });
-        videoChannelMap.set(item.videoId, channelId);
-        videoTitleMap.set(item.videoId, item.title || '');
-        if (item.publishedAt) {
-          const pubMs = new Date(item.publishedAt).getTime();
-          if (!isNaN(pubMs)) {
-            rssPublishMap.set(item.videoId, pubMs);
-            let chPubs = channelPublishTimes.get(channelId);
-            if (!chPubs) { chPubs = []; channelPublishTimes.set(channelId, chPubs); }
-            chPubs.push(pubMs);
-          }
-        }
-        channelVideoCount.set(channelId, (channelVideoCount.get(channelId) || 0) + 1);
-      }
-    } catch { /* skip malformed RSS cache entries */ }
-  }
-
-  // Compute per-channel median upload interval from RSS timestamps
+  const subscribedChannels = new Set<string>();
   const channelMedianInterval = new Map<string, number>();
-  for (const [chId, pubs] of channelPublishTimes) {
-    if (pubs.length < 2) continue;
-    pubs.sort((a, b) => b - a); // newest first
-    const intervals: number[] = [];
-    for (let i = 0; i < pubs.length - 1; i++) {
-      intervals.push(pubs[i] - pubs[i + 1]);
-    }
-    intervals.sort((a, b) => a - b);
-    channelMedianInterval.set(chId, intervals[Math.floor(intervals.length / 2)]);
-  }
-
-  // Channel upload dormancy — channels with no upload in 45+ days get decaying affinity
   const channelDormancyMultiplier = new Map<string, number>();
-  for (const [chId, pubs] of channelPublishTimes) {
-    const newestPub = Math.max(...pubs);
-    const daysSinceLastUpload = (Date.now() - newestPub) / (1000 * 60 * 60 * 24);
+
+  for (const stat of rssSnapshot.channelStats) {
+    const channelId = stat.channel_id;
+    subscribedChannels.add(channelId);
+    channelVideoCount.set(channelId, Number(stat.video_count) || 0);
+    const medianInterval = Number(stat.median_interval_ms) || 0;
+    if (medianInterval > 0) channelMedianInterval.set(channelId, medianInterval);
+    const newestPub = new Date(stat.newest_published_at).getTime();
+    if (!Number.isFinite(newestPub)) continue;
+    const daysSinceLastUpload = (now - newestPub) / (1000 * 60 * 60 * 24);
     if (daysSinceLastUpload > config.dormancyThresholdDays) {
       const fraction = Math.min(1, (daysSinceLastUpload - config.dormancyThresholdDays) / 120);
-      channelDormancyMultiplier.set(chId, 1 - fraction * (1 - DORMANCY_FLOOR));
+      channelDormancyMultiplier.set(channelId, 1 - fraction * (1 - DORMANCY_FLOOR));
+    }
+  }
+
+  for (const row of rows) {
+    const channelId = row.channel_id;
+    subscribedChannels.add(channelId);
+    allVideos.push({
+      videoId: row.video_id,
+      title: row.title,
+      thumbnail: `https://i.ytimg.com/vi/${row.video_id}/mqdefault.jpg`,
+      channelTitle: row.sub_title || '',
+      channelId,
+      publishedAt: row.published_at,
+    });
+    videoChannelMap.set(row.video_id, channelId);
+    videoTitleMap.set(row.video_id, row.title || '');
+    if (row.published_at) {
+      const pubMs = new Date(row.published_at).getTime();
+      if (!isNaN(pubMs)) rssPublishMap.set(row.video_id, pubMs);
+    }
+  }
+
+  // Watch rows are enriched with their subscribed RSS channel/title so older
+  // history still contributes to affinity without keeping every feed row.
+  for (const wt of watchTimes) {
+    if (!wt.channel_id) continue;
+    if (!videoChannelMap.has(wt.video_id)) videoChannelMap.set(wt.video_id, wt.channel_id);
+    if (wt.title && !videoTitleMap.has(wt.video_id)) videoTitleMap.set(wt.video_id, wt.title);
+    if (wt.published_at && !rssPublishMap.has(wt.video_id)) {
+      const publishedMs = new Date(wt.published_at).getTime();
+      if (Number.isFinite(publishedMs)) rssPublishMap.set(wt.video_id, publishedMs);
     }
   }
 
   if (allVideos.length === 0) {
-    const empty: ExploreResult = { videos: [], continueWatching: [], newVideoIds: [] };
-    cache.exploreVideos.set(userId, { data: empty, expires: Date.now() + EXPLORE_TTL });
+    const emptySignals = await database.getExploreUserSignals(userId, [], [...subscribedChannels], 90);
+    const empty: ExploreResult = {
+      videos: [], continueWatching: [], newVideoIds: [],
+      boostedChannelIds: emptySignals.boostedChannelIdRows,
+      queuedVideoIds: [],
+      mutedChannelIds: emptySignals.mutedChannelIdRows,
+      ratings: [],
+      topicFilters: emptySignals.topicFilterRows,
+      durationSeconds: {},
+      liveStatuses: {},
+    };
+    if (useCache) cache.exploreVideos.set(userId, { data: empty, expires: Date.now() + EXPLORE_TTL });
     return empty;
   }
 
   // 2. Get all watch times — compute time-decayed channel affinity + abandon counts
-  const watchTimes = db.getAllWatchTimesForUser(userId);
   const watchMap = new Map<string, { last_position: number; duration: number }>();
   const AFFINITY_HALF_LIFE_DAYS = config.affinityHalfLifeDays;
-  const now = Date.now();
   const channelWatches = new Map<string, { decayedCount: number; decayedCompletion: number }>();
   const channelRawCompletion = new Map<string, { count: number; totalCompletion: number }>();
   const channelAbandons = new Map<string, number>();
@@ -399,37 +479,33 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 2a2. Session completion backfill — retroactively update best_completion from watch data
-  const backfillSessions = db.getExploreSessionsForBackfill(userId);
   for (const session of backfillSessions) {
-    const sessionStartMs = new Date(session.started_at).getTime();
-    let maxCompletion = session.best_completion;
-    for (const wt of watchTimes) {
-      const wtMs = new Date(wt.updated_at).getTime();
-      if (wtMs >= sessionStartMs && wt.duration > 0) {
-        const completion = wt.last_position === 0
-          ? 1.0
-          : Math.min(1, wt.last_position / wt.duration);
-        if (completion > maxCompletion) maxCompletion = completion;
-      }
-    }
+    const maxCompletion = Math.max(
+      Number(session.best_completion) || 0,
+      Number(session.observed_best_completion) || 0,
+    );
     if (maxCompletion > session.best_completion) {
-      void Promise.resolve(db.updateExploreSession(userId, session.session_id,
-        session.clicks, session.total_watch_seconds, maxCompletion));
+      void Promise.resolve(database.updateExploreSession(userId, session.session_id,
+        session.clicks, session.total_watch_seconds, maxCompletion)).catch(() => {});
     }
   }
 
   // 2b. New subscription ramp — smooth exponential decay over 14 days
-  const NEW_SUB_RAMP_DAYS = 14;
   const NEW_SUB_DECAY_TAU = 7;
-  const recentSubChannelIds = new Set(db.getRecentSubscriptionChannelIds(userId, NEW_SUB_RAMP_DAYS));
-  const subDates = recentSubChannelIds.size > 0
-    ? db.getSubscriptionDates(userId, [...recentSubChannelIds])
-    : new Map<string, string>();
+  const recentSubChannelIds = new Set(recentSubDates.keys());
+  const subDates = recentSubDates;
 
   // 2c. Session context — find videos related to the 3 most recently watched
   const meaningfulWatches = watchTimes
     .filter(wt => wt.duration > 0 && (wt.last_position === 0 || wt.last_position / wt.duration > 0.3))
     .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
+  const recentWatchIds = meaningfulWatches.slice(0, 50).map(wt => wt.video_id);
+  // Start this bounded lookup while CPU-only affinity work proceeds below.
+  // The result is also included in the scoped signal query so dismissed or
+  // negatively-rated related videos cannot be reintroduced later.
+  const relatedRowsPromise = recentWatchIds.length > 0
+    ? Promise.resolve(database.getRelatedVideosForSources(recentWatchIds))
+    : Promise.resolve([]);
 
   const SESSION_BOOST = config.sessionBoost;
   const SESSION_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
@@ -450,7 +526,9 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   const sessionRelatedIds = new Set<string>();
   const sessionRelatedSourceCount = new Map<string, number>();
   if (recentSessionIds.length > 0) {
-    for (const r of db.getRelatedVideosForSources(recentSessionIds)) {
+    const recentSessionIdSet = new Set(recentSessionIds);
+    for (const r of await relatedRowsPromise) {
+      if (!recentSessionIdSet.has(r.source_video_id)) continue;
       sessionRelatedIds.add(r.video_id);
       sessionRelatedSourceCount.set(
         r.video_id,
@@ -474,14 +552,13 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     const completion = wt.last_position === 0
       ? 1.0
       : Math.min(1, wt.last_position / wt.duration);
-    for (const kw of tokenize(title)) {
+    for (const kw of cachedTokens(title)) {
       momentumKeywordWeights.set(kw, Math.max(momentumKeywordWeights.get(kw) || 0, recencyWeight * completion));
     }
   }
 
   // 2c2. Session-type detection — prefer candidates matching session viewing mode
-  const sessionSeedDurations = recentSessionIds.length > 0 ? db.getDurations(recentSessionIds) : {};
-  const sessionDurValues = Object.values(sessionSeedDurations)
+  const sessionDurValues = sessionSeeds.map(watch => Number(watch.duration) || 0)
     .filter(d => d > config.shortsDurationThreshold)
     .sort((a, b) => a - b);
   const sessionMedianDuration = sessionDurValues.length >= 2
@@ -508,9 +585,8 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 2d. Duration preference — compute median from meaningful watches
-  const top100Watches = meaningfulWatches.slice(0, 100).map(wt => wt.video_id);
-  const watchDurations = top100Watches.length > 0 ? db.getDurations(top100Watches) : {};
-  const durationValues = Object.values(watchDurations)
+  const durationValues = meaningfulWatches.slice(0, 100)
+    .map(watch => Number(watch.duration) || 0)
     .filter(d => d > config.shortsDurationThreshold)
     .sort((a, b) => a - b);
   const medianDuration = durationValues.length > 0
@@ -525,7 +601,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     const completion = wt.last_position === 0
       ? 1.0
       : Math.min(1, wt.last_position / wt.duration);
-    for (const kw of tokenize(title)) {
+    for (const kw of cachedTokens(title)) {
       recentKeywordWeights.set(kw, Math.max(recentKeywordWeights.get(kw) || 0, completion));
     }
   }
@@ -536,7 +612,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     if (wt.duration > config.shortsDurationThreshold && wt.last_position / wt.duration < 0.1) {
       const title = videoTitleMap.get(wt.video_id);
       if (title) {
-        for (const kw of tokenize(title)) {
+        for (const kw of cachedTokens(title)) {
           if (!recentKeywordWeights.has(kw)) negativeKeywords.add(kw);
         }
       }
@@ -554,7 +630,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
       tokens = new Map<string, number>();
       channelTitleTokens.set(chId, tokens);
     }
-    for (const kw of tokenize(title)) {
+    for (const kw of cachedTokens(title)) {
       tokens.set(kw, (tokens.get(kw) || 0) + 1);
     }
   }
@@ -576,7 +652,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     const title = videoTitleMap.get(wt.video_id);
     if (!chId || !title || !channelSeriesTokens.has(chId)) continue;
     const seriesTokens = channelSeriesTokens.get(chId)!;
-    const words = tokenize(title);
+    const words = cachedTokens(title);
     let overlap = 0;
     for (const w of words) if (seriesTokens.has(w)) overlap++;
     if (seriesTokens.size > 0 && overlap / seriesTokens.size >= 0.5) {
@@ -607,7 +683,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     if (!chId) continue;
     let hits = channelCategoryHits.get(chId);
     if (!hits) { hits = [0, 0, 0]; channelCategoryHits.set(chId, hits); }
-    const words = tokenize(title);
+    const words = cachedTokens(title);
     for (const w of words) {
       if (FAST_KEYWORDS.has(w)) hits[0]++;
       if (SLOW_KEYWORDS.has(w)) hits[1]++;
@@ -625,26 +701,55 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     else if (fast >= threshold) channelDecayTier.set(chId, DECAY_TIER_FAST);
   }
 
+  // Independent user-signal reads are issued together. This is effectively
+  // free for SQLite and removes a long chain of network round trips for PG.
+  const relatedRows = await relatedRowsPromise;
+  // Candidate-scoped state is enough for per-video filters. Historical
+  // channel behavior comes from the incremental user/channel rollup, so old
+  // watch IDs no longer inflate every UNION branch in the signal query.
+  const relevantVideoIds = new Set(allVideos.map(video => video.videoId));
+  const relevantChannelIds = new Set(videoChannelMap.values());
+  for (const row of relatedRows) {
+    relevantVideoIds.add(row.video_id);
+    relevantVideoIds.add(row.source_video_id);
+    if (row.channel_id) relevantChannelIds.add(row.channel_id);
+  }
+  const {
+    exploreBounces,
+    exploreEvents,
+    topicFilterRows,
+    taggedVideoIds,
+    dismissedVideoIds,
+    boostedChannelIdRows,
+    mutedChannelIdRows,
+    queuedVideoIdRows,
+    ratingRows,
+    returnChannelCounts,
+    channelBehaviors,
+    eventDurations,
+  } = await database.getExploreUserSignals(
+    userId,
+    [...relevantVideoIds],
+    [...relevantChannelIds],
+    90,
+  );
+
   // 2f. Explore click-through data — completion-weighted, time-decayed.
   //     Each click's value = watch completion ratio (0.0–1.0).
   //     Impressions and clicks decay with a 21-day half-life.
   //     Bounced clicks use reduced weight based on bounce seconds.
   const CTR_HALF_LIFE_DAYS = config.ctrHalfLifeDays;
-  const exploreBounces = db.getExploreBounces(userId);
   const bounceMap = new Map<string, number>();
   const channelBounceCount = new Map<string, number>();
   for (const b of exploreBounces) {
     bounceMap.set(b.video_id, b.bounce_seconds);
     channelBounceCount.set(b.channel_id, (channelBounceCount.get(b.channel_id) || 0) + 1);
   }
-  const exploreEvents = db.getExploreEventsForUser(userId);
   const channelImpressions = new Map<string, number>();
   const channelWeightedClicks = new Map<string, number>();
   const videoImpressionCount = new Map<string, number>();
   const videoClickCompletion = new Map<string, number>();
   const DEFAULT_CLICK_WEIGHT = 0.5;
-  const eventVideoIds = [...new Set(exploreEvents.map(ev => ev.video_id))];
-  const eventDurations = eventVideoIds.length > 0 ? db.getDurations(eventVideoIds) : {};
   for (const ev of exploreEvents) {
     // Skip shorts from CTR data — they inflate impressions and skew channel CTR
     const evDur = eventDurations[ev.video_id];
@@ -683,7 +788,12 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   // 2f1b. Channel-level impression fatigue — aggregate raw impressions and meaningful clicks per channel
   const channelTotalImpressions = new Map<string, number>();
   const channelTotalMeaningfulClicks = new Map<string, number>();
+  for (const [channelId, behavior] of Object.entries(channelBehaviors)) {
+    channelTotalImpressions.set(channelId, behavior.impressions);
+    channelTotalMeaningfulClicks.set(channelId, behavior.clicks);
+  }
   for (const ev of exploreEvents) {
+    if (channelBehaviors[ev.channel_id]) continue;
     if (ev.event_type === 'impression') {
       channelTotalImpressions.set(ev.channel_id, (channelTotalImpressions.get(ev.channel_id) || 0) + ev.impression_count);
     } else if (ev.event_type === 'click') {
@@ -698,7 +808,6 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 2f2. Topic filters — explicit user preferences for cross-channel topics
-  const topicFilterRows = db.getTopicFilters(userId);
   const topicBoosts = new Set<string>();
   const topicSuppressions = new Set<string>();
   for (const tf of topicFilterRows) {
@@ -777,20 +886,19 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 3. Get tagged video IDs — compute per-channel tag count
-  const taggedVideoIds = db.getAllTaggedVideoIds(userId);
   const taggedSet = new Set(taggedVideoIds);
 
   // 3b. Get dismissed video IDs
-  const dismissedSet = new Set(db.getDismissedVideoIds(userId));
+  const dismissedSet = new Set(dismissedVideoIds);
 
   // 3c. Channel boosts — explicit positive signal from user
-  const boostedChannelIds = new Set(db.getBoostedChannelIds(userId));
+  const boostedChannelIds = new Set(boostedChannelIdRows);
 
   // 3c2. Channel mutes — hard exclude
-  const mutedChannelIds = new Set(db.getMutedChannelIds(userId));
+  const mutedChannelIds = new Set(mutedChannelIdRows);
 
   // 3c3. Queue channel affinity boost
-  const queuedVideoIds = new Set(db.getQueuedVideoIds(userId));
+  const queuedVideoIds = new Set(queuedVideoIdRows);
   const queuedChannelCount = new Map<string, number>();
   for (const vid of queuedVideoIds) {
     const chId = videoChannelMap.get(vid);
@@ -798,7 +906,6 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 3c5. Video ratings — explicit per-video thumbs up/down
-  const ratingRows = db.getVideoRatings(userId);
   const personalRatings = new Map<string, number>();
   const ratedUpChannels = new Map<string, number>();
   for (const r of ratingRows) {
@@ -846,26 +953,77 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   });
 
   // Also exclude videos the user tagged or dismissed
-  const scoredVideos = candidates.filter(v => !taggedSet.has(v.videoId) && !dismissedSet.has(v.videoId) && !mutedChannelIds.has(v.channelId));
+  const eligibleVideos = candidates.filter(v => !taggedSet.has(v.videoId) && !dismissedSet.has(v.videoId) && !mutedChannelIds.has(v.channelId));
+  const scoredVideos = eligibleVideos.slice(0, EXPLORE_RICH_SCORE_CANDIDATE_LIMIT);
+
+  // Stage one is deliberately metadata-light: it preserves recent coverage,
+  // then promotes candidates backed by explicit/session/history intent. The
+  // shortlist is built before the database enrichment boundary so large tags
+  // and descriptions are never transferred for the unselected tail.
+  const richTextCandidateIds = new Set<string>();
+  if (scoredVideos.length <= EXPLORE_RICH_TEXT_CANDIDATE_LIMIT) {
+    for (const video of scoredVideos) richTextCandidateIds.add(video.videoId);
+  } else {
+    const seenChannels = new Set<string>();
+    const prelim = scoredVideos.map((video, index) => {
+      const isChannelHead = !seenChannels.has(video.channelId);
+      seenChannels.add(video.channelId);
+      const watchStats = channelWatches.get(video.channelId);
+      const historyIntent = watchStats && totalDecayedWatches > 0
+        ? Math.min(2, watchStats.decayedCount / totalDecayedWatches * 10)
+        : 0;
+      const explicitIntent = (boostedChannelIds.has(video.channelId) ? 5 : 0)
+        + (queuedChannelCount.has(video.channelId) ? 4 : 0)
+        + (ratedUpChannels.has(video.channelId) ? 3 : 0)
+        + (sessionRelatedIds.has(video.videoId) ? 6 : 0);
+      const coverage = isChannelHead ? 0.35 : 0;
+      const freshness = 1 - index / scoredVideos.length;
+      return { videoId: video.videoId, priority: explicitIntent + historyIntent + coverage + freshness };
+    });
+    prelim.sort((a, b) => b.priority - a.priority);
+    for (const entry of prelim.slice(0, EXPLORE_RICH_TEXT_CANDIDATE_LIMIT)) {
+      richTextCandidateIds.add(entry.videoId);
+    }
+  }
 
   // 4b. Batch-fetch candidate durations for duration preference scoring
   const candidateIds = scoredVideos.map(v => v.videoId);
-  const candidateDurations = candidateIds.length > 0 ? db.getDurations(candidateIds) : {};
-
-  // 4c. Batch-fetch candidate live statuses for live boost scoring
-  const candidateLiveStatuses = candidateIds.length > 0 ? db.getLiveStatuses(candidateIds) : {};
-
-  // 4e. Cross-user video popularity — how many users meaningfully watched each candidate
-  const videoPopularity = candidateIds.length > 0 ? db.getVideoPopularity(candidateIds) : {};
-
-  // 4e1b. Trending velocity — recent watchers within last 24 hours
-  const recentVideoPopularity = candidateIds.length > 0 ? db.getRecentVideoPopularity(candidateIds, TRENDING_WINDOW_HOURS) : {};
+  const userWatchedIds = meaningfulWatches.slice(0, 50).map(wt => wt.video_id);
+  const recentWatchVideoIds = meaningfulWatches.slice(0, 20).map(wt => wt.video_id);
+  const metadataQueryIds = [...new Set([...recentWatchVideoIds, ...candidateIds])];
+  const richMetadataQueryIds = [...new Set([...recentWatchVideoIds, ...richTextCandidateIds])];
+  const allCandidateChannelIds = [...new Set(scoredVideos.map(v => v.channelId))];
+  const [candidateSignals, coWatchedRaw] = await Promise.all([
+    database.getExploreCandidateSignals(
+      metadataQueryIds, richMetadataQueryIds, candidateIds, allCandidateChannelIds,
+      userId, TRENDING_WINDOW_HOURS,
+    ),
+    userWatchedIds.length > 0
+      ? database.getCoWatchedVideos(
+        userWatchedIds,
+        userId,
+        100,
+        EXPLORE_COWATCH_MAX_AGE_DAYS,
+        EXPLORE_COWATCH_MAX_USERS,
+      )
+      : [],
+  ]);
+  const {
+    videoMetadata,
+    videoPopularity,
+    recentVideoPopularity,
+    communityRatings,
+    channelSubscriberCounts: allChannelSubCounts,
+    channelImpressionCounts,
+  } = candidateSignals;
+  const {
+    durations: candidateDurations,
+    liveStatuses: candidateLiveStatuses,
+    tags: videoTagsMap,
+    descriptions: videoDescMap,
+  } = videoMetadata;
 
   // 4e2. Collaborative filtering — item-item co-watch from other users
-  const userWatchedIds = meaningfulWatches.slice(0, 50).map(wt => wt.video_id);
-  const coWatchedRaw = userWatchedIds.length > 0
-    ? db.getCoWatchedVideos(userWatchedIds, userId, 100)
-    : [];
   const coWatchScores = new Map<string, number>();
   for (const cw of coWatchedRaw) {
     coWatchScores.set(cw.video_id, cw.score);
@@ -877,9 +1035,6 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   const TOPIC_AFFINITY_CAP = 0.6;
   const channelCoOccurrence = new Map<string, Map<string, number>>();
   const channelRelatedTotal = new Map<string, number>();
-  const recentWatchIds = meaningfulWatches.slice(0, 50).map(wt => wt.video_id);
-  const relatedRows = recentWatchIds.length > 0 ? db.getRelatedVideosForSources(recentWatchIds) : [];
-
   // Build co-occurrence: sourceChannel → relatedChannel → count
   for (const r of relatedRows) {
     const sourceChannel = videoChannelMap.get(r.source_video_id);
@@ -924,21 +1079,11 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     }
   }
 
-  // 4f. Cross-user channel quality — subscriber counts for cold channels
-  const coldChannelIds = [...new Set(scoredVideos.map(v => v.channelId))]
-    .filter(chId => !channelWatches.has(chId) && !recentSubChannelIds.has(chId) && !topicAffinityMap.has(chId));
-  const communitySubCounts = coldChannelIds.length > 0
-    ? db.getChannelSubscriberCounts(coldChannelIds, userId)
-    : {};
+  // 4f. Cross-user channel quality. One all-candidate query also covers the
+  // cold-channel subset, avoiding a duplicate aggregate scan.
+  const communitySubCounts = allChannelSubCounts;
 
   // 4f2. Creator long-tail — identify emerging channels (low subs + low cross-user impressions)
-  const allCandidateChannelIds = [...new Set(scoredVideos.map(v => v.channelId))];
-  const allChannelSubCounts = allCandidateChannelIds.length > 0
-    ? db.getChannelSubscriberCounts(allCandidateChannelIds, userId)
-    : {};
-  const channelImpressionCounts = allCandidateChannelIds.length > 0
-    ? db.getChannelImpressionCounts(allCandidateChannelIds)
-    : {};
   const emergingChannels = new Set<string>();
   for (const chId of allCandidateChannelIds) {
     const subs = allChannelSubCounts[chId] || 0;
@@ -949,10 +1094,6 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 4g. Tag-based topic vectors — fetch tags for recent watches + candidates
-  const recentWatchVideoIds = meaningfulWatches.slice(0, 20).map(wt => wt.video_id);
-  const allTagQueryIds = [...new Set([...recentWatchVideoIds, ...candidateIds])];
-  const videoTagsMap = allTagQueryIds.length > 0 ? db.getVideoTags(allTagQueryIds) : {};
-
   const tagWeights = new Map<string, number>();
   for (const wt of meaningfulWatches.slice(0, 20)) {
     const vtags = videoTagsMap[wt.video_id];
@@ -967,9 +1108,6 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 4h. Description-based topic similarity — tokenized description overlap
-  const allDescQueryIds = [...new Set([...recentWatchVideoIds, ...candidateIds])];
-  const videoDescMap = allDescQueryIds.length > 0 ? db.getVideoDescriptions(allDescQueryIds) : {};
-
   const descKeywordWeights = new Map<string, number>();
   for (const wt of meaningfulWatches.slice(0, 20)) {
     const desc = videoDescMap[wt.video_id];
@@ -977,7 +1115,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     const completion = wt.last_position === 0
       ? 1.0
       : Math.min(1, wt.last_position / wt.duration);
-    for (const kw of tokenize(desc.slice(0, 500))) {
+    for (const kw of cachedTokens(desc.slice(0, 500))) {
       descKeywordWeights.set(kw, Math.max(descKeywordWeights.get(kw) || 0, completion));
     }
   }
@@ -995,11 +1133,6 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   }
 
   // 4h3. Return-visit channel boost — channels user returned to Explore for
-  const returnChannelCounts: Record<string, number> = db.getExploreReturnChannels(userId);
-
-  // 4i. Community video ratings — aggregate from other users
-  const communityRatings = candidateIds.length > 0 ? db.getCommunityRatings(candidateIds, userId) : {};
-
   // Performance instrumentation — t1: all DB queries complete
   const t1 = performance.now();
 
@@ -1120,7 +1253,8 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     }
 
     // Tokenize candidate title — used by keyword similarity, negative keywords, and series detection
-    const candidateWords = tokenize(v.title);
+    const applyRichTextSignals = richTextCandidateIds.has(v.videoId);
+    const candidateWords = applyRichTextSignals ? cachedTokens(v.title) : [];
 
     // Title keyword similarity (weight 0.07) — completion-weighted overlap with recent watches
     let titleSimilarity = 0;
@@ -1267,7 +1401,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
 
     // Tag-based topic similarity (weight 0.06)
     let tagSimilarity = 0;
-    if (tagWeights.size > 0) {
+    if (applyRichTextSignals && tagWeights.size > 0) {
       const candidateTags = videoTagsMap[v.videoId];
       if (candidateTags && candidateTags.length > 0) {
         let weightedOverlap = 0;
@@ -1290,10 +1424,10 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
 
     // Description-based topic similarity (weight 0.04)
     let descSimilarity = 0;
-    if (descKeywordWeights.size > 0) {
+    if (applyRichTextSignals && descKeywordWeights.size > 0) {
       const candidateDesc = videoDescMap[v.videoId];
       if (candidateDesc) {
-        const descWords = tokenize(candidateDesc.slice(0, 500));
+        const descWords = cachedTokens(candidateDesc.slice(0, 500));
         if (descWords.length > 0) {
           let weightedOverlap = 0;
           for (const w of descWords) {
@@ -1313,7 +1447,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     const cr = communityRatings[v.videoId];
     const crWeight = isColdStart ? config.coldStartCommunityRatingWeight : config.communityRatingWeight;
     const crCap = isColdStart ? config.coldStartCommunityRatingCap : config.communityRatingCap;
-    const communityRatingScore = cr
+    const communityRatingScore = cr && cr.up + cr.down > 0
       ? Math.max(-crCap, Math.min(crCap,
           (cr.up - cr.down) / (cr.up + cr.down) * crWeight))
       : 0;
@@ -1431,16 +1565,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
 
   // 5b. Mix in related videos from non-subscribed channels
   const rssVideoIds = new Set(allVideos.map(v => v.videoId));
-  const subscribedChannels = new Set<string>();
-  for (const row of rows) {
-    try {
-      const rssData = JSON.parse(row.data);
-      for (const item of rssData.items || []) {
-        subscribedChannels.add(item.channelId || row.channel_id);
-      }
-    } catch { /* skip */ }
-  }
-  // Also add channels from subscriptions table
+  // Ensure every channel seen in the flattened feed is represented.
   for (const v of allVideos) subscribedChannels.add(v.channelId);
 
   if (recentWatchIds.length > 0) {
@@ -1485,30 +1610,38 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
 
   // 5c. Score decomposition logging — emit aggregate signal averages
   const n = scoredVideos.length || 1;
-  const topScore = scored.length > 0 ? Math.max(...scored.map(s => s.score)) : 0;
-  const bottomScore = scored.length > 0 ? Math.min(...scored.map(s => s.score)) : 0;
-  logger.info('explore-scores', {
-    userId,
-    candidates: scoredVideos.length,
-    meaningful: meaningfulWatches.length,
-    coldStart: isColdStart,
-    avgAffinity: (signalStats.affinity.sum / n).toFixed(4),
-    avgRecency: (signalStats.recency.sum / n).toFixed(4),
-    avgTopicTotal: (signalStats.topicTotal.sum / n).toFixed(4),
-    avgSession: (signalStats.session.sum / n).toFixed(4),
-    avgTrending: (signalStats.trending.sum / n).toFixed(4),
-    topScore: topScore.toFixed(4),
-    bottomScore: bottomScore.toFixed(4),
-  });
+  let topScore = 0;
+  let bottomScore = 0;
+  if (scored.length > 0) {
+    topScore = -Infinity;
+    bottomScore = Infinity;
+    for (const entry of scored) {
+      if (entry.score > topScore) topScore = entry.score;
+      if (entry.score < bottomScore) bottomScore = entry.score;
+    }
+  }
+  if (instrument) {
+    logger.sampledInfo('explore-scores', 'explore-scores', {
+      userId,
+      candidates: scoredVideos.length,
+      meaningful: meaningfulWatches.length,
+      coldStart: isColdStart,
+      avgAffinity: (signalStats.affinity.sum / n).toFixed(4),
+      avgRecency: (signalStats.recency.sum / n).toFixed(4),
+      avgTopicTotal: (signalStats.topicTotal.sum / n).toFixed(4),
+      avgSession: (signalStats.session.sum / n).toFixed(4),
+      avgTrending: (signalStats.trending.sum / n).toFixed(4),
+      topScore: topScore.toFixed(4),
+      bottomScore: bottomScore.toFixed(4),
+    });
+  }
 
   // 5d. Score normalization — min-max normalize all scores to [0, 1]
   if (scored.length > 1) {
-    const minScore = Math.min(...scored.map(s => s.score));
-    const maxScore = Math.max(...scored.map(s => s.score));
-    const range = maxScore - minScore;
+    const range = topScore - bottomScore;
     if (range > 0) {
       for (const entry of scored) {
-        entry.score = (entry.score - minScore) / range;
+        entry.score = (entry.score - bottomScore) / range;
       }
     }
   }
@@ -1541,14 +1674,14 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
 
   // Find subscribed channels not represented in top 54
   const topChannels = new Set(topN.map(e => e.video.channelId));
-  const underrepresented = [...subscribedChannels].filter(ch => !topChannels.has(ch));
+  const underrepresented = new Set([...subscribedChannels].filter(ch => !topChannels.has(ch)));
 
   // Pick random unwatched videos from underrepresented channels
   const topVideoIds = new Set(topN.map(e => e.video.videoId));
   const diversityCandidates = scoredVideos.filter(
-    v => !topVideoIds.has(v.videoId) && underrepresented.includes(v.channelId)
+    v => !topVideoIds.has(v.videoId) && underrepresented.has(v.channelId)
   );
-  const shuffled = [...diversityCandidates].sort(() => Math.random() - 0.5);
+  const shuffled = shuffledCopy(diversityCandidates);
   const pickedChannels = new Set<string>();
   const diversityPicks: typeof topN = [];
   for (const v of shuffled) {
@@ -1588,7 +1721,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     return pubMs !== undefined && (now - pubMs) >= deepCutMinAgeMs;
   });
 
-  const deepCutShuffled = [...deepCutCandidates].sort(() => Math.random() - 0.5);
+  const deepCutShuffled = shuffledCopy(deepCutCandidates);
   const deepCutPicked: typeof topN = [];
   const deepCutChannels = new Set<string>();
   for (const v of deepCutShuffled) {
@@ -1616,7 +1749,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     !mergedIdsAfterDeepCut.has(e.video.videoId) &&
     (mergedChannelCounts.get(e.video.channelId) || 0) < 2
   );
-  const explorationShuffled = [...explorationCandidates].sort(() => Math.random() - 0.5);
+  const explorationShuffled = shuffledCopy(explorationCandidates);
   const explorationPicked: typeof topN = [];
   const explorationChannels = new Set<string>();
   for (const e of explorationShuffled) {
@@ -1637,7 +1770,7 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   const emergingCandidates = scored.filter(e =>
     emergingChannels.has(e.video.channelId) && !mergedIdsAfterExploration.has(e.video.videoId)
   );
-  const emergingShuffled = [...emergingCandidates].sort(() => Math.random() - 0.5);
+  const emergingShuffled = shuffledCopy(emergingCandidates);
   const emergingPicked: typeof merged = [];
   const emergingPickedChannels = new Set<string>();
   for (const e of emergingShuffled) {
@@ -1695,8 +1828,8 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
     }
     const sortedCounts = [...feedChannelCounts.values()].sort((a, b) => b - a);
     const top3Sum = (sortedCounts[0] || 0) + (sortedCounts[1] || 0) + (sortedCounts[2] || 0);
-    if (top3Sum > feedLen * 0.5) {
-      logger.info('explore-concentration-warning', {
+    if (instrument && top3Sum > feedLen * 0.5) {
+      logger.warn('explore-concentration-warning', {
         userId,
         top3ChannelShare: (top3Sum / feedLen).toFixed(2),
         feedSize: feedLen,
@@ -1707,50 +1840,133 @@ function getExploreVideos(userId: string, sessionStartMs?: number, config: Explo
   const finalVideoList = merged.slice(0, TOP_COUNT).map(e => e.video);
 
   // 8h. Explore evaluation metrics — comprehensive quality metrics
-  const metrics = computeExploreMetrics(scored, finalVideoList, signalStats, n);
-  logger.info('explore-eval', {
-    userId,
-    scoreP25: metrics.scoreP25.toFixed(4),
-    scoreP50: metrics.scoreP50.toFixed(4),
-    scoreP75: metrics.scoreP75.toFixed(4),
-    scoreStdDev: metrics.scoreStdDev.toFixed(4),
-    channelHHI: metrics.channelHHI.toFixed(4),
-    uniqueChannelsTop10: metrics.uniqueChannelsTop10,
-    uniqueChannelsTop30: metrics.uniqueChannelsTop30,
-    reasonDistribution: metrics.reasonDistribution,
-    affinityVariance: metrics.affinityVariance.toFixed(6),
-    recencyVariance: metrics.recencyVariance.toFixed(6),
-    topicVariance: metrics.topicVariance.toFixed(6),
-  });
+  if (instrument) {
+    logger.sampledInfoLazy('explore-eval', 'explore-eval', () => {
+      const metrics = computeExploreMetrics(scored, finalVideoList, signalStats, n);
+      return {
+        userId,
+        scoreP25: metrics.scoreP25.toFixed(4),
+        scoreP50: metrics.scoreP50.toFixed(4),
+        scoreP75: metrics.scoreP75.toFixed(4),
+        scoreStdDev: metrics.scoreStdDev.toFixed(4),
+        channelHHI: metrics.channelHHI.toFixed(4),
+        uniqueChannelsTop10: metrics.uniqueChannelsTop10,
+        uniqueChannelsTop30: metrics.uniqueChannelsTop30,
+        reasonDistribution: metrics.reasonDistribution,
+        affinityVariance: metrics.affinityVariance.toFixed(6),
+        recencyVariance: metrics.recencyVariance.toFixed(6),
+        topicVariance: metrics.topicVariance.toFixed(6),
+      };
+    });
+  }
   const newVideoIds = finalVideoList
     .filter(v => !videoImpressionCount.has(v.videoId))
     .map(v => v.videoId);
-  const result: ExploreResult = { videos: finalVideoList, continueWatching: [], newVideoIds };
+  const durationSeconds: Record<string, number> = {};
+  const finalLiveStatuses: Record<string, string> = {};
+  for (const video of finalVideoList) {
+    const duration = candidateDurations[video.videoId];
+    const liveStatus = candidateLiveStatuses[video.videoId];
+    if (duration !== undefined) durationSeconds[video.videoId] = duration;
+    if (liveStatus !== undefined) finalLiveStatuses[video.videoId] = liveStatus;
+  }
+  const result: ExploreResult = {
+    videos: finalVideoList,
+    continueWatching: [],
+    newVideoIds,
+    boostedChannelIds: boostedChannelIdRows,
+    queuedVideoIds: queuedVideoIdRows,
+    mutedChannelIds: mutedChannelIdRows,
+    ratings: ratingRows,
+    topicFilters: topicFilterRows,
+    durationSeconds,
+    liveStatuses: finalLiveStatuses,
+  };
 
   // Performance instrumentation — t3: post-processing complete
   const t3 = performance.now();
-  logger.info('explore-perf', {
-    userId,
-    totalMs: Math.round(t3 - t0),
-    dbMs: Math.round(t1 - t0),
-    scoringMs: Math.round(t2 - t1),
-    postMs: Math.round(t3 - t2),
-    candidates: scoredVideos.length,
-    finalCount: finalVideoList.length,
-  });
+  if (instrument) {
+    logger.sampledInfo('explore-perf', 'explore-perf', {
+      userId,
+      totalMs: Math.round(t3 - t0),
+      dbMs: Math.round(t1 - t0),
+      scoringMs: Math.round(t2 - t1),
+      postMs: Math.round(t3 - t2),
+      candidates: scoredVideos.length,
+      richTextCandidates: richTextCandidateIds.size,
+      tokenCacheEntries: tokenCache.size,
+      finalCount: finalVideoList.length,
+    });
+    observeMetric('explore_build_duration_seconds', (t3 - t0) / 1000);
+    observeMetric('explore_db_duration_seconds', (t1 - t0) / 1000);
+    observeMetric('explore_scoring_duration_seconds', (t2 - t1) / 1000);
+    setMetricGauge('explore_candidates', scoredVideos.length);
+    setMetricGauge('explore_candidates_eligible', eligibleVideos.length);
+    setMetricGauge('explore_rich_text_candidates', richTextCandidateIds.size);
+  }
 
-  cache.exploreVideos.set(userId, { data: result, expires: Date.now() + EXPLORE_TTL });
-
-  // Periodic prune — fire-and-forget, at most once per hour
-  if (now - lastPruneTime > 60 * 60 * 1000) {
-    lastPruneTime = now;
-    void Promise.resolve(db.pruneRelatedVideos(30));
-    void Promise.resolve(db.pruneExploreEvents(90));
-    void Promise.resolve(db.pruneExploreSessions(90));
+  if (useCache) {
+    await cache.exploreVideos.setAsync(userId, { data: result, expires: Date.now() + EXPLORE_TTL });
   }
 
   return result;
 }
 
-export { getExploreVideos, DEFAULT_EXPLORE_CONFIG };
+async function buildExploreVideosForBenchmark(
+  userId: string,
+  database: DatabaseAPI,
+  config: ExploreConfig = DEFAULT_EXPLORE_CONFIG,
+): Promise<ExploreResult> {
+  return _buildExploreVideos(userId, undefined, config, {
+    database,
+    useCache: false,
+    instrument: false,
+  });
+}
+
+async function getExploreVideos(userId: string, sessionStartMs?: number, config: ExploreConfig = DEFAULT_EXPLORE_CONFIG): Promise<ExploreResult> {
+  const cached = await cache.exploreVideos.getAsync(userId);
+  if (cached && Date.now() < cached.expires) return cached.data;
+  const stale = cached?.data;
+  try {
+    return await runBoundedSingleFlight(exploreInflight, userId, async () => {
+    const lockKey = `explore-build:${userId}`;
+    const leaseMs = 30_000;
+    let token = await acquireLock(lockKey, leaseMs);
+    if (!token) {
+      // During a refresh, an expired snapshot is preferable to multiplying the
+      // same database/scoring build across every worker.
+      if (stale) return stale;
+      const waitStartedAt = performance.now();
+      for (let attempt = 0; attempt < 60 && !token; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        const shared = await cache.exploreVideos.getAsync(userId);
+        if (shared && Date.now() < shared.expires) return shared.data;
+        token = await acquireLock(lockKey, leaseMs);
+      }
+      observeMetric('explore_lock_wait_seconds', (performance.now() - waitStartedAt) / 1000);
+      if (!token) throw new Error('explore-build-lock-timeout');
+    }
+    const renewTimer = setInterval(() => {
+      void renewLock(lockKey, token, leaseMs);
+    }, 10_000);
+    renewTimer.unref?.();
+    try {
+      return await _buildExploreVideos(userId, sessionStartMs, config);
+    } finally {
+      clearInterval(renewTimer);
+      await releaseLock(lockKey, token);
+    }
+    }, exploreSingleFlight);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '';
+    if (stale && (
+      error instanceof SingleFlightCapacityError
+      || message.startsWith('sqlite-explore-rss-snapshot-read-')
+    )) return stale;
+    throw error;
+  }
+}
+
+export { getExploreVideos, buildExploreVideosForBenchmark, DEFAULT_EXPLORE_CONFIG };
 export type { ExploreConfig };

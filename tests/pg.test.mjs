@@ -1,6 +1,8 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import db from '../db.js';
+import { getExploreVideos } from '../youtube/explore.js';
+import { cache } from '../youtube/shared.js';
 
 const TEST_USER = 'test-user-pg-' + Date.now();
 const TEST_VIDEO = 'pgTestVid001';
@@ -86,6 +88,46 @@ if (!process.env.DATABASE_URL) {
         const subs = await db.getSubscriptions(TEST_USER);
         const found = subs.find((s) => s.channelId === TEST_CHANNEL);
         assert.strictEqual(found.title, 'Updated PG Title');
+      });
+
+      it('should search literal wildcard characters with window-count pagination', async () => {
+        await db.upsertSubscriptions(TEST_USER, [{
+          channelId: TEST_CHANNEL,
+          title: 'Literal 100%_ Match',
+          thumbnail: '',
+          description: 'Search pagination fixture',
+        }]);
+        const page = await db.searchSubscriptions(TEST_USER, '%_', 20, 0);
+        assert.strictEqual(page.totalResults, 1);
+        assert.deepStrictEqual(page.items.map(item => item.channelId), [TEST_CHANNEL]);
+        assert.ok(page.items.every(item => item._total === undefined));
+
+        const outOfRange = await db.searchSubscriptions(TEST_USER, '%_', 20, 100);
+        assert.strictEqual(outOfRange.totalResults, 1);
+        assert.deepStrictEqual(outOfRange.items, []);
+      });
+
+      it('should cursor-page subscription search without exact counts', async () => {
+        const channelIds = Array.from({ length: 5 }, (_, index) => `UCpgCursor${String(index).padStart(15, '0')}`);
+        try {
+          await db.upsertSubscriptions(TEST_USER, channelIds.map((channelId, index) => ({
+            channelId,
+            title: `PG Cursor ${index}`,
+            thumbnail: '',
+            description: '',
+          })));
+          const first = await db.getSubscriptionsCursorPage(TEST_USER, 'pg cursor', 2, null, 'next');
+          assert.strictEqual(first.items.length, 2);
+          assert.strictEqual(first.hasMore, true);
+          const last = first.items.at(-1);
+          const second = await db.getSubscriptionsCursorPage(TEST_USER, 'PG CURSOR', 2, {
+            title: last.title,
+            channelId: last.channelId,
+          }, 'next');
+          assert.deepStrictEqual(second.items.map(item => item.title), ['PG Cursor 2', 'PG Cursor 3']);
+        } finally {
+          for (const channelId of channelIds) await db.deleteSubscription(TEST_USER, channelId);
+        }
       });
 
       it('should delete a subscription', async () => {
@@ -178,6 +220,75 @@ if (!process.env.DATABASE_URL) {
         const getSubsResult = db.getSubscriptions(TEST_USER);
         assert.ok(getSubsResult instanceof Promise, 'getSubscriptions should return a Promise');
         await getSubsResult;
+      });
+    });
+
+    describe('Async application consumers', () => {
+      it('builds Explore through the PostgreSQL API without sync assumptions', async () => {
+        // Earlier tag API tests intentionally leave this tag in place; Explore
+        // excludes tagged videos, so isolate this application-level scenario.
+        await db.removeTag(TEST_USER, TEST_VIDEO, 'testtag');
+        await db.upsertSubscriptions(TEST_USER, [{
+          channelId: TEST_CHANNEL,
+          title: 'PG Explore Channel',
+          thumbnail: '',
+          description: '',
+        }]);
+        await db.setRssCache(TEST_CHANNEL, {
+          channelTitle: 'PG Explore Channel',
+          items: [{
+            videoId: TEST_VIDEO,
+            title: 'PG Explore Video',
+            publishedAt: new Date().toISOString(),
+            channelId: TEST_CHANNEL,
+          }],
+        }, { etag: '"pg-feed-v1"', lastModified: 'Sun, 02 Aug 2026 00:00:00 GMT' });
+        const cachedFeed = await db.getRssCache(TEST_CHANNEL);
+        assert.deepStrictEqual(cachedFeed.validators, {
+          etag: '"pg-feed-v1"',
+          lastModified: 'Sun, 02 Aug 2026 00:00:00 GMT',
+        });
+        await db.touchRssCache(TEST_CHANNEL, { etag: '"pg-feed-v1"' });
+        const rssRows = await db.getRssVideosForUser(TEST_USER, null, 6, 20);
+        assert.ok(rssRows.some(row => row.video_id === TEST_VIDEO));
+        await db.setDuration(TEST_VIDEO, 654, 'not_live');
+        const todayPage = await db.getRssVideosPageForUser(TEST_USER, null, 6, 20, 0);
+        assert.ok(todayPage.totalResults >= 1);
+        const todayVideo = todayPage.items.find(row => row.video_id === TEST_VIDEO);
+        assert.ok(todayVideo);
+        assert.strictEqual(Number(todayVideo.duration), 654);
+        const bootstrap = await db.getPlayerBootstrapData(TEST_USER, TEST_VIDEO, true);
+        assert.deepStrictEqual(bootstrap.display, {
+          title: 'PG Explore Video',
+          channelTitle: 'PG Explore Channel',
+          channelId: TEST_CHANNEL,
+        });
+        assert.deepStrictEqual(bootstrap.tags, []);
+        assert.strictEqual(bootstrap.rating, 0);
+        assert.strictEqual(bootstrap.liveStatus, 'not_live');
+        const todayCursorPage = await db.getRssVideosCursorPageForUser(
+          TEST_USER, null, 6, 20, null, 'older',
+        );
+        assert.ok(todayCursorPage.items.some(row => row.video_id === TEST_VIDEO));
+        const storageBefore = await db.getDownloadStorageUsage();
+        const storageBytes = await db.adjustDownloadStorageBytes(17);
+        assert.strictEqual(storageBytes, storageBefore.storedBytes + 17);
+        const storageAdjusted = await db.getDownloadStorageUsage();
+        assert.strictEqual(
+          await db.reconcileDownloadStorageBytes(storageBefore.storedBytes, storageAdjusted.version),
+          true,
+        );
+        cache.exploreVideos.delete(TEST_USER);
+        const result = await getExploreVideos(TEST_USER);
+        assert.ok(result.videos.some(video => video.videoId === TEST_VIDEO));
+        const lease = `pg-maintenance-${Date.now()}`;
+        assert.strictEqual(await db.claimMaintenanceLease(lease, 60), true);
+        assert.strictEqual(await db.claimMaintenanceLease(lease, 60), false);
+        const migration = 'pg-integration-test-marker-v1';
+        await db.recordSchemaMigration(migration);
+        assert.strictEqual(await db.hasSchemaMigration(migration), true);
+        await db.recordSchemaMigration(migration);
+        assert.strictEqual(await db.hasSchemaMigration(migration), true);
       });
     });
   });

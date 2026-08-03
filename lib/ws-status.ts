@@ -4,9 +4,14 @@
  *
  * Attach to HTTP server: import('./lib/ws-status.js').then(m => m.attach(server))
  */
+import { rawRequestClientIp } from './client-ip.js';
+import { acquireStatusConnection } from './status-connection-limiter.js';
+
 let wss = null;
 const listeners = new Map(); // videoId → Set<ws>
 let getCurrentStatus: ((videoId: string) => { step?: string } | null | undefined) | null = null;
+const STATUS_CONNECTION_MAX_AGE_MS = Math.max(10_000, Number(process.env.STATUS_CONNECTION_MAX_AGE_MS) || 45_000);
+const STATUS_WS_MAX_BUFFERED_BYTES = Math.max(16 * 1024, Number(process.env.STATUS_WS_MAX_BUFFERED_BYTES) || 256 * 1024);
 
 async function attach(server) {
   try {
@@ -20,26 +25,37 @@ async function attach(server) {
         ws.close(1008, 'Invalid video ID');
         return;
       }
+      const releaseConnection = acquireStatusConnection(rawRequestClientIp(req), 'websocket');
+      if (!releaseConnection) {
+        ws.close(1013, 'Status connection capacity reached');
+        return;
+      }
 
       if (!listeners.has(videoId)) listeners.set(videoId, new Set());
       listeners.get(videoId).add(ws);
+      const maxAgeTimer = setTimeout(() => {
+        try { ws.terminate(); } catch { ws.close(1001, 'Status connection expired'); }
+      }, STATUS_CONNECTION_MAX_AGE_MS);
+      maxAgeTimer.unref?.();
       const current = getCurrentStatus ? getCurrentStatus(videoId) : null;
       if (current) {
         try { ws.send(JSON.stringify({ step: current.step })); } catch {}
       }
 
-      ws.on('close', () => {
+      let cleanedUp = false;
+      const cleanupConnection = () => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearTimeout(maxAgeTimer);
+        releaseConnection();
         const set = listeners.get(videoId);
         if (set) {
           set.delete(ws);
           if (set.size === 0) listeners.delete(videoId);
         }
-      });
-
-      ws.on('error', () => {
-        const set = listeners.get(videoId);
-        if (set) set.delete(ws);
-      });
+      };
+      ws.on('close', cleanupConnection);
+      ws.on('error', cleanupConnection);
     });
 
     console.log('[ws-status] WebSocket server attached at /ws/status');
@@ -56,7 +72,10 @@ function notify(videoId, data) {
   const msg = JSON.stringify(data);
   for (const ws of set) {
     try {
-      if (ws.readyState === 1) ws.send(msg); // 1 = OPEN
+      if (ws.bufferedAmount > STATUS_WS_MAX_BUFFERED_BYTES) {
+        ws.close(1013, 'Status client is too slow');
+        set.delete(ws);
+      } else if (ws.readyState === 1) ws.send(msg); // 1 = OPEN
     } catch {
       set.delete(ws);
     }

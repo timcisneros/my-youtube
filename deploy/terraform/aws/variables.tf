@@ -55,24 +55,11 @@ variable "db_instance_type" {
   # t3.medium: 2 vCPU, 4GB RAM — ~$30/month
 }
 
-variable "storage_instance_type" {
-  description = "EC2 instance type for MinIO storage"
-  type        = string
-  default     = "t3.medium"
-  # t3.medium: 2 vCPU, 4GB RAM — ~$30/month
-}
-
 # Volume sizes (GB)
 variable "db_volume_size" {
   description = "Size of the database EBS volume in GB"
   type        = number
   default     = 50
-}
-
-variable "storage_volume_size" {
-  description = "Size of the MinIO EBS volume in GB"
-  type        = number
-  default     = 200
 }
 
 # Credentials
@@ -84,19 +71,6 @@ variable "postgres_password" {
 
 variable "redis_password" {
   description = "Redis requirepass password"
-  type        = string
-  sensitive   = true
-}
-
-variable "s3_access_key" {
-  description = "MinIO root access key"
-  type        = string
-  sensitive   = true
-  default     = "myyoutube-admin"
-}
-
-variable "s3_secret_key" {
-  description = "MinIO root secret key"
   type        = string
   sensitive   = true
 }

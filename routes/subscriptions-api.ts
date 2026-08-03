@@ -5,20 +5,26 @@
 import { Router } from 'express';
 import express from 'express';
 import { spawn, execFile } from 'child_process';
-import fs from 'fs';
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'fs';
 import path from 'path';
 import db from '../db.js';
 import { YTDLP_BIN, availableBrowsers } from '../ytdlp.js';
 import { invalidateSubCaches } from '../youtube/index.js';
 import type { Subscription } from '../types.js';
+import { withYtdlpSlot } from './stream/shared.js';
+import { acquireLock, releaseLock, renewLock } from '../lib/cache.js';
+import { parseSubscriptionHtmlOffThread, parseSubscriptionList } from '../lib/subscription-parser.js';
+import { projectPath } from '../lib/project-paths.js';
 
 const router = Router();
-const dataDir = path.join(import.meta.dirname, '..', 'data');
+const dataDir = projectPath('data');
+const browserFetchInflight = new Set<string>();
 
 // Export browser cookies to a temp file via yt-dlp, return path
 function exportCookies(browser: string): Promise<string> {
   return new Promise((resolve, reject) => {
-    const cookiePath = path.join(dataDir, 'cookies-' + Date.now() + '.txt');
+    const cookiePath = path.join(dataDir, `cookies-${randomUUID()}.txt`);
     const child = spawn(YTDLP_BIN, [
       '--cookies-from-browser', browser,
       '--cookies', cookiePath,
@@ -30,6 +36,7 @@ function exportCookies(browser: string): Promise<string> {
       if (done) return;
       done = true;
       child.kill('SIGKILL');
+      void fs.rm(cookiePath, { force: true }).catch(() => {});
       reject(new Error('Cookie export timed out. Browser keyring may be inaccessible.'));
     }, 15000);
     child.stderr.on('data', (d) => { stderr += d; });
@@ -37,109 +44,21 @@ function exportCookies(browser: string): Promise<string> {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      void fs.rm(cookiePath, { force: true }).catch(() => {});
       reject(new Error('Failed to run yt-dlp: ' + err.message));
     });
     child.on('close', (_code) => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (!fs.existsSync(cookiePath)) {
+      void fs.access(cookiePath).then(() => {
+        resolve(cookiePath);
+      }, () => {
         const msg = stderr.trim().split('\n').pop() || 'Cookie export failed';
-        return reject(new Error(msg));
-      }
-      resolve(cookiePath);
+        reject(new Error(msg));
+      });
     });
   });
-}
-
-function textFromRuns(value: unknown): string {
-  if (!value || typeof value !== 'object') return '';
-  const obj = value as Record<string, unknown>;
-  if (typeof obj.simpleText === 'string') return obj.simpleText;
-  const runs = Array.isArray(obj.runs) ? obj.runs : [];
-  return runs.map((run) => {
-    if (!run || typeof run !== 'object') return '';
-    const text = (run as Record<string, unknown>).text;
-    return typeof text === 'string' ? text : '';
-  }).join('');
-}
-
-function thumbnailUrl(value: unknown): string {
-  if (!value || typeof value !== 'object') return '';
-  const thumbnails = (value as Record<string, unknown>).thumbnails;
-  if (!Array.isArray(thumbnails) || thumbnails.length === 0) return '';
-  const last = thumbnails[thumbnails.length - 1];
-  if (!last || typeof last !== 'object') return '';
-  const url = (last as Record<string, unknown>).url;
-  return typeof url === 'string' ? url : '';
-}
-
-function extractInitialData(html: string): unknown {
-  const markerIndex = html.indexOf('ytInitialData');
-  if (markerIndex === -1) {
-    if (/ServiceLogin|accounts\.google\.com|signin/i.test(html)) {
-      throw new Error('YouTube returned a sign-in page. Browser cookies were exported, but not accepted for youtube.com.');
-    }
-    throw new Error('Could not find subscription data in YouTube response.');
-  }
-  const start = html.indexOf('{', markerIndex);
-  if (start === -1) throw new Error('Could not find subscription data object in YouTube response.');
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < html.length; i++) {
-    const ch = html[i];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return JSON.parse(html.slice(start, i + 1));
-    }
-  }
-  throw new Error('Subscription data object was incomplete.');
-}
-
-function subscriptionFromRenderer(renderer: Record<string, unknown>): Subscription | null {
-  const channelId = renderer.channelId;
-  if (typeof channelId !== 'string' || !channelId.startsWith('UC')) return null;
-  return {
-    channelId,
-    title: textFromRuns(renderer.title) || textFromRuns(renderer.shortBylineText),
-    thumbnail: thumbnailUrl(renderer.thumbnail),
-    description: textFromRuns(renderer.descriptionSnippet),
-  };
-}
-
-function parseSubscriptionList(data: unknown): Subscription[] {
-  const byId = new Map<string, Subscription>();
-  const visit = (node: unknown) => {
-    if (!node || typeof node !== 'object') return;
-    if (Array.isArray(node)) {
-      for (const item of node) visit(item);
-      return;
-    }
-    const obj = node as Record<string, unknown>;
-    for (const key of ['channelRenderer', 'gridChannelRenderer', 'compactChannelRenderer']) {
-      const renderer = obj[key];
-      if (renderer && typeof renderer === 'object') {
-        const sub = subscriptionFromRenderer(renderer as Record<string, unknown>);
-        if (sub && !byId.has(sub.channelId)) byId.set(sub.channelId, sub);
-      }
-    }
-    for (const value of Object.values(obj)) visit(value);
-  };
-  visit(data);
-  return [...byId.values()];
 }
 
 // Fetch youtube.com/feed/channels via curl with cookie jar, parse channels from ytInitialData
@@ -153,13 +72,9 @@ function fetchChannelList(cookiePath: string): Promise<Subscription[]> {
       'https://www.youtube.com/feed/channels'
     ], { timeout: 15000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
       if (err) return reject(new Error('Failed to fetch YouTube: ' + err.message));
-      try {
-        const yt = extractInitialData(stdout);
-        const subs = parseSubscriptionList(yt);
-        resolve(subs);
-      } catch (e) {
+      parseSubscriptionHtmlOffThread(stdout).then(resolve, (e) => {
         reject(e instanceof Error ? e : new Error('Failed to parse YouTube response'));
-      }
+      });
     });
   });
 }
@@ -178,7 +93,7 @@ function requestBrowserHints(req: express.Request): string {
   ].filter(Boolean).join(' ').toLowerCase();
 }
 
-function rankBrowserSpecsForRequest(req: express.Request, specs = availableBrowsers()): string[] {
+function rankBrowserSpecsForRequest(req: express.Request, specs: string[] = []): string[] {
   const hints = requestBrowserHints(req);
   const desired: string[] = [];
   if (hints.includes('firefox')) desired.push('firefox');
@@ -205,14 +120,17 @@ async function fetchSubscriptionsFromBrowserSpecs(specs: string[]) {
   for (const browser of specs) {
     let cookiePath: string | undefined;
     try {
-      cookiePath = await exportCookies(browser);
-      const subs = await fetchChannelList(cookiePath);
+      const result = await withYtdlpSlot(async () => {
+        cookiePath = await exportCookies(browser);
+        return fetchChannelList(cookiePath);
+      }, { priority: 'background' });
+      const subs = result;
       if (subs.length > 0) return { browser, subs };
       lastError = new Error(`${browser} did not contain subscriptions`);
     } catch (e: unknown) {
       lastError = e instanceof Error ? e : new Error(String(e));
     } finally {
-      if (cookiePath) try { fs.unlinkSync(cookiePath); } catch {}
+      if (cookiePath) await fs.rm(cookiePath, { force: true }).catch(() => {});
     }
   }
   throw lastError || new Error('No browser cookies found');
@@ -221,7 +139,7 @@ async function fetchSubscriptionsFromBrowserSpecs(specs: string[]) {
 // Fetch subscriptions from browser cookies
 router.post('/fetch', async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
-  const available = availableBrowsers();
+  const available = await availableBrowsers();
   const requestedBrowser = typeof req.body?.browser === 'string' ? req.body.browser : '';
   let candidates: string[];
   if (requestedBrowser) {
@@ -237,15 +155,27 @@ router.post('/fetch', async (req, res) => {
     if (candidates.length === 0) return res.status(400).json({ error: 'No browser cookies found' });
   }
 
+  const fetchKey = String(req.session.userId);
+  if (browserFetchInflight.has(fetchKey)) return res.status(409).json({ error: 'Subscription import already in progress' });
+  const lockKey = `subscription-browser-fetch:${fetchKey}`;
+  const lockToken = await acquireLock(lockKey, 45_000);
+  if (!lockToken) return res.status(409).json({ error: 'Subscription import already in progress' });
+  browserFetchInflight.add(fetchKey);
+  const renewTimer = setInterval(() => { void renewLock(lockKey, lockToken, 45_000); }, 15_000);
+  renewTimer.unref?.();
   try {
     const { browser, subs } = await fetchSubscriptionsFromBrowserSpecs(candidates);
     if (subs.length === 0) return res.json({ imported: 0 });
-    db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
-    invalidateSubCaches(req.session.userId);
+    await db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
+    await invalidateSubCaches(req.session.userId);
     res.json({ imported: subs.length, browser });
   } catch (e: unknown) {
     console.error('Subscription fetch error:', (e as Error).message);
     res.status(500).json({ error: (e as Error).message });
+  } finally {
+    clearInterval(renewTimer);
+    browserFetchInflight.delete(fetchKey);
+    await releaseLock(lockKey, lockToken);
   }
 });
 
@@ -256,24 +186,24 @@ router.post('/fetch-cookies', express.text({ type: '*/*', limit: '1mb' }), async
   if (!text || typeof text !== 'string' || !text.includes('youtube.com')) {
     return res.status(400).json({ error: 'Invalid cookies.txt file — must contain youtube.com cookies' });
   }
-  const cookiePath = path.join(dataDir, 'cookies-upload-' + Date.now() + '.txt');
-  fs.writeFileSync(cookiePath, text);
+  const cookiePath = path.join(dataDir, `cookies-upload-${randomUUID()}.txt`);
+  await fs.writeFile(cookiePath, text);
   try {
-    const subs = await fetchChannelList(cookiePath);
+    const subs = await withYtdlpSlot(() => fetchChannelList(cookiePath), { priority: 'background' });
     if (subs.length === 0) return res.json({ imported: 0 });
-    db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
-    invalidateSubCaches(req.session.userId);
+    await db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
+    await invalidateSubCaches(req.session.userId);
     res.json({ imported: subs.length });
   } catch (e: unknown) {
     console.error('Subscription fetch error:', (e as Error).message);
     res.status(500).json({ error: (e as Error).message });
   } finally {
-    try { fs.unlinkSync(cookiePath); } catch {}
+    await fs.rm(cookiePath, { force: true }).catch(() => {});
   }
 });
 
 // Import subscriptions from Google Takeout CSV or OPML
-router.post('/import', express.text({ type: '*/*', limit: '2mb' }), (req, res) => {
+router.post('/import', express.text({ type: '*/*', limit: '2mb' }), async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
   const text = req.body;
   if (!text || typeof text !== 'string') return res.status(400).json({ error: 'No data' });
@@ -316,18 +246,18 @@ router.post('/import', express.text({ type: '*/*', limit: '2mb' }), (req, res) =
 
   if (subs.length === 0) return res.status(400).json({ error: 'No valid subscriptions found in file' });
 
-  db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
-  invalidateSubCaches(req.session.userId);
+  await db.upsertSubscriptions(req.session.userId, subs, { fullSync: true });
+  await invalidateSubCaches(req.session.userId);
   res.json({ imported: subs.length });
 });
 
 // Unsubscribe from a channel
-router.delete('/:channelId', (req, res) => {
+router.delete('/:channelId', async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
   const { channelId } = req.params;
   if (!/^UC[A-Za-z0-9_-]{22}$/.test(channelId)) return res.status(400).json({ error: 'Invalid channel ID' });
-  db.deleteSubscription(req.session.userId, channelId);
-  invalidateSubCaches(req.session.userId);
+  await db.deleteSubscription(req.session.userId, channelId);
+  await invalidateSubCaches(req.session.userId);
   res.status(204).end();
 });
 

@@ -1,9 +1,11 @@
 import { Router, Request, Response } from 'express';
 import { ensureAuth, createStreamToken } from '../auth.js';
-import { getVideoDetails, enrichFromNext, getPlaylistDetails, sanitizePlaylistId } from '../youtube/index.js';
-import { buildMPD, bgDownloads } from './stream/index.js';
+import { getCachedVideoDetails, getVideoDetails, enrichFromNext, getPlaylistDetails, sanitizePlaylistId } from '../youtube/index.js';
+import { buildMPD } from './stream/index.js';
 import { mpdCache } from './stream/shared.js';
 import db from '../db.js';
+import { listDownloadedFormats } from '../lib/download-files.js';
+import { runtimeAssetUrl } from '../lib/runtime-assets.js';
 
 const router = Router();
 
@@ -19,17 +21,26 @@ function isLocalPlaylistId(playlistId: string) {
   return /^local_[A-Za-z0-9_-]{8,64}$/.test(playlistId);
 }
 
-async function getLocalPlaylistDetails(userId: string, playlistId: string) {
+async function getLocalPlaylistDetails(userId: string, playlistId: string, requestedIndex = 1) {
   const saved = await Promise.resolve(db.getSavedPlaylist(userId, playlistId));
   if (!saved || saved.playlist_type !== 'local') return null;
-  const rows = await Promise.resolve(db.getLocalPlaylistItems(userId, playlistId));
-  const items = rows.map((row, idx) => ({
+  const limit = 50;
+  const startPosition = Math.max(0, requestedIndex - Math.floor(limit / 2) - 1);
+  const page = await Promise.resolve(db.getLocalPlaylistItemsCursorPage(
+    userId,
+    playlistId,
+    limit,
+    { position: startPosition, createdAt: '9999-12-31T23:59:59.999Z', videoId: 'zzzzzzzzzzzzzzzz' },
+    'next',
+  ));
+  const rows = page.items;
+  const items = rows.map(row => ({
     videoId: row.video_id,
     title: row.title || row.video_id,
     channelTitle: row.channel_title || '',
     channelId: row.channel_id || '',
     lengthText: '',
-    index: idx + 1,
+    index: row.position,
     available: true,
     unavailableReason: '',
   }));
@@ -38,7 +49,7 @@ async function getLocalPlaylistDetails(userId: string, playlistId: string) {
     title: saved.title,
     channelTitle: '',
     channelId: '',
-    itemCountText: `${items.length} ${items.length === 1 ? 'video' : 'videos'}`,
+    itemCountText: saved.item_count_text || '0 videos',
     thumbnailVideoId: items[0]?.videoId || '',
     items,
     nextPageToken: null,
@@ -51,13 +62,13 @@ type PlaylistSource =
 
 function buildPlaylistContext(fetchedPlaylist: PlaylistSource | null, videoId: string, requestedPlaylistIndex: number) {
   if (!fetchedPlaylist || fetchedPlaylist.items.length === 0) return null;
-  const foundIndex = fetchedPlaylist.items.findIndex((item) => item.videoId === videoId);
-  const currentIndex = foundIndex >= 0 ? foundIndex + 1 : requestedPlaylistIndex;
+  const foundArrayIndex = fetchedPlaylist.items.findIndex((item) => item.videoId === videoId);
+  const currentIndex = foundArrayIndex >= 0 ? fetchedPlaylist.items[foundArrayIndex].index : requestedPlaylistIndex;
   const prev = currentIndex > 1
-    ? fetchedPlaylist.items.slice(0, currentIndex - 1).reverse().find((item) => item.available && item.videoId) || null
+    ? fetchedPlaylist.items.slice(0, foundArrayIndex >= 0 ? foundArrayIndex : 0).reverse().find((item) => item.available && item.videoId) || null
     : null;
-  const next = currentIndex > 0
-    ? fetchedPlaylist.items.slice(currentIndex).find((item) => item.available && item.videoId) || null
+  const next = currentIndex > 0 && foundArrayIndex >= 0
+    ? fetchedPlaylist.items.slice(foundArrayIndex + 1).find((item) => item.available && item.videoId) || null
     : null;
   const buildPlaylistWatchUrl = (item: { videoId: string; index: number } | null) => item
     ? `/watch?v=${item.videoId}&list=${encodeURIComponent(fetchedPlaylist.playlistId)}&index=${item.index}`
@@ -104,33 +115,55 @@ router.get('/', ensureAuth, async (req, res) => {
   // for the browser to receive HTML and fire a prefetch request
   buildMPD(videoId).catch(() => {});
 
-  const videoP = getVideoDetails(videoId).catch(() => null);
+  const videoP = getCachedVideoDetails(videoId).catch(() => null);
+  const bootstrapP = Promise.resolve(
+    db.getPlayerBootstrapData(req.session.userId, videoId, startTime === 0),
+  );
+  const downloadedFormatsP = listDownloadedFormats(videoId);
   // Local playlists are an inexpensive DB lookup. Remote YouTube playlist
   // context starts in the browser only after the playback provider is ready,
   // so it cannot consume an extraction slot or bandwidth during startup.
   const playlistP = playlistId && isLocalPlaylistId(playlistId)
-    ? getLocalPlaylistDetails(req.session.userId, playlistId).catch(() => null)
+    ? getLocalPlaylistDetails(req.session.userId, playlistId, requestedPlaylistIndex).catch(() => null)
     : Promise.resolve(null);
 
-  // Flush shell with the native player + preload/prefetch in head. The browser
-  // starts loading these resources immediately while getVideoDetails runs.
+  // Flush shell with the native player + preload in head. The browser
+  // starts loading these resources immediately while cache/DB metadata resolves.
   // Shaka remains a lazy emergency fallback only.
   await res.flushShell({
     activeTab: null,
     mainClass: 'player-page',
     extraHead: `<link rel="preload" href="/api/stream/${videoId}/poster" as="image" fetchpriority="high">\n` +
       (inlineMPD ? '' : `  <link rel="preload" href="/api/stream/${videoId}/dash.mpd?token=${streamToken}" as="fetch" crossorigin fetchpriority="high">\n`) +
-      `  <script src="/native-player-engine.js?v=17" defer><\/script>\n` +
-      `  <script>fetch('/api/stream/${videoId}/prefetch')<\/script>`
+      `  <script src="${runtimeAssetUrl('native-player-engine.min.js')}" defer fetchpriority="high"><\/script>\n` +
+      `  <script src="${runtimeAssetUrl('player-telemetry.min.js')}" defer fetchpriority="low"><\/script>\n` +
+      `  <script src="${runtimeAssetUrl('player-page.min.js')}" defer fetchpriority="low"><\/script>`
   });
 
   try {
-    let video = await resolveThisTurn(videoP);
-    const fetchedPlaylist = await resolveThisTurn(playlistP);
+    const [cachedVideo, fetchedPlaylist, bootstrap, downloadedFormats] = await Promise.all([
+      resolveThisTurn(videoP),
+      resolveThisTurn(playlistP),
+      bootstrapP,
+      downloadedFormatsP,
+    ]);
+    let video = cachedVideo;
     if (!video || !video.title) {
-      const dl = db.getDownload(videoId);
-      if (dl) {
-        video = { videoId, title: dl.title, channelTitle: dl.channel_title, description: '', channelId: '', publishedAt: '', viewCount: null, likeCount: null };
+      if (bootstrap.display) {
+        video = {
+          videoId,
+          title: bootstrap.display.title,
+          channelTitle: bootstrap.display.channelTitle,
+          channelId: bootstrap.display.channelId,
+          description: '', publishedAt: '', viewCount: null, likeCount: null,
+        };
+      } else if (bootstrap.download) {
+        video = {
+          videoId,
+          title: bootstrap.download.title,
+          channelTitle: bootstrap.download.channel_title,
+          description: '', channelId: '', publishedAt: '', viewCount: null, likeCount: null,
+        };
       }
     }
     if (!video) {
@@ -143,16 +176,16 @@ router.get('/', ensureAuth, async (req, res) => {
         publishedAt: '',
         viewCount: null,
         likeCount: null,
-        liveStatus: db.getLiveStatus(videoId) || undefined,
+        liveStatus: bootstrap.liveStatus || undefined,
       };
     } else if (!video.title) {
       video = { ...video, title: videoId };
+    } else if (!video.liveStatus && bootstrap.liveStatus) {
+      video = { ...video, liveStatus: bootstrap.liveStatus };
     }
-    const tags = db.getTags(req.session.userId, videoId);
-    const currentRating = db.getVideoRating(req.session.userId, videoId);
     // Pass saved watch position so the player can seek before buffering starts
     const savedPosition = startTime === 0
-      ? (db.getWatchTime(req.session.userId, videoId)?.last_position || 0)
+      ? (bootstrap.watchTime?.last_position || 0)
       : 0;
     // Check if this video has a completed local download — pass the height
     // so the player can pin ABR and serve from disk instead of YouTube.
@@ -167,20 +200,17 @@ router.get('/', ensureAuth, async (req, res) => {
       '399': 1080, '400': 1440, '401': 2160, '571': 4320,
     };
     let downloadedHeight = 0;
-    for (const [key, entry] of bgDownloads) {
-      if (key.startsWith(videoId + ':') && entry.done) {
-        const itag = key.split(':')[1];
-        const h = itagHeight[itag] || 0;
-        if (h > downloadedHeight) downloadedHeight = h;
-      }
+    for (const entry of downloadedFormats) {
+      const h = itagHeight[entry.formatId] || 0;
+      if (h > downloadedHeight) downloadedHeight = h;
     }
     const playlist = buildPlaylistContext(fetchedPlaylist, videoId, requestedPlaylistIndex);
-    await res.streamContent('player', {
+    await res.streamContent('player-shell', {
       video,
-      tags,
+      tags: bootstrap.tags,
       startTime,
       streamToken,
-      currentRating,
+      currentRating: bootstrap.rating,
       savedPosition,
       inlineMPD,
       inlineVia,
@@ -206,7 +236,7 @@ router.get('/playlist-context', ensureAuth, async (req, res) => {
       return res.status(400).json({ error: 'Invalid video or playlist ID' });
     }
     const fetchedPlaylist = isLocalPlaylistId(playlistId)
-      ? await getLocalPlaylistDetails(req.session.userId, playlistId)
+      ? await getLocalPlaylistDetails(req.session.userId, playlistId, requestedPlaylistIndex)
       : await getPlaylistDetails(playlistId);
     const playlist = buildPlaylistContext(fetchedPlaylist, videoId, requestedPlaylistIndex);
     if (!playlist) return res.status(404).json({ error: 'Playlist not found' });

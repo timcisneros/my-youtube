@@ -29,18 +29,17 @@ router.use('/:videoId', (req, res, next) => {
 
 // Import sub-modules and mount routes
 import { getCached } from './extraction.js';
-import { buildMPD } from './mpd.js';
-import { bgDownloads, cleanupBgDownload } from './downloads.js';
+import { buildMPD, hasCachedPlayback } from './mpd.js';
+import { cleanupVideoDownloads } from './downloads.js';
 
 // Prefetch endpoint — called early by the page to warm caches
 // buildMPD deduplicates via mpdInflight, so no concurrency guard needed
 router.get('/:videoId/prefetch', async (req, res) => {
   const { videoId } = req.params;
   res.status(204).end();
-  if (getCached(videoId)) return;
-  // Extraction rate limit
-  if (req.app.extractionRateCheck && !req.app.extractionRateCheck(req.ip, videoId)) return;
-  buildMPD(videoId).catch(err => console.warn(`[prefetch ${videoId}]`, err.message));
+  if (!getCached(videoId) && !await hasCachedPlayback(videoId)
+    && req.app.extractionRateCheck && !req.app.extractionRateCheck(req.ip, videoId)) return;
+  buildMPD(videoId, { priority: 'prefetch' }).catch(err => console.warn(`[prefetch ${videoId}]`, err.message));
 });
 
 // Mount all route groups
@@ -61,4 +60,4 @@ mountAssetRoutes(router);
 mountDownloadRoutes(router);
 
 export default router;
-export { bgDownloads, cleanupBgDownload, buildMPD };
+export { cleanupVideoDownloads, buildMPD };

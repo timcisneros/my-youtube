@@ -21,6 +21,12 @@
           <%- include('partials/video-card', { vid: v.videoId, title: v.title, channel: v.channelTitle, published: v.publishedAt }) %>
         <% } %>
       </div>
+      <% if (prevCursor || nextCursor) { %>
+        <nav class="pagination" aria-label="Today's videos pages">
+          <% if (prevCursor) { %><a href="/?cursor=<%= encodeURIComponent(prevCursor) %>">&larr; More recent</a><% } %>
+          <% if (nextCursor) { %><a href="/?cursor=<%= encodeURIComponent(nextCursor) %>">Older &rarr;</a><% } %>
+        </nav>
+      <% } %>
     <% } %>
     <script>document.querySelectorAll('[data-published]').forEach(function(el) { if (el.dataset.published) el.textContent = timeAgo(el.dataset.published); });</script>
   </main>

@@ -3,10 +3,14 @@
  */
 import { Router } from 'express';
 import express from 'express';
-import fs from 'fs';
-import path from 'path';
+import { promises as fs } from 'fs';
+import { randomUUID } from 'node:crypto';
 import { exportCookies, rankBrowserSpecsForRequest } from './subscriptions-api.js';
 import { availableBrowsers, refreshCookiesFile } from '../ytdlp.js';
+import { ensureAuth } from '../auth.js';
+import { acquireLock, releaseLock, renewLock } from '../lib/cache.js';
+import { withYtdlpSlot } from './stream/shared.js';
+import { projectPath } from '../lib/project-paths.js';
 
 const router = Router();
 
@@ -17,14 +21,14 @@ function browserBase(browserSpec: string): string {
 }
 
 // Available browsers for cookie extraction
-router.get('/browsers', (_req, res) => {
-  res.json(availableBrowsers());
+router.get('/browsers', ensureAuth, async (_req, res) => {
+  res.json(await availableBrowsers());
 });
 
 // Auto-refresh cookies from best available browser (used by player retry)
-router.post('/refresh-auto', async (_req, res) => {
+router.post('/refresh-auto', ensureAuth, async (_req, res) => {
   try {
-    await refreshCookiesFile();
+    await refreshCookiesFile({ withSlot: withYtdlpSlot });
     res.json({ ok: true });
   } catch (e: unknown) {
     res.status(500).json({ error: (e as Error).message });
@@ -35,7 +39,7 @@ router.post('/refresh-auto', async (_req, res) => {
 router.post('/refresh', async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
   const browser = typeof req.body?.browser === 'string' ? req.body.browser : '';
-  const available = availableBrowsers();
+  const available = await availableBrowsers();
   let candidates: string[];
   if (browser) {
     if (!ALLOWED_BROWSERS.includes(browserBase(browser))) {
@@ -50,35 +54,50 @@ router.post('/refresh', async (req, res) => {
     if (candidates.length === 0) return res.status(400).json({ error: 'No browser cookies found' });
   }
   let tempPath: string | undefined;
+  let atomicPath: string | undefined;
+  const lockKey = 'cookie-file-refresh';
+  const lockToken = await acquireLock(lockKey, 45_000);
+  if (!lockToken) return res.status(409).json({ error: 'Cookie refresh already in progress' });
+  const renewTimer = setInterval(() => {
+    void renewLock(lockKey, lockToken, 45_000);
+  }, 15_000);
+  renewTimer.unref?.();
   try {
     let lastError: Error | null = null;
     for (const candidate of candidates) {
       try {
-        tempPath = await exportCookies(candidate);
+        tempPath = await withYtdlpSlot(() => exportCookies(candidate), { priority: 'background' });
         break;
       } catch (e: unknown) {
         lastError = e instanceof Error ? e : new Error(String(e));
       }
     }
     if (!tempPath) throw lastError || new Error('No browser cookies found');
-    fs.copyFileSync(tempPath, path.join(import.meta.dirname, '..', 'cookies.txt'));
+    const cookiesPath = projectPath('cookies.txt');
+    atomicPath = `${cookiesPath}.tmp-${process.pid}-${randomUUID()}`;
+    await fs.copyFile(tempPath, atomicPath);
+    await fs.rename(atomicPath, cookiesPath);
+    atomicPath = undefined;
     res.json({ ok: true });
   } catch (e: unknown) {
     console.error('Cookie refresh error:', (e as Error).message);
     res.status(500).json({ error: (e as Error).message });
   } finally {
-    if (tempPath) try { fs.unlinkSync(tempPath); } catch {}
+    clearInterval(renewTimer);
+    if (tempPath) await fs.rm(tempPath, { force: true }).catch(() => {});
+    if (atomicPath) await fs.rm(atomicPath, { force: true }).catch(() => {});
+    await releaseLock(lockKey, lockToken);
   }
 });
 
 // Upload cookies.txt for yt-dlp
-router.post('/upload', express.text({ type: '*/*', limit: '1mb' }), (req, res) => {
+router.post('/upload', express.text({ type: '*/*', limit: '1mb' }), async (req, res) => {
   if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
   const text = req.body;
   if (!text || typeof text !== 'string' || !text.includes('youtube.com')) {
     return res.status(400).json({ error: 'Invalid cookies.txt — must contain youtube.com cookies' });
   }
-  fs.writeFileSync(path.join(import.meta.dirname, '..', 'cookies.txt'), text);
+  await fs.writeFile(projectPath('cookies.txt'), text);
   res.json({ ok: true });
 });
 

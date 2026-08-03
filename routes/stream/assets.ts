@@ -1,37 +1,61 @@
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
-import { promisify } from 'util';
-import { execFile } from 'child_process';
 import express from 'express';
-import { YTDLP_BIN, ytdlpArgs } from '../../ytdlp.js';
 import { getCachedDuration } from '../../youtube/index.js';
-import { fetchVideoMetaBatch } from '../../yt-meta.js';
+import { withYtSlot } from '../../youtube/shared.js';
+import { resolveVideoMetadata } from '../../lib/duration-metadata.js';
+import { acquireStatusConnection } from '../../lib/status-connection-limiter.js';
 import { isYouTubeCdnUrl, fetchLiveStoryboardSpec } from '../../extractors.js';
 import db from '../../db.js';
 import {
   PROXY_HEADERS,
   isClientGone,
-  extractionInflight,
+  fetchWithConnTimeout,
   storyboardUrlCache,
   liveStoryboardCache,
+  streamRequestSignal,
+  withYtdlpSlot,
+  dedup,
 } from './shared.js';
 import { getCached, extractFormats } from './extraction.js';
 
-const execFileAsync = promisify(execFile);
+const liveStoryboardInflight = new Map<string, Promise<Record<string, unknown> | null>>();
+const LIVE_STORYBOARD_TTL_MS = 30 * 60 * 1000;
+const LIVE_STORYBOARD_NEGATIVE_TTL_MS = 5 * 60 * 1000;
+const DURATION_STATUS_MAX_AGE_MS = Math.max(5_000, Number(process.env.DURATION_STATUS_MAX_AGE_MS) || 30_000);
 
 // Cached wrapper around extractors.fetchLiveStoryboardSpec
 async function getLiveStoryboardSpec(videoId) {
-  const cached = liveStoryboardCache.get(videoId);
-  if (cached && Date.now() - cached.createdAt < 30 * 60 * 1000) return cached;
-  try {
-    const raw = await fetchLiveStoryboardSpec(videoId);
-    if (!raw) return null;
-    const spec = { ...raw, createdAt: Date.now() };
-    liveStoryboardCache.set(videoId, spec);
-    return spec;
-  } catch {
-    return null;
-  }
+  const cached = await liveStoryboardCache.getAsync(videoId);
+  if (cached && Date.now() < cached.expires) return cached.miss ? null : cached;
+  return dedup(liveStoryboardInflight, videoId, async () => {
+    try {
+      const raw = await fetchLiveStoryboardSpec(videoId, {
+        withRequestSlot: task => withYtSlot(task, 'background'),
+        withProcessSlot: task => withYtdlpSlot(task, { priority: 'background' }),
+      });
+      const now = Date.now();
+      if (!raw) {
+        await liveStoryboardCache.setAsync(videoId, {
+          miss: true,
+          createdAt: now,
+          expires: now + LIVE_STORYBOARD_NEGATIVE_TTL_MS,
+        });
+        return null;
+      }
+      const spec = { ...raw, createdAt: now, expires: now + LIVE_STORYBOARD_TTL_MS };
+      await liveStoryboardCache.setAsync(videoId, spec);
+      return spec;
+    } catch {
+      const now = Date.now();
+      await liveStoryboardCache.setAsync(videoId, {
+        miss: true,
+        createdAt: now,
+        expires: now + Math.min(60_000, LIVE_STORYBOARD_NEGATIVE_TTL_MS),
+      }).catch(() => {});
+      return null;
+    }
+  }, { name: 'stream_storyboards', maxEntries: 64 });
 }
 
 // Parse chapter timestamps from video description text
@@ -72,7 +96,12 @@ function mountAssetRoutes(router) {
     try {
       const { videoId } = req.params;
       // hq720.jpg is 1280x720, always available, fills widescreen — single fetch
-      const upstream = await fetch(`https://i.ytimg.com/vi/${videoId}/hq720.jpg`, { headers: PROXY_HEADERS });
+      const upstream = await fetchWithConnTimeout(`https://i.ytimg.com/vi/${videoId}/hq720.jpg`, {
+        headers: PROXY_HEADERS,
+        bodyIdleMs: 8000,
+        outboundPriority: 'background',
+        signal: streamRequestSignal(req, res),
+      }, 8000);
       if (!upstream.ok) {
         await upstream.body?.cancel().catch(() => {});
         if (!res.headersSent) res.status(upstream.status).end();
@@ -109,22 +138,24 @@ function mountAssetRoutes(router) {
       return res.json({ duration: dur });
     }
     // Check DB
-    const dbDur = db.getDuration(videoId);
+    const dbDur = await db.getDuration(videoId);
     if (dbDur) {
       res.set('Cache-Control', 'public, max-age=86400');
       return res.json({ duration: dbDur });
     }
-    // Fetch via yt-dlp (single video only, not batch)
+    // Use the same bounded, abortable, cross-worker-deduplicated resolver as
+    // the duration SSE endpoint. This compatibility route must not bypass the
+    // shared YouTube and yt-dlp limits.
     try {
-      const { stdout } = await execFileAsync(YTDLP_BIN, [
-        ...ytdlpArgs(), '--print', 'duration', '--no-warnings', '--', videoId
-      ], { timeout: 15000 });
-      const d = parseFloat(stdout.trim());
-      if (!isNaN(d)) db.setDuration(videoId, d);
+      const metadata = await resolveVideoMetadata([videoId], 1, {
+        signal: streamRequestSignal(req, res),
+      });
+      const d = metadata.get(videoId)?.duration || null;
       res.set('Cache-Control', 'public, max-age=86400');
-      res.json({ duration: isNaN(d) ? null : d });
-    } catch {
-      res.json({ duration: null });
+      res.json({ duration: d });
+    } catch (err) {
+      if (isClientGone(err)) return;
+      if (!res.headersSent) res.json({ duration: null });
     }
   });
 
@@ -132,7 +163,12 @@ function mountAssetRoutes(router) {
   router.get('/:videoId/thumb', async (req, res) => {
     try {
       const { videoId } = req.params;
-      const upstream = await fetch(`https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`, { headers: PROXY_HEADERS });
+      const upstream = await fetchWithConnTimeout(`https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`, {
+        headers: PROXY_HEADERS,
+        bodyIdleMs: 8000,
+        outboundPriority: 'background',
+        signal: streamRequestSignal(req, res),
+      }, 8000);
       if (!upstream.ok) {
         await upstream.body?.cancel().catch(() => {});
         if (!res.headersSent) res.status(upstream.status).end();
@@ -185,8 +221,10 @@ function mountAssetRoutes(router) {
         });
       }
 
-      // Live storyboard — fetch spec from Innertube
-      const liveSpec = await getLiveStoryboardSpec(videoId);
+      // The expensive live fallback is only valid for an active livestream.
+      // A VOD without storyboard frames should remain a cheap 404.
+      const isCurrentLive = info.live_status === 'is_live' || info.is_live === true;
+      const liveSpec = isCurrentLive ? await getLiveStoryboardSpec(videoId) : null;
       if (liveSpec) {
         return res.json({
           live: true,
@@ -242,7 +280,12 @@ function mountAssetRoutes(router) {
       const url = spec.urlTemplate.replace('M$M', 'M' + seqNum);
       // Validate domain
       if (!isYouTubeCdnUrl(url)) return res.status(403).end();
-      const upstream = await fetch(url, { headers: PROXY_HEADERS });
+      const upstream = await fetchWithConnTimeout(url, {
+        headers: PROXY_HEADERS,
+        bodyIdleMs: 8000,
+        outboundPriority: 'background',
+        signal: streamRequestSignal(req, res),
+      }, 8000);
       if (!upstream.ok) return res.status(upstream.status).end();
       const ct = upstream.headers.get('content-type');
       if (ct) res.set('Content-Type', ct);
@@ -276,7 +319,12 @@ function mountAssetRoutes(router) {
 
       if (idx < 0 || idx >= urls.length) return res.status(404).json({ error: 'Sheet not found' });
 
-      const upstream = await fetch(urls[idx], { headers: PROXY_HEADERS });
+      const upstream = await fetchWithConnTimeout(urls[idx], {
+        headers: PROXY_HEADERS,
+        bodyIdleMs: 8000,
+        outboundPriority: 'background',
+        signal: streamRequestSignal(req, res),
+      }, 8000);
       if (!upstream.ok) {
         await upstream.body?.cancel().catch(() => {});
         return res.status(upstream.status).end();
@@ -300,7 +348,7 @@ function mountAssetRoutes(router) {
 // validator in index.ts, otherwise Express matches "durations-live" as a videoId.
 function mountBatchRoutes(router) {
   // POST /api/stream/durations — batch duration lookup (cache + DB only, no yt-dlp)
-  router.post('/durations', express.json(), (req, res) => {
+  router.post('/durations', express.json(), async (req, res) => {
     const { ids } = req.body || {};
     if (!Array.isArray(ids) || ids.length === 0) return res.json({});
     const validIds = ids.filter(id => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 50);
@@ -318,7 +366,7 @@ function mountBatchRoutes(router) {
 
     // Check DB for anything not in memory
     if (remaining.length > 0) {
-      const dbDurations = db.getDurations(remaining);
+      const dbDurations = await db.getDurations(remaining);
       Object.assign(result, dbDurations);
     }
 
@@ -327,10 +375,41 @@ function mountBatchRoutes(router) {
   });
 
   // SSE endpoint — streams durations as yt-dlp resolves them, one by one
-  router.get('/durations-live', (req, res) => {
+  router.get('/durations-live', async (req, res) => {
     const raw = (req.query.ids || '').toString();
-    const ids = raw.split(',').filter(id => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 50);
+    const ids = raw.split(',').filter(id => /^[A-Za-z0-9_-]{11}$/.test(id)).slice(0, 20);
     if (!ids.length) return res.status(400).end();
+
+    // Do the bounded database lookup before reserving a long-lived connection.
+    // Fully cached batches can complete immediately without consuming SSE
+    // capacity while upstream metadata work is protected by the shared lease.
+    const stored = await db.getDurationsAndLiveStatuses(ids);
+    const dbDurations = stored.durations;
+    const dbStatuses = stored.liveStatuses;
+    const missing = ids.filter(id => dbDurations[id] === undefined);
+    const releaseConnection = missing.length > 0
+      ? acquireStatusConnection(req.ip, 'duration_sse')
+      : () => {};
+    if (!releaseConnection) {
+      res.set('Retry-After', '5');
+      return res.status(429).end();
+    }
+
+    let closed = false;
+    const controller = new AbortController();
+    let maxAgeTimer: NodeJS.Timeout | null = null;
+    let cleanedUp = false;
+    const cleanupConnection = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      closed = true;
+      if (maxAgeTimer) clearTimeout(maxAgeTimer);
+      if (!controller.signal.aborted) controller.abort(new Error('duration metadata client disconnected'));
+      releaseConnection();
+    };
+    req.once('aborted', cleanupConnection);
+    res.once('close', cleanupConnection);
+    res.once('finish', cleanupConnection);
 
     res.set({
       'Content-Type': 'text/event-stream',
@@ -340,56 +419,63 @@ function mountBatchRoutes(router) {
     });
     res.flushHeaders();
 
-    // Immediately send durations already in DB
-    const dbDurations = db.getDurations(ids);
-    const dbStatuses = db.getLiveStatuses(ids);
-    const missing = [];
+    const writeEvent = (body: string) => {
+      if (res.writableEnded || res.destroyed) return false;
+      const accepted = res.write(body);
+      if (typeof res.flush === 'function') res.flush();
+      if (!accepted) res.end();
+      return accepted;
+    };
+
+    // Immediately send durations already in DB.
     for (const id of ids) {
-      if (dbDurations[id]) {
+      if (dbDurations[id] !== undefined) {
         const msg: { id: string; duration: number; live_status?: string } = { id, duration: dbDurations[id] };
         if (dbStatuses[id] && dbStatuses[id] !== 'not_live') msg.live_status = dbStatuses[id];
-        res.write(`data: ${JSON.stringify(msg)}\n\n`);
-      } else {
-        missing.push(id);
+        if (!writeEvent(`data: ${JSON.stringify(msg)}\n\n`)) return;
       }
     }
-    if (typeof res.flush === 'function') res.flush();
 
     if (!missing.length) {
-      res.write('event: done\ndata: {}\n\n');
+      writeEvent('event: done\ndata: {}\n\n');
       return res.end();
     }
 
-    // Fetch via yt-meta (internal API -> page scrape -> yt-dlp fallback chain)
-    // Yield to active video extractions — duration badges are cosmetic and should
-    // never compete with playback for yt-dlp/YouTube API slots
-    let closed = false;
-    req.on('close', () => { closed = true; });
+    maxAgeTimer = setTimeout(() => {
+      if (!controller.signal.aborted) controller.abort(new Error('duration metadata deadline exceeded'));
+      if (!res.writableEnded) {
+        res.write('event: done\ndata: {}\n\n');
+        res.end();
+      }
+    }, DURATION_STATUS_MAX_AGE_MS);
+    maxAgeTimer.unref?.();
 
     void (async () => {
       try {
-        // Wait for any in-flight video extractions to finish first
-        while (extractionInflight.size > 0 && !closed) {
-          await new Promise(r => setTimeout(r, 500));
-        }
-        if (closed) return;
-        const results = await fetchVideoMetaBatch(missing, { concurrency: 3 });
+        // YouTube and yt-dlp admission queues already prioritize playback over
+        // this background metadata work, so no polling loop is needed here.
+        const results = await resolveVideoMetadata(missing, 3, {
+          signal: controller.signal,
+          mode: 'lightweight',
+          // The route already performed one batch lookup for every id. Avoid
+          // turning the missing subset back into one query per badge.
+          skipStoredLookup: true,
+        });
         for (const id of missing) {
           if (closed) return;
           const meta = results.get(id);
           if (meta) {
-            db.setDuration(id, meta.duration, meta.liveStatus);
             const msg: { id: string; duration: number; live_status?: string } = { id, duration: meta.duration };
             if (meta.liveStatus !== 'not_live') msg.live_status = meta.liveStatus;
-            res.write(`data: ${JSON.stringify(msg)}\n\n`);
-            if (typeof res.flush === 'function') res.flush();
+            if (!writeEvent(`data: ${JSON.stringify(msg)}\n\n`)) return;
           }
         }
       } catch (err) {
+        if (controller.signal.aborted) return;
         console.error('[durations-live] error:', err.message);
       }
       if (!closed) {
-        res.write('event: done\ndata: {}\n\n');
+        writeEvent('event: done\ndata: {}\n\n');
         res.end();
       }
     })();

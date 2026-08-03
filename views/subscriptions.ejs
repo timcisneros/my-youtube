@@ -1,4 +1,4 @@
-    <h1>Subscriptions <span class="count">(<%= totalResults %>)</span></h1>
+    <h1>Subscriptions</h1>
     <form class="sub-search-form" action="/subscriptions" method="get">
       <input type="text" class="sub-search" name="q" value="<%= searchQuery %>" placeholder="Search subscriptions..." autocomplete="off">
     </form>
@@ -199,14 +199,12 @@
       });
     })();
     </script>
-    <% if (!searchQuery) { %>
     <div class="pagination">
-      <% if (prevPage) { %>
-        <a href="/subscriptions?page=<%= prevPage %>">&larr; Previous</a>
+      <% if (prevCursor) { %>
+        <a href="/subscriptions?cursor=<%= encodeURIComponent(prevCursor) %><%= searchQuery ? '&q=' + encodeURIComponent(searchQuery) : '' %>">&larr; Previous</a>
       <% } %>
-      <% if (nextPage) { %>
-        <a href="/subscriptions?page=<%= nextPage %>">Next &rarr;</a>
+      <% if (nextCursor) { %>
+        <a href="/subscriptions?cursor=<%= encodeURIComponent(nextCursor) %><%= searchQuery ? '&q=' + encodeURIComponent(searchQuery) : '' %>">Next &rarr;</a>
       <% } %>
     </div>
-    <% } %>
   </main>

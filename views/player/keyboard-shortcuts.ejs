@@ -36,10 +36,8 @@
             video.muted = !video.muted;
             break;
           case 'c':
-            // Toggle captions
-            if (window._subtitleList && window._subtitleList.length > 0) {
-              ccBtn.click();
-            }
+            // The button lazily loads the subtitle list on first use.
+            ccBtn.click();
             break;
           case '>':
             e.preventDefault();

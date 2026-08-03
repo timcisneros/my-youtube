@@ -1,4 +1,4 @@
-    <h1>Playlists <span class="count">(<%= playlists.length %>)</span></h1>
+    <h1>Playlists</h1>
     <details class="import-section" <%= playlists.length === 0 ? 'open' : '' %>>
       <summary class="import-toggle"><%= playlists.length === 0 ? 'Add a playlist' : 'Add another playlist' %></summary>
       <div class="import-body">
@@ -42,6 +42,12 @@
           </div>
         <% } %>
       </div>
+    <% } %>
+    <% if (prevCursor || nextCursor) { %>
+      <nav class="pagination" aria-label="Saved playlist pages">
+        <% if (prevCursor) { %><a href="/playlists?cursor=<%= encodeURIComponent(prevCursor) %>">&larr; Previous</a><% } %>
+        <% if (nextCursor) { %><a href="/playlists?cursor=<%= encodeURIComponent(nextCursor) %>">Next &rarr;</a><% } %>
+      </nav>
     <% } %>
 
     <script>
@@ -95,8 +101,13 @@
             .then(function(r) { return r.json(); })
             .then(function(data) {
               if (data.error) { refreshStatus.textContent = data.error; return; }
-              refreshStatus.textContent = 'Refreshed';
-              setTimeout(function() { location.reload(); }, 500);
+              if (data.queued) {
+                refreshStatus.textContent = 'Refresh queued';
+                setTimeout(function() { location.reload(); }, 3000);
+              } else {
+                refreshStatus.textContent = 'Refreshed';
+                setTimeout(function() { location.reload(); }, 500);
+              }
             })
             .catch(function() { refreshStatus.textContent = 'Refresh failed'; })
             .finally(function() { refreshBtn.disabled = false; });

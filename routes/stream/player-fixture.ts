@@ -50,6 +50,8 @@ function ensureFixtureFiles() {
   const tsPaths = FIXTURE_VIDEO_REPS.map(rep => path.join(FIXTURE_DIR, `${rep.formatId}.ts`));
   const muxedTsPaths = FIXTURE_VIDEO_REPS.map(rep => path.join(FIXTURE_DIR, `${rep.formatId}-muxed.ts`));
   const audioTsPath = path.join(FIXTURE_DIR, 'audio.ts');
+  const timelineTsPath = path.join(FIXTURE_DIR, 'v360-timeline.ts');
+  const seekTsPaths = [0, 1].map(index => path.join(FIXTURE_DIR, `v360-seek-${index}.ts`));
   if (
     fs.existsSync(audioPath)
     && videoPaths.every(filePath => fs.existsSync(filePath))
@@ -57,6 +59,8 @@ function ensureFixtureFiles() {
     && tsPaths.every(filePath => fs.existsSync(filePath))
     && muxedTsPaths.every(filePath => fs.existsSync(filePath))
     && fs.existsSync(audioTsPath)
+    && fs.existsSync(timelineTsPath)
+    && seekTsPaths.every(filePath => fs.existsSync(filePath))
   ) return;
 
   if (!fs.existsSync(audioPath) || !videoPaths.every(filePath => fs.existsSync(filePath))) {
@@ -154,6 +158,48 @@ function ensureFixtureFiles() {
       muxedTsPaths[index],
     ], { stdio: 'ignore' });
   });
+
+  if (!fs.existsSync(timelineTsPath)) {
+    execFileSync('ffmpeg', [
+      '-y',
+      '-i', videoMainPaths[1],
+      '-itsoffset', '0.125',
+      '-i', audioPath,
+      '-map', '0:v',
+      '-map', '1:a',
+      '-c:v', 'copy',
+      '-bsf:v', 'h264_mp4toannexb,setts=pts=PTS+0.04/TB',
+      '-c:a', 'copy',
+      '-muxpreload', '0',
+      '-muxdelay', '0',
+      '-f', 'mpegts',
+      timelineTsPath,
+    ], { stdio: 'ignore' });
+  }
+
+  if (!seekTsPaths.every(filePath => fs.existsSync(filePath))) {
+    execFileSync('ffmpeg', [
+      '-y',
+      '-stream_loop', '1',
+      '-i', videoMainPaths[1],
+      '-itsoffset', '0.125',
+      '-stream_loop', '1',
+      '-i', audioPath,
+      '-map', '0:v',
+      '-map', '1:a',
+      '-t', '12',
+      '-c:v', 'copy',
+      '-bsf:v', 'h264_mp4toannexb',
+      '-c:a', 'copy',
+      '-muxpreload', '0',
+      '-muxdelay', '0',
+      '-f', 'segment',
+      '-segment_time', '6',
+      '-segment_format', 'mpegts',
+      '-reset_timestamps', '0',
+      path.join(FIXTURE_DIR, 'v360-seek-%d.ts'),
+    ], { stdio: 'ignore' });
+  }
 }
 
 function h264FixtureEncoderArgs(profile: 'baseline' | 'main') {
@@ -261,12 +307,14 @@ ${videos.map(video => `<Representation id="${video.formatId}" bandwidth="${video
 
 function buildFixtureHlsMaster(videoId: string, query: Record<string, unknown> = {}) {
   const formats = getFixtureFormats();
-  const videos = FIXTURE_VIDEO_REPS.map(rep => formats[rep.formatId]);
   const fixtureMode = firstQueryValue(query.fixtureHls);
+  const videos = fixtureMode === 'ts-timeline' || fixtureMode === 'ts-seek'
+    ? [formats.v360]
+    : FIXTURE_VIDEO_REPS.map(rep => formats[rep.formatId]);
   const benchmarkGroups = fixtureMode === 'benchmark-groups';
   const mediaGroups = fixtureMode === 'groups' || fixtureMode === 'ts-groups' || benchmarkGroups;
-  const tsMode = fixtureMode === 'ts' || fixtureMode === 'ts-muxed' || fixtureMode === 'ts-groups' || fixtureMode === 'ts-aes';
-  const muxedTsMode = fixtureMode === 'ts-muxed';
+  const tsMode = fixtureMode === 'ts' || fixtureMode === 'ts-muxed' || fixtureMode === 'ts-groups' || fixtureMode === 'ts-aes' || fixtureMode === 'ts-extensionless' || fixtureMode === 'mixed-container' || fixtureMode === 'ts-timeline' || fixtureMode === 'ts-seek';
+  const muxedTsMode = fixtureMode === 'ts-muxed' || fixtureMode === 'ts-timeline' || fixtureMode === 'ts-seek';
   const hlsQuery = hlsFixtureQuery(query, tsMode ? fixtureMode : (mediaGroups ? 'groups' : (fixtureMode || '1')));
   const subtitleData = encodeURIComponent('WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nNative HLS captions\n');
   const audioGroupLine = mediaGroups
@@ -278,7 +326,7 @@ function buildFixtureHlsMaster(videoId: string, query: Record<string, unknown> =
   return `#EXTM3U
 #EXT-X-VERSION:7
 ${[audioGroupLine, subtitleGroupLine].filter(Boolean).join('\n')}
-${videos.map(video => `#EXT-X-STREAM-INF:BANDWIDTH=${video.bandwidth + (mediaGroups || muxedTsMode ? formats.a64.bandwidth : 0)},RESOLUTION=${video.width}x${video.height},CODECS="${mediaGroups || muxedTsMode ? `${video.codecs},mp4a.40.2` : video.codecs}"${mediaGroups ? `,AUDIO="audio-main"${benchmarkGroups ? '' : ',SUBTITLES="subs"'}` : ''}
+${videos.map(video => `#EXT-X-STREAM-INF:BANDWIDTH=${video.bandwidth + (mediaGroups || muxedTsMode ? formats.a64.bandwidth : 0)},RESOLUTION=${video.width}x${video.height},CODECS="${fixtureMode === 'ts-timeline' || fixtureMode === 'ts-seek' ? 'avc1.4d401f,mp4a.40.2' : (mediaGroups || muxedTsMode ? `${video.codecs},mp4a.40.2` : video.codecs)}"${mediaGroups ? `,AUDIO="audio-main"${benchmarkGroups ? '' : ',SUBTITLES="subs"'}` : ''}
 /api/stream/${videoId}/hls/${video.formatId}.m3u8?${hlsQuery}`).join('\n')}`;
 }
 
@@ -289,8 +337,56 @@ function buildFixtureHlsMedia(videoId: string, formatId: string, query: Record<s
   if (fixtureMode === 'live' || fixtureMode === 'sliding' || fixtureMode === 'live-discontinuity') {
     return buildFixtureLiveHlsMedia(videoId, fmt, query, fixtureMode);
   }
-  if (fixtureMode === 'aes' || fixtureMode === 'aes-rotate' || fixtureMode === 'ts-aes') {
+  if (fixtureMode === 'aes' || fixtureMode === 'aes-rotate' || fixtureMode === 'aes-map' || fixtureMode === 'ts-aes') {
     return buildFixtureEncryptedHlsMedia(videoId, fmt, fixtureMode);
+  }
+  if (fixtureMode === 'ts-extensionless') {
+    const tsKind = formatId === 'a64' ? 'audio' : 'video';
+    return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:${FIXTURE_DURATION}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:${FIXTURE_DURATION}.000,
+/api/stream/${videoId}/hls-ts-raw/${fmt.formatId}?fixtureTs=${tsKind}
+#EXT-X-ENDLIST`;
+  }
+  if (fixtureMode === 'mixed-container') {
+    const segments = segmentsFor(fmt.filePath, fmt.indexRange.end);
+    if (!segments.length) return '';
+    const first = segments[0];
+    const firstDuration = first.end - first.start;
+    return `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:${Math.max(FIXTURE_DURATION, Math.ceil(firstDuration))}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="/api/stream/${videoId}/fmt/${fmt.formatId}",BYTERANGE="${fmt.initRange.end - fmt.initRange.start + 1}@${fmt.initRange.start}"
+#EXTINF:${firstDuration.toFixed(3)},
+#EXT-X-BYTERANGE:${first.range.end - first.range.start + 1}@${first.range.start}
+/api/stream/${videoId}/fmt/${fmt.formatId}
+#EXT-X-DISCONTINUITY
+#EXTINF:${FIXTURE_DURATION}.000,
+/api/stream/${videoId}/hls-ts-raw/${fmt.formatId}?fixtureTs=video
+#EXT-X-ENDLIST`;
+  }
+  if (fixtureMode === 'ts-timeline') {
+    return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:7
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.125,
+/api/stream/${videoId}/hls-ts/${fmt.formatId}.ts?fixtureTs=timeline
+#EXT-X-ENDLIST`;
+  }
+  if (fixtureMode === 'ts-seek') {
+    return `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:6.000,
+/api/stream/${videoId}/hls-ts/${fmt.formatId}.ts?fixtureTs=seek-0
+#EXTINF:6.000,
+/api/stream/${videoId}/hls-ts/${fmt.formatId}.ts?fixtureTs=seek-1
+#EXT-X-ENDLIST`;
   }
   if (fixtureMode === 'ts' || fixtureMode === 'ts-muxed' || fixtureMode === 'ts-groups') {
     const tsKind = formatId === 'a64' ? 'audio' : (fixtureMode === 'ts-muxed' ? 'muxed' : 'video');
@@ -330,6 +426,18 @@ function buildFixtureEncryptedHlsMedia(videoId: string, fmt: FixtureFormat, fixt
   const segments = segmentsFor(fmt.filePath, fmt.indexRange.end);
   if (!segments.length) return '';
   const targetDuration = Math.max(1, Math.ceil(Math.max(...segments.map(seg => seg.end - seg.start))));
+  if (fixtureMode === 'aes-map') {
+    return `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:${targetDuration}
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-KEY:METHOD=AES-128,URI="/api/stream/${videoId}/hls-key/0.key",IV=0x00000000000000000000000000000000
+#EXT-X-MAP:URI="/api/stream/${videoId}/hls-aes/${fmt.formatId}/0.bin?fixtureKey=0&fixtureInit=1"
+#EXT-X-KEY:METHOD=AES-128,URI="/api/stream/${videoId}/hls-key/0.key"
+${segments.map((seg, index) => `#EXTINF:${(seg.end - seg.start).toFixed(3)},
+/api/stream/${videoId}/hls-aes/${fmt.formatId}/${index}.bin?fixtureKey=0`).join('\n')}
+#EXT-X-ENDLIST`;
+  }
   return `#EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-TARGETDURATION:${targetDuration}
@@ -632,6 +740,14 @@ function serveFixtureProgressive(videoId: string, req, res) {
   return true;
 }
 
+function fixtureTsFilename(formatId: string, kind: string | undefined) {
+  if (kind === 'audio') return 'audio.ts';
+  if (kind === 'muxed') return `${formatId}-muxed.ts`;
+  if (kind === 'timeline') return 'v360-timeline.ts';
+  if (kind === 'seek-0' || kind === 'seek-1') return `v360-${kind}.ts`;
+  return `${formatId}.ts`;
+}
+
 function serveFixtureTsSegment(videoId: string, formatId: string, req, res) {
   if (!isPlayerFixtureVideo(videoId)) return false;
   const fmt = getFixtureFormats()[formatId];
@@ -640,9 +756,7 @@ function serveFixtureTsSegment(videoId: string, formatId: string, req, res) {
     return true;
   }
   const kind = firstQueryValue(req.query.fixtureTs);
-  const filename = kind === 'audio'
-    ? 'audio.ts'
-    : (kind === 'muxed' ? `${fmt.formatId}-muxed.ts` : `${fmt.formatId}.ts`);
+  const filename = fixtureTsFilename(fmt.formatId, kind);
   const tsPath = path.join(FIXTURE_DIR, filename);
   if (!fs.existsSync(tsPath)) {
     res.status(404).json({ error: 'Fixture TS not found' });
@@ -678,9 +792,11 @@ function serveFixtureEncryptedHlsSegment(videoId: string, formatId: string, segm
   }
   const sequence = boundedInt(segmentId, 0, 1000);
   const keyId = boundedInt(firstQueryValue(req.query.fixtureKey), 0, FIXTURE_HLS_KEYS.length - 1);
-  const bytes = firstQueryValue(req.query.fixtureTs)
-    ? readFixtureTsBytes(fmt.formatId, firstQueryValue(req.query.fixtureTs))
-    : readFixtureSegmentBytes(fmt, sequence);
+  const bytes = firstQueryValue(req.query.fixtureInit)
+    ? readFixtureRangeBytes(fmt.filePath, fmt.initRange)
+    : (firstQueryValue(req.query.fixtureTs)
+      ? readFixtureTsBytes(fmt.formatId, firstQueryValue(req.query.fixtureTs))
+      : readFixtureSegmentBytes(fmt, sequence));
   if (!bytes) {
     res.status(404).json({ error: 'Fixture encrypted segment not found' });
     return true;
@@ -726,10 +842,17 @@ function readFixtureSegmentBytes(fmt: FixtureFormat, sequence: number) {
   return buf;
 }
 
+function readFixtureRangeBytes(filePath: string, range: BoxRange) {
+  const length = range.end - range.start + 1;
+  const buf = Buffer.alloc(length);
+  const fd = fs.openSync(filePath, 'r');
+  fs.readSync(fd, buf, 0, length, range.start);
+  fs.closeSync(fd);
+  return buf;
+}
+
 function readFixtureTsBytes(formatId: string, kind: string | undefined) {
-  const filename = kind === 'audio'
-    ? 'audio.ts'
-    : (kind === 'muxed' ? `${formatId}-muxed.ts` : `${formatId}.ts`);
+  const filename = fixtureTsFilename(formatId, kind);
   const tsPath = path.join(FIXTURE_DIR, filename);
   return fs.existsSync(tsPath) ? fs.readFileSync(tsPath) : null;
 }

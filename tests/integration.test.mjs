@@ -14,6 +14,17 @@ import { getSegment, putSegment } from '../lib/segment-cache.js';
 import { initQueue, enqueueExtraction, hasQueue } from '../lib/extraction-queue.js';
 import { attach, notify, isAvailable } from '../lib/ws-status.js';
 import { stopChild } from './helpers/child-process.mjs';
+import { appendHlsReloadParams, rewriteHlsManifest } from '../lib/hls-manifest.js';
+import {
+  downloadedFormatManifestPath,
+  downloadedFormatPath,
+  getDownloadedFormat,
+  invalidateDownloadedVideo,
+  listDownloadedFormats,
+  recordDownloadedFormatRanges,
+  recordDownloadedFormats,
+} from '../lib/download-files.js';
+import { parseSubscriptionHtmlOffThread } from '../lib/subscription-parser.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -101,6 +112,117 @@ function httpGetUntil(port, urlPath, predicate, headers = {}) {
   });
 }
 
+describe('HLS manifest rewriting', () => {
+  it('marks playlist references separately from segments and does not reuse same-length content', () => {
+    const master = [
+      '#EXTM3U',
+      '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",URI="audio.m3u8"',
+      '#EXT-X-STREAM-INF:BANDWIDTH=1000000,RESOLUTION=1280x720',
+      'video-a.m3u8',
+      '#EXT-X-STREAM-INF:BANDWIDTH=2000000,RESOLUTION=1280x720',
+      'video-b.m3u8',
+    ].join('\n');
+    const rewrittenMaster = rewriteHlsManifest(master, TEST_VIDEO, 'https://example.googlevideo.com/master.m3u8', 'token-a');
+    const masterUrls = rewrittenMaster.match(/\/api\/stream\/[^\s"]+/g) || [];
+    assert.strictEqual(masterUrls.length, 2, 'audio plus the best 720p variant should remain');
+    for (const value of masterUrls) {
+      const url = new URL(value, 'https://local.test');
+      assert.strictEqual(url.searchParams.get('kind'), 'playlist');
+      assert.strictEqual(url.searchParams.get('token'), 'token-a');
+    }
+    assert.match(rewrittenMaster, /video-b\.m3u8/);
+    assert.doesNotMatch(rewrittenMaster, /video-a\.m3u8/);
+
+    const mediaA = '#EXTM3U\n#EXTINF:4,\na.m4s';
+    const mediaB = '#EXTM3U\n#EXTINF:4,\nb.m4s';
+    assert.strictEqual(mediaA.length, mediaB.length);
+    const rewrittenA = rewriteHlsManifest(mediaA, TEST_VIDEO, 'https://example.googlevideo.com/a/index.m3u8', 'token-a');
+    const rewrittenB = rewriteHlsManifest(mediaB, TEST_VIDEO, 'https://example.googlevideo.com/b/index.m3u8', 'token-a');
+    assert.notStrictEqual(rewrittenA, rewrittenB);
+    const segmentUrl = new URL(rewrittenA.split('\n').at(-1), 'https://local.test');
+    assert.strictEqual(segmentUrl.searchParams.has('kind'), false);
+    assert.strictEqual(segmentUrl.searchParams.get('u'), 'https://example.googlevideo.com/a/a.m4s');
+  });
+
+  it('forwards only valid LL-HLS delivery directives', () => {
+    const forwarded = new URL(appendHlsReloadParams('https://example.googlevideo.com/live.m3u8?keep=1', {
+      _HLS_msn: '42',
+      _HLS_part: '3',
+      _HLS_skip: 'v2',
+      ignored: 'value',
+    }));
+    assert.strictEqual(forwarded.searchParams.get('keep'), '1');
+    assert.strictEqual(forwarded.searchParams.get('_HLS_msn'), '42');
+    assert.strictEqual(forwarded.searchParams.get('_HLS_part'), '3');
+    assert.strictEqual(forwarded.searchParams.get('_HLS_skip'), 'v2');
+    assert.strictEqual(forwarded.searchParams.has('ignored'), false);
+
+    const rejected = new URL(appendHlsReloadParams('https://example.googlevideo.com/live.m3u8', {
+      _HLS_msn: '42&bad=1',
+      _HLS_part: '-1',
+      _HLS_skip: 'anything',
+    }));
+    assert.strictEqual(rejected.searchParams.has('_HLS_msn'), false);
+    assert.strictEqual(rejected.searchParams.has('_HLS_part'), false);
+    assert.strictEqual(rejected.searchParams.has('_HLS_skip'), false);
+  });
+});
+
+describe('Downloaded format manifests', () => {
+  it('does not scan the download library on a request-time manifest miss', async () => {
+    const videoId = `m${Date.now().toString(36).slice(-10)}`.padEnd(11, '0').slice(0, 11);
+    const formatId = 'manifestTest';
+    const filePath = downloadedFormatPath(videoId, formatId);
+    const manifestPath = downloadedFormatManifestPath(videoId);
+    try {
+      await fs.promises.writeFile(filePath, Buffer.alloc(32));
+      invalidateDownloadedVideo(videoId);
+      assert.deepStrictEqual(await listDownloadedFormats(videoId), []);
+      assert.strictEqual(await getDownloadedFormat(videoId, formatId), null);
+
+      await recordDownloadedFormats(videoId, [{ formatId, size: 32 }]);
+      await recordDownloadedFormatRanges(videoId, {
+        [formatId]: { initRange: '0-15', indexRange: '16-31' },
+      });
+      invalidateDownloadedVideo(videoId);
+      assert.deepStrictEqual((await listDownloadedFormats(videoId)).map(entry => ({
+        formatId: entry.formatId,
+        size: entry.size,
+        ranges: entry.ranges,
+      })), [{ formatId, size: 32, ranges: { initRange: '0-15', indexRange: '16-31' } }]);
+      assert.deepStrictEqual(await getDownloadedFormat(videoId, formatId), {
+        formatId,
+        filePath,
+        size: 32,
+        ranges: { initRange: '0-15', indexRange: '16-31' },
+      });
+    } finally {
+      invalidateDownloadedVideo(videoId);
+      await fs.promises.unlink(filePath).catch(() => {});
+      await fs.promises.unlink(manifestPath).catch(() => {});
+    }
+  });
+});
+
+describe('Subscription parsing worker', () => {
+  it('parses YouTube subscription HTML without using the request event loop', async () => {
+    const html = '<script>var ytInitialData = '
+      + JSON.stringify({ contents: [{ channelRenderer: {
+        channelId: 'UC1234567890123456789012',
+        title: { simpleText: 'Worker Channel' },
+        thumbnail: { thumbnails: [{ url: 'worker.jpg' }] },
+      } }] })
+      + ';</script>';
+    const subscriptions = await parseSubscriptionHtmlOffThread(html);
+    assert.deepStrictEqual(subscriptions, [{
+      channelId: 'UC1234567890123456789012',
+      title: 'Worker Channel',
+      thumbnail: 'worker.jpg',
+      description: '',
+    }]);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // 1. Database layer (SQLite)
 // ---------------------------------------------------------------------------
@@ -176,6 +298,68 @@ describe('Database layer (SQLite)', () => {
       const subs = db.getSubscriptions(TEST_USER);
       const found = subs.find((s) => s.channelId === TEST_CHANNEL);
       assert.strictEqual(found.title, 'Updated Title');
+    });
+
+    it('should search subscriptions case-insensitively with bounded database pagination', () => {
+      const searchUser = `${TEST_USER}-search`;
+      const channelIds = Array.from({ length: 27 }, (_, index) => `UCsearch${String(index).padStart(17, '0')}`);
+      try {
+        db.upsertSubscriptions(searchUser, channelIds.map((channelId, index) => ({
+          channelId,
+          title: `Paged Match ${String(index).padStart(2, '0')}`,
+          thumbnail: '',
+          description: `Description ${index}`,
+        })));
+        db.upsertSubscriptions(searchUser, [{
+          channelId: 'UCsearchUnmatched00000000',
+          title: 'Different title',
+          thumbnail: '',
+          description: '',
+        }]);
+
+        const page = db.searchSubscriptions(searchUser, 'pAgEd MaTcH', 10, 10);
+        assert.strictEqual(page.totalResults, 27);
+        assert.strictEqual(page.items.length, 10);
+        assert.strictEqual(page.items[0].title, 'Paged Match 10');
+        assert.strictEqual(page.items[9].title, 'Paged Match 19');
+      } finally {
+        for (const channelId of channelIds) db.deleteSubscription(searchUser, channelId);
+        db.deleteSubscription(searchUser, 'UCsearchUnmatched00000000');
+      }
+    });
+
+    it('should cursor-page indexed subscription search without exact counts', () => {
+      const searchUser = `${TEST_USER}-cursor-search`;
+      const channelIds = Array.from({ length: 25 }, (_, index) => `UCcursor${String(index).padStart(18, '0')}`);
+      try {
+        db.upsertSubscriptions(searchUser, channelIds.map((channelId, index) => ({
+          channelId,
+          title: `Cursor Match ${String(index).padStart(2, '0')}`,
+          thumbnail: '',
+          description: '',
+        })));
+        const first = db.getSubscriptionsCursorPage(searchUser, 'cursor mat', 10, null, 'next');
+        assert.strictEqual(first.items.length, 10);
+        assert.strictEqual(first.hasMore, true);
+        assert.strictEqual(first.items[0].title, 'Cursor Match 00');
+
+        const firstLast = first.items.at(-1);
+        const second = db.getSubscriptionsCursorPage(searchUser, 'CURSOR MATCH', 10, {
+          title: firstLast.title,
+          channelId: firstLast.channelId,
+        }, 'next');
+        assert.strictEqual(second.items[0].title, 'Cursor Match 10');
+        assert.strictEqual(second.items.at(-1).title, 'Cursor Match 19');
+
+        const secondFirst = second.items[0];
+        const previous = db.getSubscriptionsCursorPage(searchUser, 'cursor match', 10, {
+          title: secondFirst.title,
+          channelId: secondFirst.channelId,
+        }, 'previous');
+        assert.deepStrictEqual(previous.items.map(item => item.channelId), first.items.map(item => item.channelId));
+      } finally {
+        for (const channelId of channelIds) db.deleteSubscription(searchUser, channelId);
+      }
     });
 
     it('should delete a subscription', () => {
@@ -265,6 +449,155 @@ describe('Database layer (SQLite)', () => {
     it('should return null for unknown channel', () => {
       assert.strictEqual(db.getRssCache('UC_NO_CACHE_CHANNEL_XXXXXX'), null);
     });
+
+    it('should return only stale or missing RSS refresh candidates in one query', () => {
+      const refreshUser = `${TEST_USER}-rss-refresh`;
+      const freshChannel = 'UCfreshRefresh00000000001';
+      const missingChannel = 'UCmissingRefresh000000001';
+      try {
+        db.upsertSubscriptions(refreshUser, [
+          { channelId: freshChannel, title: 'Fresh', thumbnail: '', description: '' },
+          { channelId: missingChannel, title: 'Missing', thumbnail: '', description: '' },
+        ]);
+        db.setRssCache(freshChannel, { channelTitle: 'Fresh', items: [] });
+        const staleBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+        const candidates = db.getStaleRssRefreshCandidatesForUser(refreshUser, staleBefore, 10);
+        assert.deepStrictEqual(candidates.map(candidate => candidate.channelId), [missingChannel]);
+        assert.strictEqual(candidates[0].fetchedAt, null);
+      } finally {
+        db.deleteSubscription(refreshUser, freshChannel);
+        db.deleteSubscription(refreshUser, missingChannel);
+      }
+    });
+
+    it('should maintain queryable normalized RSS rows with SQL limits', async () => {
+      await db.upsertSubscriptions(TEST_USER, [{
+        channelId: TEST_CHANNEL, title: 'Normalized Feed', thumbnail: '', description: '',
+      }]);
+      await db.setRssCache(TEST_CHANNEL, {
+        channelTitle: 'Normalized Feed',
+        items: [
+          { videoId: 'rssOlder001', title: 'Older', publishedAt: '2026-07-30T12:00:00.000Z', channelId: TEST_CHANNEL },
+          { videoId: 'rssNewer001', title: 'Newer', publishedAt: '2026-08-01T12:00:00.000Z', channelId: TEST_CHANNEL },
+        ],
+      });
+      const rows = await db.getRssVideosForUser(TEST_USER, '2026-08-01T00:00:00.000Z', 1, 10);
+      assert.deepStrictEqual(rows.map(row => row.video_id), ['rssNewer001']);
+      assert.strictEqual(rows[0].sub_title, 'Normalized Feed');
+      await db.setDuration('rssNewer001', 321, 'not_live');
+      const todayPage = await db.getRssVideosPageForUser(
+        TEST_USER, '2026-08-01T00:00:00.000Z', 30, 1, 0,
+      );
+      assert.strictEqual(todayPage.totalResults, 1);
+      assert.strictEqual(todayPage.items[0].video_id, 'rssNewer001');
+      assert.strictEqual(Number(todayPage.items[0].duration), 321);
+      assert.strictEqual(todayPage.items[0].live_status, 'not_live');
+      const cursorPage = await db.getRssVideosCursorPageForUser(
+        TEST_USER, null, 30, 1, null, 'older',
+      );
+      assert.strictEqual(cursorPage.hasMore, true);
+      assert.strictEqual(cursorPage.items[0].video_id, 'rssNewer001');
+      const olderCursorPage = await db.getRssVideosCursorPageForUser(
+        TEST_USER, null, 30, 1, {
+          publishedAt: cursorPage.items[0].published_at,
+          videoId: cursorPage.items[0].video_id,
+        }, 'older',
+      );
+      assert.strictEqual(olderCursorPage.items[0].video_id, 'rssOlder001');
+      const newerCursorPage = await db.getRssVideosCursorPageForUser(
+        TEST_USER, null, 30, 1, {
+          publishedAt: olderCursorPage.items[0].published_at,
+          videoId: olderCursorPage.items[0].video_id,
+        }, 'newer',
+      );
+      assert.strictEqual(newerCursorPage.items[0].video_id, 'rssNewer001');
+      const display = await db.getVideoDisplayMetadata('rssNewer001');
+      assert.deepStrictEqual(display, {
+        title: 'Newer', channelId: TEST_CHANNEL, channelTitle: 'Normalized Feed',
+      });
+      const beyondToday = await db.getRssVideosPageForUser(
+        TEST_USER, '2026-08-01T00:00:00.000Z', 30, 1, 100,
+      );
+      assert.strictEqual(beyondToday.items.length, 0);
+      assert.strictEqual(beyondToday.totalResults, 1);
+      const snapshot = await db.getExploreRssSnapshotForUser(
+        TEST_USER, 6, 10, 365, '2026-07-31T00:00:00.000Z'
+      );
+      assert.deepStrictEqual(snapshot.videos.map(row => row.video_id), ['rssNewer001', 'rssOlder001']);
+      const stats = snapshot.channelStats.find(row => row.channel_id === TEST_CHANNEL);
+      assert.ok(stats, 'Expected materialized channel cadence stats');
+      assert.strictEqual(Number(stats.video_count), 2);
+      assert.strictEqual(stats.newest_published_at, '2026-08-01T12:00:00.000Z');
+      assert.strictEqual(Number(stats.median_interval_ms), 2 * 24 * 60 * 60 * 1000);
+
+      await db.setRssCache(TEST_CHANNEL, {
+        channelTitle: 'Normalized Feed',
+        items: [
+          { videoId: 'rssNewer001', title: 'Newer', publishedAt: '2026-08-01T12:00:00.000Z', channelId: TEST_CHANNEL },
+        ],
+      }, { etag: '"feed-v2"', lastModified: 'Sat, 01 Aug 2026 12:00:00 GMT' });
+      const updatedRows = await db.getRssVideosForUser(TEST_USER, null, 30, 10);
+      assert.deepStrictEqual(updatedRows.map(row => row.video_id), ['rssNewer001']);
+      const updatedCache = await db.getRssCache(TEST_CHANNEL);
+      assert.deepStrictEqual(updatedCache.validators, {
+        etag: '"feed-v2"',
+        lastModified: 'Sat, 01 Aug 2026 12:00:00 GMT',
+      });
+      await db.touchRssCache(TEST_CHANNEL, { etag: '"feed-v2"' });
+      assert.strictEqual((await db.getRssCache(TEST_CHANNEL)).validators.etag, '"feed-v2"');
+    });
+
+    it('should elect only one database maintenance runner per lease', async () => {
+      const lease = `integration-maintenance-${Date.now()}`;
+      assert.strictEqual(await db.claimMaintenanceLease(lease, 60), true);
+      assert.strictEqual(await db.claimMaintenanceLease(lease, 60), false);
+      if (db.optimizeDatabase) assert.strictEqual(await db.optimizeDatabase(), true);
+    });
+
+    it('should persist versioned schema migration markers', async () => {
+      const migration = 'integration-test-marker-v1';
+      await db.recordSchemaMigration(migration);
+      assert.strictEqual(await db.hasSchemaMigration(migration), true);
+      await db.recordSchemaMigration(migration);
+      assert.strictEqual(await db.hasSchemaMigration(migration), true);
+    });
+
+    it('should load all player bootstrap state in one database call', async () => {
+      const videoId = 'bootstrap01';
+      await db.setRssCache(TEST_CHANNEL, {
+        channelTitle: 'Bootstrap Channel',
+        items: [{
+          videoId,
+          title: 'Bootstrap Video',
+          publishedAt: '2026-08-02T12:00:00.000Z',
+          channelId: TEST_CHANNEL,
+        }],
+      });
+      await db.addTag(TEST_USER, videoId, 'fast');
+      await db.rateVideo(TEST_USER, videoId, 1);
+      await db.setWatchTime(TEST_USER, videoId, 42, 300);
+      await db.setDuration(videoId, 300, 'not_live');
+      await db.upsertDownload(videoId, 'Downloaded Bootstrap', 'Bootstrap Channel', '');
+      await db.completeDownload(videoId);
+
+      const bootstrap = await db.getPlayerBootstrapData(TEST_USER, videoId, true);
+      assert.deepStrictEqual(bootstrap.display, {
+        title: 'Bootstrap Video',
+        channelTitle: 'Normalized Feed',
+        channelId: TEST_CHANNEL,
+      });
+      assert.strictEqual(bootstrap.download?.status, 'complete');
+      assert.deepStrictEqual(bootstrap.tags, ['fast']);
+      assert.strictEqual(bootstrap.rating, 1);
+      assert.deepStrictEqual(bootstrap.watchTime, { last_position: 42, duration: 300 });
+      assert.strictEqual(bootstrap.liveStatus, 'not_live');
+
+      const withoutWatchTime = await db.getPlayerBootstrapData(TEST_USER, videoId, false);
+      assert.strictEqual(withoutWatchTime.watchTime, null);
+      await db.removeTag(TEST_USER, videoId, 'fast');
+      await db.unrateVideo(TEST_USER, videoId);
+      await db.deleteDownload(videoId);
+    });
   });
 
   describe('upsertDownload / getDownload / getAllDownloads / completeDownload / deleteDownload', () => {
@@ -285,6 +618,38 @@ describe('Database layer (SQLite)', () => {
       assert.ok(found);
     });
 
+    it('should return a bounded downloads page and total count', () => {
+      const page = db.getDownloadsPage(1, 0);
+      assert.ok(page.totalResults >= 1);
+      assert.strictEqual(page.items.length, 1);
+      assert.strictEqual(page.items[0].video_id, DL_VIDEO);
+    });
+
+    it('should traverse downloads in both cursor directions without gaps', () => {
+      const ids = ['000cursorA1', '000cursorB1', '000cursorC1'];
+      try {
+        for (const id of ids) db.upsertDownload(id, id, 'Cursor Channel', '');
+        const first = db.getDownloadsCursorPage(2, null, 'next');
+        assert.strictEqual(first.hasMore, true);
+        const second = db.getDownloadsCursorPage(2, {
+          timestamp: first.items[1].created_at,
+          id: first.items[1].video_id,
+        }, 'next');
+        assert.ok(second.items.length > 0);
+        assert.ok(!first.items.some(item => item.video_id === second.items[0].video_id));
+        const previous = db.getDownloadsCursorPage(2, {
+          timestamp: second.items[0].created_at,
+          id: second.items[0].video_id,
+        }, 'previous');
+        assert.deepStrictEqual(
+          previous.items.map(item => item.video_id),
+          first.items.map(item => item.video_id),
+        );
+      } finally {
+        for (const id of ids) db.deleteDownload(id);
+      }
+    });
+
     it('should complete a download', () => {
       db.completeDownload(DL_VIDEO);
       const dl = db.getDownload(DL_VIDEO);
@@ -295,6 +660,21 @@ describe('Database layer (SQLite)', () => {
       db.deleteDownload(DL_VIDEO);
       const dl = db.getDownload(DL_VIDEO);
       assert.strictEqual(dl, null);
+    });
+
+    it('should atomically account and reconcile download storage', async () => {
+      const before = await db.getDownloadStorageUsage();
+      const adjustedBytes = await db.adjustDownloadStorageBytes(1234);
+      assert.strictEqual(adjustedBytes, before.storedBytes + 1234);
+      const adjusted = await db.getDownloadStorageUsage();
+      assert.strictEqual(await db.reconcileDownloadStorageBytes(42, before.version), false);
+      assert.strictEqual(await db.reconcileDownloadStorageBytes(42, adjusted.version), true);
+      const reconciled = await db.getDownloadStorageUsage();
+      assert.strictEqual(reconciled.storedBytes, 42);
+      assert.strictEqual(
+        await db.reconcileDownloadStorageBytes(before.storedBytes, reconciled.version),
+        true,
+      );
     });
   });
 
@@ -316,6 +696,113 @@ describe('Database layer (SQLite)', () => {
       db.setWatchTime(TEST_USER, TEST_VIDEO, 100, 300);
       const wt = db.getWatchTime(TEST_USER, TEST_VIDEO);
       assert.strictEqual(wt.last_position, 100);
+    });
+
+    it('should increment and reverse Explore rollups and co-watch edges', async () => {
+      const user = `rollup-user-${Date.now()}`;
+      const source = 'rollupA0001';
+      const related = 'rollupB0001';
+      db.setWatchTime(user, source, 50, 100);
+      db.setWatchTime(user, related, 50, 100);
+      let signals = await db.getExploreCandidateSignals(
+        [related], [related], [related], [], 'different-user', 24,
+      );
+      assert.strictEqual(signals.videoPopularity[related], 1);
+      let cowatched = await db.getCoWatchedVideos([source], 'different-user', 10, 90, 100);
+      assert.ok(cowatched.some(row => row.video_id === related && Number(row.score) === 1));
+
+      db.setWatchTime(user, related, 10, 100);
+      signals = await db.getExploreCandidateSignals(
+        [related], [related], [related], [], 'different-user', 24,
+      );
+      assert.strictEqual(signals.videoPopularity[related], 0);
+      cowatched = await db.getCoWatchedVideos([source], 'different-user', 10, 90, 100);
+      assert.ok(!cowatched.some(row => row.video_id === related));
+      db.setWatchTime(user, source, 10, 100);
+    });
+
+    it('should aggregate Explore impressions once per channel batch and expose user behavior rollups', async () => {
+      const user = `behavior-rollup-${Date.now()}`;
+      const channelId = 'UCbehaviorRollup00000001';
+      const firstVideo = 'behavVid001';
+      const secondVideo = 'behavVid002';
+      try {
+        db.logExploreImpressions(user, [
+          { videoId: firstVideo, channelId, position: 1 },
+          { videoId: secondVideo, channelId, position: 2 },
+        ]);
+        db.logExploreImpressions(user, [{ videoId: firstVideo, channelId, position: 3 }]);
+        db.logExploreClick(user, firstVideo, channelId);
+        db.logExploreClick(user, firstVideo, channelId);
+        db.logExploreBounce(user, firstVideo, channelId, 12);
+        db.logExploreReturn(user, firstVideo, channelId);
+        db.logExploreReturn(user, firstVideo, channelId);
+
+        const signals = await db.getExploreUserSignals(
+          user,
+          [firstVideo, secondVideo],
+          [channelId],
+          90,
+        );
+        assert.deepStrictEqual(signals.channelBehaviors[channelId], {
+          impressions: 3,
+          clicks: 1,
+          bounces: 1,
+          returns: 2,
+        });
+        assert.strictEqual(signals.returnChannelCounts[channelId], 2);
+        const globalSignals = await db.getExploreCandidateSignals(
+          [], [], [], [channelId], user, 24,
+        );
+        assert.strictEqual(globalSignals.channelImpressionCounts[channelId], 3);
+      } finally {
+        db.resetRecommendations(user);
+      }
+    });
+
+    it('should cursor-page queue, saved playlists, and local playlist items', async () => {
+      const user = `cursor-library-${Date.now()}`;
+      const queueIds = ['queueCurA01', 'queueCurB01', 'queueCurC01'];
+      const playlistIds = ['local_cursor_a', 'local_cursor_b', 'local_cursor_c'];
+      const localId = 'local_cursor_items';
+      try {
+        for (const id of queueIds) db.queueVideo(user, id, id, '', '');
+        const queueFirst = await db.getQueuedVideosCursorPage(user, 2, null, 'next');
+        const queueNext = await db.getQueuedVideosCursorPage(user, 2, {
+          timestamp: queueFirst.items[1].created_at,
+          id: queueFirst.items[1].video_id,
+        }, 'next');
+        assert.deepStrictEqual(queueFirst.items.concat(queueNext.items).map(item => item.video_id), queueIds);
+
+        for (const id of playlistIds) db.savePlaylist(user, id, id, '', '', '', '0 videos', 'local');
+        const savedFirst = await db.getSavedPlaylistsCursorPage(user, 2, null, 'next');
+        const savedNext = await db.getSavedPlaylistsCursorPage(user, 2, {
+          timestamp: savedFirst.items[1].updated_at,
+          id: savedFirst.items[1].playlist_id,
+        }, 'next');
+        assert.deepStrictEqual(savedFirst.items.concat(savedNext.items).map(item => item.playlist_id), playlistIds);
+
+        const youtubePlaylistIds = ['PL_cursor_youtube_a', 'PL_cursor_youtube_b'];
+        for (const id of youtubePlaylistIds) db.savePlaylist(user, id, id, '', '', '', '0 videos', 'youtube');
+        const selectedYoutubePlaylists = await db.getSavedYoutubePlaylistIds(user, 1);
+        assert.strictEqual(selectedYoutubePlaylists.length, 1);
+        assert.ok(youtubePlaylistIds.includes(selectedYoutubePlaylists[0]));
+
+        db.savePlaylist(user, localId, 'Items', '', '', '', '0 videos', 'local');
+        for (const id of queueIds) db.addLocalPlaylistItem(user, localId, id, id, '', '');
+        const localFirst = await db.getLocalPlaylistItemsCursorPage(user, localId, 2, null, 'next');
+        const localNext = await db.getLocalPlaylistItemsCursorPage(user, localId, 2, {
+          position: localFirst.items[1].position,
+          createdAt: localFirst.items[1].created_at,
+          videoId: localFirst.items[1].video_id,
+        }, 'next');
+        assert.deepStrictEqual(localFirst.items.concat(localNext.items).map(item => item.video_id), queueIds);
+      } finally {
+        for (const id of queueIds) db.unqueueVideo(user, id);
+        for (const id of playlistIds) db.unsavePlaylist(user, id);
+        for (const id of ['PL_cursor_youtube_a', 'PL_cursor_youtube_b']) db.unsavePlaylist(user, id);
+        db.unsavePlaylist(user, localId);
+      }
     });
   });
 
@@ -754,10 +1241,60 @@ describe('HTTP endpoint smoke tests', () => {
     assert.strictEqual(res.status, 204);
   });
 
-  it('GET /native-player-engine.js should always revalidate the player runtime', async () => {
-    const res = await httpGet(TEST_PORT, '/native-player-engine.js?v=17');
+  it('GET /metrics should expose bounded Prometheus performance series', async () => {
+    const res = await httpGet(TEST_PORT, '/metrics');
     assert.strictEqual(res.status, 200);
-    assert.match(res.headers['cache-control'] || '', /no-cache/);
+    assert.match(res.headers['content-type'] || '', /text\/plain/);
+    assert.strictEqual(res.headers['cache-control'], 'no-store');
+    assert.match(res.body, /process_uptime_seconds/);
+    assert.match(res.body, /http_request_duration_ms/);
+  });
+
+  it('GET /metrics should reject a public client forwarded by the local reverse proxy', async () => {
+    const res = await httpGet(TEST_PORT, '/metrics', { 'X-Forwarded-For': '203.0.113.5' });
+    assert.strictEqual(res.status, 404);
+  });
+
+  it('records bounded stream completion, first-byte, byte, and duration telemetry', async () => {
+    const streamRes = await httpGet(TEST_PORT, `/api/stream/${TEST_VIDEO}/progressive`);
+    assert.strictEqual(streamRes.status, 401);
+    // Metrics snapshots are intentionally cached to keep scrape cost bounded.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    const metrics = await httpGet(TEST_PORT, '/metrics');
+    assert.match(metrics.body, /stream_responses_total\{operation="progressive",result="complete",status="4xx"\}/);
+    assert.match(metrics.body, /stream_response_first_byte_seconds_count\{operation="progressive"\}/);
+    assert.match(metrics.body, /stream_response_bytes_total\{operation="progressive",result="complete"\}/);
+    assert.match(metrics.body, /stream_response_duration_seconds_count\{operation="progressive",result="complete",status="4xx"\}/);
+  });
+
+  it('GET /native-player-engine.min.js should cache the versioned player runtime immutably', async () => {
+    const res = await httpGet(TEST_PORT, '/native-player-engine.min.js?v=contenthash');
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers['cache-control'] || '', /immutable/);
+  });
+
+  it('GET /native-player-engine.min.js should serve its precompressed Brotli build', async () => {
+    const res = await httpGet(TEST_PORT, '/native-player-engine.min.js?v=contenthash', {
+      'Accept-Encoding': 'br, gzip',
+    });
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.headers['content-encoding'], 'br');
+    assert.match(res.headers.vary || '', /Accept-Encoding/i);
+    assert.match(res.headers['cache-control'] || '', /immutable/);
+  });
+
+  it('GET /player-page.min.js should cache the versioned page runtime immutably', async () => {
+    const res = await httpGet(TEST_PORT, '/player-page.min.js?v=contenthash');
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers['cache-control'] || '', /immutable/);
+    assert.match(res.body, /window\.__playerBootstrap/);
+  });
+
+  it('GET /player-telemetry.min.js should serve the optional feature chunk immutably', async () => {
+    const res = await httpGet(TEST_PORT, '/player-telemetry.min.js?v=contenthash');
+    assert.strictEqual(res.status, 200);
+    assert.match(res.headers['cache-control'] || '', /immutable/);
+    assert.match(res.body, /PlayerTelemetry/);
   });
 
   it('GET /auth/login should return 200', async () => {
@@ -801,15 +1338,18 @@ describe('HTTP endpoint smoke tests', () => {
     const res = await httpGetUntil(
       TEST_PORT,
       `/watch?v=${TEST_VIDEO}`,
-      (body) => body.includes('/native-player-engine.js'),
+      (body) => /\/player-page\.min\.js\?v=[a-f0-9]{16}/.test(body),
       { Cookie: cookie }
     );
 
     assert.strictEqual(res.status, 200);
     assert.match(res.body, /<main[^>]*class="[^"]*player-page/);
-    assert.ok(res.body.includes('/native-player-engine.js'), 'Should load the native player engine in the shell');
+    assert.match(res.body, /\/native-player-engine\.min\.js\?v=[a-f0-9]{16}/, 'Should load the content-versioned native player engine in the shell');
+    assert.match(res.body, /\/player-telemetry\.min\.js\?v=[a-f0-9]{16}/, 'Should load the content-versioned telemetry chunk');
+    assert.match(res.body, /\/player-page\.min\.js\?v=[a-f0-9]{16}/, 'Should load the content-versioned page runtime in the shell');
     assert.ok(!res.body.includes('/vendor/shaka/shaka-player.compiled.js'), 'Should not eager-load Shaka in the watch shell');
     assert.ok(!res.body.includes('/player-engine.js'), 'Should not load the legacy Shaka-primary engine in the watch shell');
+    assert.strictEqual(res.headers['x-accel-buffering'], 'no');
   });
 
   it('GET /live/:videoId should redirect to /watch?v= (YouTube live share links)', async () => {
@@ -837,6 +1377,36 @@ describe('HTTP endpoint smoke tests', () => {
       duration: 300,
     });
     assert.strictEqual(res.status, 401);
+  });
+
+  it('coalesces watch-time updates while preserving immediate reads and completion', async () => {
+    const login = await httpRequest(TEST_PORT, 'POST', '/auth/free');
+    const cookie = Array.isArray(login.headers['set-cookie'])
+      ? login.headers['set-cookie'].map((value) => value.split(';')[0]).join('; ')
+      : '';
+    assert.ok(cookie, 'Expected auth cookie from /auth/free');
+    const headers = { Cookie: cookie };
+
+    const first = await httpRequest(TEST_PORT, 'POST', `/api/watch-time/${TEST_VIDEO}`, {
+      position: 25,
+      duration: 300,
+    }, headers);
+    const second = await httpRequest(TEST_PORT, 'POST', `/api/watch-time/${TEST_VIDEO}`, {
+      position: 50,
+      duration: 300,
+    }, headers);
+    assert.strictEqual(first.status, 200);
+    assert.strictEqual(second.status, 200);
+    const visible = await httpGet(TEST_PORT, `/api/watch-time/${TEST_VIDEO}`, headers);
+    assert.deepStrictEqual(JSON.parse(visible.body), { position: 50, duration: 300 });
+
+    const completed = await httpRequest(TEST_PORT, 'POST', `/api/watch-time/${TEST_VIDEO}`, {
+      position: 295,
+      duration: 300,
+    }, headers);
+    assert.strictEqual(completed.status, 200);
+    const final = await httpGet(TEST_PORT, `/api/watch-time/${TEST_VIDEO}`, headers);
+    assert.deepStrictEqual(JSON.parse(final.body), { position: 0, duration: 300 });
   });
 
   it('POST /api/player-events should accept sanitized first-party telemetry without session', async () => {

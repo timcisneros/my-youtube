@@ -24,10 +24,10 @@ router.post('/', ensureAuth, async (req, res) => {
   res.json({ ok: true, channelMuted });
 });
 
-router.delete('/', ensureAuth, (req, res) => {
+router.delete('/', ensureAuth, async (req, res) => {
   const { videoId } = req.body;
   if (!videoId) return res.status(400).json({ error: 'videoId required' });
-  db.undismissVideo(req.session.userId, videoId);
+  await db.undismissVideo(req.session.userId, videoId);
   cache.exploreVideos.delete(req.session.userId);
   res.json({ ok: true });
 });

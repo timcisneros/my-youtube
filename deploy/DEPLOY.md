@@ -5,7 +5,7 @@ that proxies all content through your own infrastructure with zero Google tracki
 reaching your users.
 
 **Architecture overview**: Express web app (cluster mode) + BullMQ extraction workers
-+ Redis (cache/queue) + PostgreSQL or SQLite (metadata) + MinIO/S3 (segment storage)
++ Redis (cache/queue/sessions) + PostgreSQL or SQLite (metadata) + bounded local download storage
 + nginx (reverse proxy/TLS).
 
 ---
@@ -46,7 +46,7 @@ sudo chmod +x /usr/local/bin/yt-dlp
 # nginx + certbot
 sudo apt install -y nginx certbot python3-certbot-nginx
 
-# Optional: Redis (for shared caches across cluster workers + BullMQ queue)
+# Redis is required for clustered sessions, shared caches, and BullMQ queues.
 sudo apt install -y redis-server
 sudo systemctl enable redis-server
 ```
@@ -75,7 +75,9 @@ sudo -u myyoutube bash
 cd /opt/myyoutube
 git clone https://your-repo-url.git app
 cd app
-npm ci --production
+YOUTUBE_DL_SKIP_DOWNLOAD=1 npm ci
+npm run build
+npm prune --omit=dev
 ```
 
 ### 4. Configure Environment
@@ -89,15 +91,8 @@ PORT=3000
 # Database: leave unset for SQLite, or set for PostgreSQL
 # DATABASE_URL=postgres://myyoutube:secretpassword@localhost:5432/myyoutube
 
-# Redis: enables shared caching + BullMQ extraction queue
+# Redis: required by the default clustered production entrypoint
 REDIS_URL=redis://localhost:6379
-
-# S3/MinIO storage (optional — falls back to local filesystem)
-# STORAGE_URL=s3://myyoutube
-# S3_ENDPOINT=http://localhost:9000
-# S3_ACCESS_KEY=minioadmin
-# S3_SECRET_KEY=minioadmin
-# S3_REGION=us-east-1
 
 # Session secret — generate with: openssl rand -hex 32
 SESSION_SECRET=CHANGE_ME_GENERATE_WITH_openssl_rand_hex_32
@@ -107,7 +102,50 @@ STREAM_SECRET=CHANGE_ME_GENERATE_WITH_openssl_rand_hex_32
 
 # Extraction concurrency
 MAX_CONCURRENT_YTDLP=4
+YTDLP_MAX_QUEUE=128
+YTDLP_QUEUE_TIMEOUT_MS=75000
 MAX_EXTRACTION_WORKERS=2
+EXTRACTION_QUEUE_MAX_JOBS=200
+# Preserve 50 of those admission slots for clicked playback instead of prefetch.
+EXTRACTION_QUEUE_PLAYBACK_RESERVE=50
+EXTRACTION_QUEUE_JOB_MAX_AGE_MS=180000
+
+# Bound offline-download ingress and prevent one requester filling the queue.
+DOWNLOAD_QUEUE_MAX_JOBS=100
+DOWNLOAD_QUEUE_MAX_JOBS_PER_OWNER=5
+DOWNLOAD_QUEUE_JOB_MAX_AGE_MS=600000
+DOWNLOAD_MAX_FORMAT_BYTES=12884901888
+DOWNLOAD_MAX_VIDEO_BYTES=21474836480
+DOWNLOAD_STORAGE_MAX_BYTES=214748364800
+DOWNLOAD_MIN_FREE_BYTES=2147483648
+DOWNLOAD_MIN_FREE_RATIO=0.05
+DOWNLOAD_UNKNOWN_FORMAT_RESERVATION_BYTES=2147483648
+DOWNLOAD_PART_MAX_AGE_MS=21600000
+
+# nginx is the one trusted reverse-proxy hop on this deployment
+TRUST_PROXY_HOPS=1
+STATUS_MAX_CONNECTIONS=1000
+STATUS_MAX_CONNECTIONS_PER_IP=8
+STATUS_CONNECTION_MAX_AGE_MS=45000
+DURATION_STATUS_MAX_AGE_MS=30000
+
+# Coalesce progress updates and bound database write pressure
+WATCH_TIME_MAX_PENDING=10000
+WATCH_TIME_WRITE_CONCURRENCY=4
+
+# Bound cold SQLite reads and distinct in-flight request keys
+SQLITE_EXPLORE_WORKER_MAX_PENDING=64
+SQLITE_EXPLORE_WORKER_TIMEOUT_MS=5000
+SINGLEFLIGHT_MAX_KEYS=500
+MAX_METADATA_INFLIGHT=256
+
+# Aggregate active upstream media bodies across web workers
+OUTBOUND_MEDIA_GLOBAL_CONCURRENCY=128
+OUTBOUND_MEDIA_MAX_QUEUE=512
+OUTBOUND_MEDIA_QUEUE_TIMEOUT_MS=10000
+
+# Bound hostile/accidental deep OFFSET requests.
+PAGINATION_MAX_PAGE=2500
 EOF
 
 sudo chmod 600 /etc/myyoutube/env
@@ -188,7 +226,7 @@ echo '0 3 * * * myyoutube pg_dump -U myyoutube -h localhost myyoutube | gzip > /
 **Retention**: keep 7 daily, 4 weekly, 3 monthly backups. Use logrotate or a simple
 script to prune old files.
 
-**Local file storage** (when not using S3/MinIO):
+**Download storage**:
 
 ```bash
 # Rsync data directory to backup location
@@ -199,8 +237,8 @@ rsync -a /opt/myyoutube/app/data/downloads/ /opt/myyoutube/backups/downloads/
 
 ## Docker Deployment (10K-100K users)
 
-Uses the provided `docker-compose.yml` which includes PostgreSQL, Redis, MinIO,
-the web app, and extraction workers.
+Uses the provided `docker-compose.yml` which includes PostgreSQL, dedicated
+coordination/cache Redis instances, the web app, and extraction/download workers.
 
 ### 1. Prepare Host
 
@@ -218,13 +256,14 @@ cd /opt/myyoutube/app
 # Create .env file
 cat > .env << 'EOF'
 POSTGRES_PASSWORD=your-strong-pg-password-here
-S3_ACCESS_KEY=your-minio-access-key
-S3_SECRET_KEY=your-minio-secret-key
 SESSION_SECRET=generate-with-openssl-rand-hex-32
 STREAM_SECRET=generate-with-openssl-rand-hex-32
 MAX_CONCURRENT_YTDLP=4
+YTDLP_MAX_QUEUE=128
+YTDLP_QUEUE_TIMEOUT_MS=75000
 MAX_EXTRACTION_WORKERS=2
 EXTRACTION_REPLICAS=2
+OUTBOUND_MEDIA_GLOBAL_CONCURRENCY=128
 EOF
 
 chmod 600 .env
@@ -253,14 +292,20 @@ docker compose up -d --scale extraction-worker=4
 # E.g., 4 containers * 2 workers each = 8 concurrent extractions
 ```
 
-### 5. Put nginx in Front
+### 5. Edge Cache and TLS
 
-On the Docker host, install nginx and proxy to port 3000:
+Compose includes an `edge` Nginx service on `${PORT:-3000}`. It is the only
+published application port and keeps a bounded persistent cache for posters,
+thumbnails, and VOD storyboard sheets. Express remains private on the Compose
+network.
+
+For a public hostname, terminate TLS at a host/load-balancer proxy and forward
+to the configured Compose `PORT`:
 
 ```bash
-# Use the same nginx.conf from the project root
-# Set upstream to 127.0.0.1:3000
-# Set up Let's Encrypt as in the single-machine section
+# Forward to 127.0.0.1:${PORT:-3000}
+# Set up Let's Encrypt as in the single-machine section.
+# Do not bypass the Compose edge service or thumbnail cache misses will reach Node.
 ```
 
 ### 6. Monitoring
@@ -305,7 +350,7 @@ For production, ship Docker logs to a central location:
 docker compose stop
 
 # Backup all named volumes
-for vol in pg_data redis_data minio_data app_data; do
+for vol in pg_data redis_data app_data; do
   docker run --rm -v "$(basename $(pwd))_${vol}:/data" -v /opt/myyoutube/backups:/backup \
     alpine tar czf "/backup/${vol}-$(date +%Y%m%d).tar.gz" -C /data .
 done
@@ -380,11 +425,6 @@ docker compose exec extraction-worker yt-dlp -U
                   |  PostgreSQL     |
                   |  Primary + Read |
                   |  Replicas       |
-                  +-----------------+
-                           |
-                  +--------+--------+
-                  |  MinIO          |
-                  |  Distributed    |
                   +-----------------+
 ```
 
@@ -506,7 +546,7 @@ Deploy them on separate VPS instances with different IP addresses to avoid
 YouTube rate limiting.
 
 **Per worker VPS**: 2 vCPU, 4GB RAM, 50GB SSD. Install Node.js, yt-dlp, ffmpeg.
-Run `node extraction-worker.js` via systemd, pointed at the central Redis.
+Run `node dist/extraction-worker.js` via systemd, pointed at the central Redis.
 
 ### IP Rotation Strategy
 
@@ -584,21 +624,13 @@ socks pass {
 # yt-dlp --proxy socks5://proxy2:1080 ...
 ```
 
-### MinIO Distributed Mode
+### Multi-node Download Storage
 
-For durability and performance across nodes:
-
-```bash
-# On 4+ nodes with dedicated disks:
-minio server http://minio{1...4}.example.com/data{1...4} \
-  --console-address ":9001"
-
-# Environment on each node:
-export MINIO_ROOT_USER=your-access-key
-export MINIO_ROOT_PASSWORD=your-secret-key
-```
-
-This provides erasure-coded storage across nodes with automatic healing.
+Completed downloads currently use the POSIX filesystem under `data/downloads`.
+Keep the download worker and serving web nodes on the same shared filesystem,
+or pin download traffic to a node with its corresponding persistent volume.
+The worker enforces global byte reservations and free-space watermarks, but it
+does not treat an object store as a transparent filesystem.
 
 ### CDN Layer
 
@@ -646,33 +678,144 @@ mode and self-host your CDN with Varnish.
 
 ---
 
+## Performance regression checks
+
+Run the SQLite benchmark without external services:
+
+```bash
+npm run benchmark:backend
+```
+
+Run the PostgreSQL benchmark against a non-production database URL. It creates
+an isolated temporary schema, reports `EXPLAIN (ANALYZE, BUFFERS)` summaries,
+enforces p95 budgets, and drops the schema when complete:
+
+```bash
+PERFORMANCE_DATABASE_URL=postgres://myyoutube:password@localhost:5432/myyoutube \
+  npm run benchmark:backend:pg
+```
+
+CI runs this benchmark against PostgreSQL 16 with an isolated temporary schema.
+The script removes that schema even when a budget fails.
+
+### Real-video staging canary
+
+The fixture benchmark remains the deterministic pull-request gate. Run the
+real-video canary against an isolated staging deployment to cover YouTube
+extraction, manifest probing, media first byte, the decoded first frame, and
+native-player fallback behavior:
+
+```bash
+PLAYER_CANARY_BASE_URL=https://staging.example.com \
+PLAYER_CANARY_VIDEO_IDS=vod:BaW_jenozKc,live:REPLACE_ID,restricted:REPLACE_ID \
+PLAYER_CANARY_METRICS_TOKEN=replace-with-the-staging-metrics-token \
+PLAYER_CANARY_REQUIRE_CATEGORIES=1 \
+PLAYER_CANARY_REQUIRE_METRICS=1 \
+  npm run canary:player
+```
+
+Every sample uses a new browser context with service workers disabled. For a
+true server-cold run, point it at a freshly started staging deployment; the
+canary deliberately does not expose a production cache-purge endpoint. It
+writes `tmp/player-canary/latest.json` and exits non-zero when the document,
+manifest, first-media-byte, first-frame, failure-rate, fallback-rate, or
+coverage budgets fail. All thresholds can be overridden with the environment
+variables printed by `npm run canary:player -- --help`.
+
+The scheduled `.github/workflows/player-canary.yml` job activates when the
+`PLAYER_CANARY_BASE_URL` and `PLAYER_CANARY_VIDEO_IDS` repository variables are
+configured. Store `PLAYER_CANARY_METRICS_TOKEN` and, if `/auth/free` is not
+available in staging, `PLAYER_CANARY_COOKIE` as repository secrets. Use stable
+representative VOD and restricted IDs, and rotate the live ID as broadcasts
+end.
+
+Configure and start it with the GitHub CLI after replacing the example values:
+
+```bash
+gh variable set PLAYER_CANARY_BASE_URL --body https://staging.example.com
+gh variable set PLAYER_CANARY_VIDEO_IDS --body 'vod:BaW_jenozKc,live:REPLACE_ID,restricted:REPLACE_ID'
+gh secret set PLAYER_CANARY_METRICS_TOKEN
+gh workflow run player-canary.yml
+```
+
+For a one-off run, the workflow dispatch form also accepts `base_url`,
+`video_ids`, and `samples` inputs without requiring repository variables.
+
 ## Monitoring & Alerting
 
 ### Prometheus Metrics
 
-Add a `/metrics` endpoint to the Express app (or use a sidecar exporter).
-Key metrics to track:
+The app exposes `GET /metrics` to loopback clients or callers bearing the
+configured `METRICS_TOKEN`. Labels are deliberately bounded; raw video IDs and
+upstream CDN hostnames are never metric labels. Key metrics include:
 
 ```
 # Request latency histogram
-http_request_duration_seconds{method, route, status_code}
+http_request_duration_ms{method, route, status}
 
-# Extraction queue depth
-extraction_queue_waiting_total
-extraction_queue_active_total
+# Media delivery latency, volume, and disconnects
+stream_response_first_byte_seconds{operation}
+stream_response_duration_seconds{operation, result, status}
+stream_response_bytes_total{operation, result}
+stream_responses_total{operation, result="complete|aborted", status}
 
-# Extraction success/failure rate
-extraction_total{status="success|failure|timeout"}
+# RSS queue depth and batch throughput
+rss_queue_waiting_jobs
+rss_queue_active_jobs
+rss_queue_batches_total{result, priority}
+rss_queue_batch_size{priority}
+
+# Saved-playlist background refresh pressure
+playlist_refresh_queue_depth
+playlist_refresh_active
+playlist_refresh_jobs_total{result}
 
 # Cache hit rates
-cache_hits_total{layer="l1|l2", namespace}
-cache_misses_total{layer="l1|l2", namespace}
+cache_requests_total{namespace, result="l1_hit|l2_hit|miss"}
 
-# Active WebSocket connections (SSE status)
-ws_connections_active
+# Extraction pressure
+ytdlp_active_jobs
+ytdlp_waiting_jobs
+ytdlp_admission_total{backend, priority, result}
+extraction_queue_jobs{state="active|waiting|prioritized|delayed"}
+extraction_queue_admitted_jobs
+extraction_queue_admitted_background_jobs
+extraction_queue_admission_total{priority, result}
 
-# yt-dlp process count
-ytdlp_processes_active
+# Offline-download queue pressure
+download_queue_jobs{state="active|waiting|prioritized|delayed"}
+download_queue_admitted_jobs
+download_queue_admission_total{result}
+download_storage_bytes{state="stored|free|capacity|reserved"}
+download_storage_rejections_total{reason}
+download_stale_parts_removed_total
+
+# Status-channel and watch-time write pressure
+status_connections_active
+status_connection_rejections_total{transport, reason}
+watch_time_writes_pending
+watch_time_writes_ready
+watch_time_writes_active
+
+# PostgreSQL pool and query pressure
+database_pool_connections{state}
+database_pool_waiting_requests
+database_pool_acquire_duration_ms{result}
+database_query_duration_ms{backend, result, scope}
+
+# SQLite read-worker pressure and load shedding
+sqlite_read_queue_depth
+sqlite_read_pending
+sqlite_read_queue_wait_ms{operation}
+sqlite_read_requests_total{operation, result}
+
+# Distinct-key single-flight pressure
+singleflight_active{registry}
+singleflight_rejections_total{registry}
+
+# Metric cardinality safety
+performance_metric_series
+performance_metric_series_dropped_total
 ```
 
 ### Grafana Dashboard Suggestions
@@ -681,32 +824,14 @@ ytdlp_processes_active
 2. **Extraction**: Queue depth, active workers, success rate, avg extraction time
 3. **Cache**: L1/L2 hit rates, Redis memory usage, eviction rate
 4. **Infrastructure**: CPU/RAM/disk per node, PostgreSQL connections, Redis ops/sec
-5. **Bandwidth**: Bytes served (video segments), upstream bandwidth to YouTube
+5. **Bandwidth**: `stream_response_bytes_total`, split by bounded media operation
 
 ### Health Check Endpoints
 
-The app exposes `GET /favicon.ico` (returns 204) as a lightweight health probe.
-For deeper health checks, add:
-
-```javascript
-// Suggested addition to server.js
-app.get('/health', async (req, res) => {
-  const checks = {};
-  // Database
-  try { db.getDuration('test'); checks.db = 'ok'; }
-  catch { checks.db = 'error'; }
-  // Redis
-  checks.redis = cache.hasRedis() ? 'ok' : 'unavailable';
-  // yt-dlp
-  try {
-    require('child_process').execFileSync('yt-dlp', ['--version']);
-    checks.ytdlp = 'ok';
-  } catch { checks.ytdlp = 'error'; }
-
-  const healthy = checks.db === 'ok' && checks.ytdlp === 'ok';
-  res.status(healthy ? 200 : 503).json(checks);
-});
-```
+The app exposes `GET /health` for database, Redis/cache, queue, memory,
+and uptime diagnostics. Use `GET /health/live` for liveness and
+`GET /health/ready` for database-backed readiness. `GET /favicon.ico` remains a
+minimal process probe for older Compose deployments.
 
 ### Alerting Rules
 
@@ -714,11 +839,18 @@ Configure in Prometheus Alertmanager or Grafana Alerting:
 
 | Alert | Condition | Severity |
 |---|---|---|
-| Extraction failure rate high | `rate(extraction_total{status="failure"}[5m]) / rate(extraction_total[5m]) > 0.5` | Critical |
+| Extraction failure rate high | `rate(extraction_requests_total{result!="success"}[5m]) / rate(extraction_requests_total[5m]) > 0.5` | Critical |
 | Redis memory high | `redis_memory_used_bytes / redis_memory_max_bytes > 0.8` | Warning |
 | PG connection pool exhaustion | `pg_stat_activity_count / pg_settings_max_connections > 0.9` | Critical |
 | Web app down | `/health` returns non-200 for > 2 minutes | Critical |
-| Extraction queue backlog | `extraction_queue_waiting_total > 50` for > 5 minutes | Warning |
+| Local extraction backlog | `ytdlp_waiting_jobs > 50` for > 5 minutes | Warning |
+| Distributed extraction queue full | `rate(extraction_queue_admission_total{result=~"full|background_full"}[5m]) > 0` | Warning |
+| Download queue full | `rate(download_queue_admission_total{result=~"full|owner_full"}[5m]) > 0` | Warning |
+| Download storage admission rejected | `rate(download_storage_rejections_total[5m]) > 0` | Warning |
+| Download filesystem safety margin reached | `download_storage_bytes{state="free"} / download_storage_bytes{state="capacity"} < 0.06` | Critical |
+| SQLite read overload | `rate(sqlite_read_requests_total{result=~"overloaded|timeout"}[5m]) > 0` for > 5 minutes | Warning |
+| Single-flight capacity reached | `rate(singleflight_rejections_total[5m]) > 0` for > 5 minutes | Warning |
+| RSS queue backlog | `rss_queue_waiting_jobs > 100` for > 5 minutes | Warning |
 | Disk space low | `node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1` | Critical |
 | yt-dlp outdated | No successful extraction in > 1 hour during active usage | Warning |
 | TLS certificate expiring | Certificate expires in < 14 days | Warning |
@@ -800,35 +932,6 @@ Update `REDIS_URL` to include the password:
 REDIS_URL=redis://:YOUR_STRONG_REDIS_PASSWORD@localhost:6379
 ```
 
-### MinIO Bucket Policy
-
-```bash
-# Set bucket to private (no anonymous access)
-mc anonymous set none local/myyoutube
-
-# Create a dedicated app user with limited permissions
-mc admin user add local myyoutube-app APP_SECRET_KEY
-mc admin policy attach local readwrite --user myyoutube-app
-
-# In production, create a custom policy that only allows access to the
-# myyoutube bucket:
-cat > /tmp/myyoutube-policy.json << 'EOF'
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-    "Resource": [
-      "arn:aws:s3:::myyoutube",
-      "arn:aws:s3:::myyoutube/*"
-    ]
-  }]
-}
-EOF
-mc admin policy create local myyoutube-only /tmp/myyoutube-policy.json
-mc admin policy attach local myyoutube-only --user myyoutube-app
-```
-
 ### Regular yt-dlp Updates
 
 yt-dlp must be updated frequently as YouTube changes their API. Set up a cron job:
@@ -864,27 +967,27 @@ For Docker deployments:
 ### Rolling Restarts (Zero Downtime)
 
 ```bash
-# Single machine: cluster.js handles worker rotation
+# Single machine: dist/cluster.js handles worker rotation
 sudo systemctl restart myyoutube
 
 # Docker: rolling update
 docker compose up -d --no-deps --build web
 docker compose up -d --no-deps --build extraction-worker
+docker compose up -d --no-deps edge
 ```
 
 ### Database Migrations
 
-The app auto-creates tables and runs migrations on startup (see `db.js`).
-For PostgreSQL, `db-pg.js` handles the same. No manual migration steps needed.
+`npm start` runs one migration child before it forks web workers. Docker Compose
+uses the dedicated `migrate` service and starts web/background workers only
+after it succeeds. Standalone processes still auto-migrate unless
+`SKIP_DATABASE_MIGRATIONS=1` is set after an external migration job.
 
 ### Disk Cleanup
 
 ```bash
 # Remove old extraction cache (data/downloads for local storage)
 find /opt/myyoutube/app/data/downloads -type f -mtime +7 -delete
-
-# For MinIO, set a lifecycle policy:
-mc ilm rule add local/myyoutube --expiry-days 30
 
 # Clean old backups
 find /opt/myyoutube/backups -name "*.gz" -mtime +30 -delete

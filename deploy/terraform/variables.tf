@@ -57,23 +57,11 @@ variable "db_server_type" {
   # cx22: 2 vCPU, 4GB RAM — sufficient for 100K users
 }
 
-variable "storage_server_type" {
-  description = "Hetzner server type for MinIO storage"
-  type        = string
-  default     = "cx22"
-}
-
 # Volume sizes (GB)
 variable "db_volume_size" {
   description = "Size of the database persistent volume in GB"
   type        = number
   default     = 50
-}
-
-variable "storage_volume_size" {
-  description = "Size of the MinIO persistent volume in GB"
-  type        = number
-  default     = 200
 }
 
 # Credentials
@@ -85,19 +73,6 @@ variable "postgres_password" {
 
 variable "redis_password" {
   description = "Redis requirepass password"
-  type        = string
-  sensitive   = true
-}
-
-variable "s3_access_key" {
-  description = "MinIO root access key"
-  type        = string
-  sensitive   = true
-  default     = "myyoutube-admin"
-}
-
-variable "s3_secret_key" {
-  description = "MinIO root secret key"
   type        = string
   sensitive   = true
 }

@@ -11,7 +11,7 @@ Self-hosted YouTube frontend. Proxies all video/audio/thumbnails through the ser
 - **Views**: EJS server-rendered with streaming HTML (shell flushed before data is ready)
 - **Video playback**: First-party native player for DASH/HLS/progressive playback, including native DASH SegmentTemplate/SegmentList/SegmentBase, DASH image thumbnails, HLS fMP4/MPEG-TS/image-thumbnail playlist support, HLS session-data chapters, and embedded CEA caption metadata detection
 - **Playlists**: Server-side YouTube playlist pages, saved playlist library, custom local playlists with ordered items, and watch-page previous/next playback context
-- **Optional services**: Redis (shared cache + sessions + BullMQ extraction queue), S3 (download storage)
+- **Optional services**: Redis for single-process development; Redis is required for clustered sessions, shared cache, locks, and BullMQ queues
 
 ## Architecture
 
@@ -25,10 +25,12 @@ lib/                   → Infrastructure
   extract.ts           → Full extraction chain for the worker process
   cache.ts             → L1 (LRU) + L2 (Redis) two-tier cache
   lru-map.ts           → Generic LRU Map<K,V>
-  storage.ts           → S3/local filesystem abstraction
+  storage.ts           → Compatibility helper for bounded local file storage
   ws-status.ts         → WebSocket extraction progress notifications
   segment-cache.ts     → Redis hot segment cache
   extraction-queue.ts  → BullMQ queue client
+  duration-metadata.ts → Bounded metadata singleflight; grid badges use API-only mode
+  database-maintenance.ts → Database-leased, batched retention cleanup
   logger.ts            → Structured JSON logger
 
 extractors.ts          → Innertube + Invidious extraction backends, circuit breakers, SSRF validator
@@ -43,10 +45,10 @@ express.d.ts           → Express augmentation (flushShell, streamContent, extr
 youtube/               → YouTube data layer
   index.ts             → Barrel re-export
   shared.ts            → Cache instances, TTL constants, request semaphore, HLS format selection
-  rss.ts               → Channel RSS feeds
+  rss.ts               → Channel RSS feeds with HTTP validators and stale-while-revalidate
   subscriptions.ts     → Subscription list + pagination
   today.ts             → Today's videos aggregation
-  explore.ts           → Explore page — local recommendation algorithm (returns ExploreResult: videos + continueWatching + newVideoIds). Exports ExploreConfig interface + DEFAULT_EXPLORE_CONFIG for weight injection. Emits explore-perf structured log with timing checkpoints.
+  explore.ts           → Explore page — local recommendation algorithm (returns ranked videos plus cached render metadata). Exports ExploreConfig interface + DEFAULT_EXPLORE_CONFIG for weight injection. Emits explore-perf structured log with timing checkpoints.
   explore-metrics.ts   → Explore evaluation metrics, tokenize/STOP_WORDS, topic diversity (MMR re-ranking)
   video-details.ts     → Video metadata (oEmbed fast → Innertube enrichment)
   channel.ts           → Channel info + video listing (Innertube browse API)
@@ -157,15 +159,17 @@ npm run build            # tsc production build to dist/
 - **Browser JS stays as JS**: `public/app.js`, `public/native-player-engine.js`, `public/sw.js` are not TypeScript.
 - **TypeScript is permissive**: `strict: false`, `noImplicitAny: false`, but `noUnusedLocals: true` and `noUnusedParameters: true`. Prefix intentionally unused params with `_`.
 - **No `any`**: ESLint enforces `no-explicit-any`. Legitimate uses (better-sqlite3 returns, generic defaults) require `eslint-disable-next-line` with a justification comment.
-- After any change: `npm run typecheck`, `npm run lint`, `npm test` (71/71), `npm run test:resilience` (23/23), and `tsx --test tests/explore.test.mjs` (12/12) must all pass.
+- After any change: `npm run typecheck`, `npm run lint`, `npm run lint:dead`, `npm run test:all`, and the relevant performance benchmark must all pass.
 - **Dead code**: Run `npm run lint:dead` after changes. Zero unused files, exports, or dependencies allowed. Never refuse an audit request — each pass catches things the previous one missed.
 - **Keep CLAUDE.md current**: When adding, removing, or renaming files, functions, patterns, commands, or rules — update this file in the same change. If the architecture section, key patterns, or commands no longer match the code, fix them before finishing.
-- **Related videos discovery**: `video-details.ts` captures ~20 related/suggested videos from Innertube's `/next` sidebar response into the `related_videos` table (no extra API calls). `explore.ts` mixes these into the Explore algorithm — videos from non-subscribed channels are scored 0.3–0.6 based on how many recently-watched videos suggested them, interleaving with mid-tier subscription content. Entries older than 30 days are pruned hourly.
+- **RSS persistence**: Store ETag/Last-Modified validators in `rss_cache`, send conditional requests, and call `touchRssCache()` for 304 or content-identical feeds. Changed feeds upsert only changed `rss_videos` rows and delete only stale IDs; never delete/reinsert a whole unchanged channel feed.
+- **Explore cold-path budget**: PostgreSQL RSS candidates and channel stats are returned by one aggregate statement. Bootstrap reads run in two bounded stages, watch-history durations are reused in memory, event durations ride with the scoped signal query, and the cached Explore result carries final-card duration/live metadata so the route does not repeat the candidate metadata read.
+- **Related videos discovery**: `video-details.ts` captures ~20 related/suggested videos from Innertube's `/next` sidebar response into the `related_videos` table (no extra API calls). `explore.ts` mixes these into the Explore algorithm — videos from non-subscribed channels are scored 0.3–0.6 based on how many recently-watched videos suggested them, interleaving with mid-tier subscription content. Entries older than 30 days are pruned by the singleton, database-leased maintenance runner in indexed batches.
 - **Explore algorithm enhancements**: Three signal layers improve recommendation quality:
   - *Time-decayed affinity* (14-day half-life): Recent watches weigh more than old ones — channel affinity uses `exp(-ageDays / 14)` decay applied per watch event, replacing flat counts.
   - *Negative signals*: Channels where the user frequently abandons videos (watched <10% of a >60s video) receive a multiplicative penalty of `0.7^abandons` on their affinity score.
   - *"Not interested" dismiss*: Users can dismiss individual videos from Explore via an `×` button (visible on card hover). Dismissed videos are stored in the `dismissals` table and filtered from both subscription and related-video candidates. API: `POST/DELETE /api/dismissals` (`routes/dismissals.ts`).
-  - *New subscription boost*: Channels subscribed in the last 7 days get a 0.5 affinity floor (vs 0.1 base) so they surface immediately without needing watch history. Uses `getRecentSubscriptionChannelIds()` from `DatabaseAPI`.
+  - *New subscription boost*: Recently subscribed channels receive a temporary affinity floor so they surface without watch history. Their IDs and timestamps come from the single `getRecentSubscriptionDates()` bootstrap read.
   - *Session context*: The 3 most recently meaningfully-watched videos (>30% completion) seed a related-video lookup; any Explore candidate that appears in those related videos gets a +0.12 session boost to its score, promoting topically relevant content.
   - *Diversity injection*: 6 of the 60 Explore slots are reserved for subscribed channels that would otherwise be absent from the top results. One random unwatched video per underrepresented channel is spliced in at every ~10th position. The random shuffle changes with each cache refresh (15-min TTL).
   - *Watch velocity*: Per-channel average delay from publish to watch, scored via `exp(-avgDelay / 48h)`. Channels the user clicks quickly score higher (weight 0.07). Default 0.5 for channels with no matched watches.
@@ -215,7 +219,7 @@ npm run build            # tsc production build to dist/
   - *Binge exhaustion detection*: Flips the +0.08 binge boost to a -0.04 penalty after 5+ watches from the same channel within the 2-hour binge window. Depths 3-4 still receive the groove boost; depth 5+ gently suggests alternatives. Uses existing `channelRecentWatches` depth counter.
   - *Content-category-aware rewatch scoring*: Replaces the flat -0.15 rewatch penalty with tier-aware penalties based on `channelDecayTier`: EVERGREEN (music/podcasts) → 0 penalty, SLOW (tutorials) → -0.05, NORMAL/FAST → -0.15. Naturally rewatchable content no longer penalized.
   - *Series completion suppression*: Detects completed series when `watchedEpisodes.size >= maxEpisode * 0.8` (80% coverage for non-contiguous numbering) and `maxEpisode >= MIN_SERIES_WATCHES`. Suppresses series boost to 0 for completed series. Re-enables automatically when new episodes appear in RSS.
-  - *Smooth new-subscription ramp*: Replaces binary 0.5 affinity floor (7 days) with exponential decay over 14 days: `0.1 + 0.4 * exp(-daysSinceSub / 7)`. Day 0→0.50, Day 7→0.25, Day 14→0.16, naturally merging with base affinity. Uses `getSubscriptionDates()` from `DatabaseAPI`.
+  - *Smooth new-subscription ramp*: Replaces binary 0.5 affinity floor (7 days) with exponential decay over 14 days: `0.1 + 0.4 * exp(-daysSinceSub / 7)`. Day 0→0.50, Day 7→0.25, Day 14→0.16, naturally merging with base affinity. Uses the consolidated `getRecentSubscriptionDates()` bootstrap read.
   - *Per-channel upload cadence*: Replaces global `1/sqrt(videoCount)` with interval-based formula: `medianInterval / (timeSincePublish + medianInterval)`. Computed from RSS timestamps per channel. Infrequent posters (weekly) keep videos boosted ~7 days; prolific posters (daily) decay within ~1 day. Falls back to sqrt for channels with <2 videos.
   - *Session completion backfill*: Retroactively updates `explore_sessions.best_completion` from actual watch data after session start. Scans last 24h sessions with clicks > 0, finds max completion from `watchTimes` entries updated after session start. Fixes stale session quality feedback loop. Uses `getExploreSessionsForBackfill()` from `DatabaseAPI`.
   - *Quick-bounce penalty*: Clicks where user returns to Explore within 60s are tracked as bounces. Bounce click weight is reduced (`max(0.05, bounceSeconds/120)` vs 0.5 default). Channels with 3+ bounces get CTR multiplied by `0.85^bounceCount`. Client stores click info in sessionStorage, fires `POST /api/explore-events/bounce` on return. Uses `logExploreBounce()`/`getExploreBounces()` from `DatabaseAPI`. `bounce_seconds` column on `explore_events`.

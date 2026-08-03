@@ -194,8 +194,10 @@
           var duration = video.duration || 0;
           timeDisplay.textContent = formatTime(target) + ' / ' + formatTime(duration);
         }
-        clearTimeout(seekDebounce);
-        seekDebounce = setTimeout(function () {
+        if (seekDebounce) clearPlayerTimeout(seekDebounce);
+        seekDebounce = setPlayerTimeout(function () {
+          seekDebounce = 0;
+          if (window._playerEngine !== engine) return;
           commitPlayerSeek(target);
           isSeeking = false;
         }, 125);
@@ -207,17 +209,33 @@
         seekTo(seekPctFromMouse(e));
         e.preventDefault();
       });
-      document.addEventListener('mousemove', function (e) {
+      function onPlayerSeekMouseMove(e) {
         if (!isDragging) return;
         seekTo(seekPctFromMouse(e));
-      });
-      document.addEventListener('mouseup', function () {
+      }
+      function onPlayerSeekMouseUp() {
         if (!isDragging) return;
         isDragging = false;
-        clearTimeout(seekDebounce);
+        if (seekDebounce) {
+          clearPlayerTimeout(seekDebounce);
+          seekDebounce = 0;
+        }
+        if (window._playerEngine !== engine) return;
         commitPlayerSeek(seekTargetFromValue(seekValue));
         if (video.ended) video.play().catch(function () {});
         isSeeking = false;
+      }
+      document.addEventListener('mousemove', onPlayerSeekMouseMove);
+      document.addEventListener('mouseup', onPlayerSeekMouseUp);
+      addPlayerCleanup(function () {
+        document.removeEventListener('mousemove', onPlayerSeekMouseMove);
+        document.removeEventListener('mouseup', onPlayerSeekMouseUp);
+        isDragging = false;
+        isSeeking = false;
+        if (seekDebounce) {
+          clearPlayerTimeout(seekDebounce);
+          seekDebounce = 0;
+        }
       });
 
       function checkLive() {
@@ -293,9 +311,12 @@
         controlsContainer.setAttribute('shown', '');
         container.classList.add('controls-visible');
         videoContainer.classList.remove('no-cursor');
-        clearTimeout(hideTimer);
+        if (hideTimer) clearPlayerTimeout(hideTimer);
         if (!video.paused && !isAnyMenuOpen()) {
-          hideTimer = setTimeout(hideControls, 3000);
+          hideTimer = setPlayerTimeout(function () {
+            hideTimer = 0;
+            hideControls();
+          }, 3000);
         }
       }
       function hideControls() {
@@ -310,7 +331,10 @@
       container.addEventListener('touchstart', showControls);
       container.addEventListener('mouseleave', function () {
         if (!video.paused) {
-          clearTimeout(hideTimer);
+          if (hideTimer) {
+            clearPlayerTimeout(hideTimer);
+            hideTimer = 0;
+          }
           hideControls();
         }
       });
@@ -352,16 +376,21 @@
 
 
       // --- Seek lifecycle ---
-      var seekRestoreTimer = 0;
-      video.addEventListener('seeking', function () {
-        if (seekRestoreTimer) { clearTimeout(seekRestoreTimer); seekRestoreTimer = 0; }
+      function onPlayerVideoSeeking() {
         beginPlayerSeek(video.currentTime || 0);
-      });
-      video.addEventListener('seeked', function () {
-        if (seekRestoreTimer) clearTimeout(seekRestoreTimer);
-        seekRestoreTimer = setTimeout(function () {
-          safePlayerCall(function () {
-            if (player.endSeek) player.endSeek();
-          });
-        }, 300);
+      }
+      function onPlayerVideoSeeked() {
+        safePlayerCall(function () {
+          if (player.endSeek) player.endSeek();
+        });
+      }
+      video.addEventListener('seeking', onPlayerVideoSeeking);
+      video.addEventListener('seeked', onPlayerVideoSeeked);
+      addPlayerCleanup(function () {
+        video.removeEventListener('seeking', onPlayerVideoSeeking);
+        video.removeEventListener('seeked', onPlayerVideoSeeked);
+        if (hideTimer) {
+          clearPlayerTimeout(hideTimer);
+          hideTimer = 0;
+        }
       });

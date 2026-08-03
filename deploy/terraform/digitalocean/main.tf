@@ -10,7 +10,6 @@
 #   - 1x web droplet (s-2vcpu-4gb: 2 vCPU, 4GB RAM)
 #   - 1x extraction worker (s-4vcpu-8gb: 4 vCPU, 8GB RAM)
 #   - 1x database droplet (s-2vcpu-4gb: 2 vCPU, 4GB RAM) running PostgreSQL + Redis
-#   - 1x storage droplet (s-2vcpu-4gb: 2 vCPU, 4GB RAM) running MinIO
 #   - VPC for private networking
 #   - Firewalls restricting access
 #   - Volumes for persistent data
@@ -129,7 +128,7 @@ resource "digitalocean_firewall" "worker" {
 resource "digitalocean_firewall" "internal" {
   name = "myyoutube-internal"
 
-  droplet_ids = [digitalocean_droplet.database.id, digitalocean_droplet.storage.id]
+  droplet_ids = [digitalocean_droplet.database.id]
 
   # SSH from admin
   inbound_rule {
@@ -150,20 +149,6 @@ resource "digitalocean_firewall" "internal" {
     protocol         = "tcp"
     port_range       = "6379"
     source_addresses = ["10.0.1.0/24"]
-  }
-
-  # MinIO API from VPC only
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "9000"
-    source_addresses = ["10.0.1.0/24"]
-  }
-
-  # MinIO Console from admin only
-  inbound_rule {
-    protocol         = "tcp"
-    port_range       = "9001"
-    source_addresses = var.ssh_allowed_ips
   }
 
   # Allow all outbound
@@ -284,67 +269,6 @@ resource "digitalocean_droplet" "database" {
   EOT
 }
 
-resource "digitalocean_droplet" "storage" {
-  name     = "myyoutube-storage"
-  size     = var.storage_droplet_size
-  image    = "ubuntu-24-04-x64"
-  region   = var.region
-  vpc_uuid = digitalocean_vpc.internal.id
-  ssh_keys = [digitalocean_ssh_key.deploy.fingerprint]
-
-  tags = ["myyoutube", "storage"]
-
-  user_data = <<-EOT
-    #!/bin/bash
-    set -e
-    apt-get update
-
-    # Install MinIO
-    curl -L https://dl.min.io/server/minio/release/linux-amd64/minio -o /usr/local/bin/minio
-    chmod +x /usr/local/bin/minio
-
-    # Install MinIO client
-    curl -L https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-    chmod +x /usr/local/bin/mc
-
-    # Create minio user and data directory
-    useradd -r -m -s /bin/false minio
-    mkdir -p /data/minio
-    chown minio:minio /data/minio
-
-    # Systemd service for MinIO
-    cat > /etc/systemd/system/minio.service << 'UNIT'
-    [Unit]
-    Description=MinIO Object Storage
-    After=network.target
-
-    [Service]
-    Type=simple
-    User=minio
-    Group=minio
-    ExecStart=/usr/local/bin/minio server /data/minio --address ":9000" --console-address ":9001"
-    Environment=MINIO_ROOT_USER=${var.s3_access_key}
-    Environment=MINIO_ROOT_PASSWORD=${var.s3_secret_key}
-    Restart=always
-    RestartSec=5
-    LimitNOFILE=65535
-
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
-
-    systemctl daemon-reload
-    systemctl enable --now minio
-
-    # Wait for MinIO to start, then create bucket
-    sleep 5
-    mc alias set local http://localhost:9000 ${var.s3_access_key} ${var.s3_secret_key}
-    mc mb --ignore-existing local/myyoutube
-
-    echo "Storage server provisioned."
-  EOT
-}
-
 # --- Volumes (persistent storage) ---
 
 resource "digitalocean_volume" "db_data" {
@@ -357,18 +281,6 @@ resource "digitalocean_volume" "db_data" {
 resource "digitalocean_volume_attachment" "db_data" {
   droplet_id = digitalocean_droplet.database.id
   volume_id  = digitalocean_volume.db_data.id
-}
-
-resource "digitalocean_volume" "minio_data" {
-  region                  = var.region
-  name                    = "myyoutube-minio-data"
-  size                    = var.storage_volume_size
-  initial_filesystem_type = "ext4"
-}
-
-resource "digitalocean_volume_attachment" "minio_data" {
-  droplet_id = digitalocean_droplet.storage.id
-  volume_id  = digitalocean_volume.minio_data.id
 }
 
 # --- Reserved IP for Web Server ---

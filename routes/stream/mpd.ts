@@ -1,39 +1,73 @@
 import fs from 'fs';
 import db from '../../db.js';
-import { hasRedis } from '../../lib/cache.js';
+import logger from '../../lib/logger.js';
+import {
+  acquireLock,
+  hasCacheRedis,
+  hasRedis,
+  releaseLock,
+  renewLock,
+} from '../../lib/cache.js';
+import { promoteExtraction } from '../../lib/extraction-queue.js';
 import {
   sanitizeHeaders,
+  formatCache,
   mpdCache,
   urlLookup,
   mp4ProbeCache,
   hlsCache,
   dedup,
+  fetchWithConnTimeout,
   CACHE_TTL,
   selectBestHlsFormat,
 } from './shared.js';
-import { bgDownloads } from './downloads.js';
+import { listDownloadedFormats, recordDownloadedFormatRanges } from '../../lib/download-files.js';
 import { extractFormats } from './extraction.js';
 import { notifyExtractionStep, notifyExtractionDone } from './status.js';
+import { incrementMetric, observeMetric, setMetricGauge } from '../../lib/performance-metrics.js';
+import { readBodyBounded } from '../../lib/bounded-fetch.js';
+
+function recordManifestBuild(
+  priority: string,
+  playback: string,
+  startedAt: number,
+  options: { result?: string; probeMs?: number; probedFormats?: number } = {},
+) {
+  const result = options.result || 'success';
+  incrementMetric('manifest_builds_total', { priority, playback, result });
+  observeMetric('manifest_build_duration_seconds', (Date.now() - startedAt) / 1000, {
+    priority,
+    playback,
+    result,
+  });
+  if ((options.probeMs || 0) > 0) {
+    observeMetric('manifest_probe_duration_seconds', options.probeMs! / 1000, { playback });
+  }
+  if (options.probedFormats !== undefined) {
+    setMetricGauge('manifest_last_probed_formats', options.probedFormats, { playback });
+  }
+}
 
 // Probe MP4 byte ranges (init + index) by walking box headers
 async function probeMP4Ranges(url, headers) {
   let offset = 0, initEnd = 0, sidxStart = -1, sidxEnd = -1;
+  const probeDeadline = Date.now() + 12_000;
 
   // Fetch a chunk starting at offset, return a Buffer
   async function fetchChunk(start, size) {
+    const remaining = probeDeadline - Date.now();
+    if (remaining <= 0) return null;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    const timeout = setTimeout(() => controller.abort(), Math.min(8000, remaining));
     try {
-      // Keep the timeout armed through body consumption. The shared proxy
-      // helper intentionally clears its timer after response headers because
-      // media streams can be long-lived, but these small probe reads must be
-      // bounded or one stalled CDN body can hold the manifest forever.
-      const resp = await fetch(url, {
+      const resp = await fetchWithConnTimeout(url, {
         headers: { ...headers, Range: `bytes=${start}-${start + size - 1}` },
         signal: controller.signal,
-      });
+        bodyIdleMs: Math.min(8000, remaining),
+        outboundPriority: 'interactive',
+      }, Math.min(8000, remaining));
       if (!resp.ok && resp.status !== 206) return null;
-      return Buffer.from(await resp.arrayBuffer());
+      return await readBodyBounded(resp, Math.max(64 * 1024, size), 'mp4-probe-response-too-large');
     } finally {
       clearTimeout(timeout);
     }
@@ -80,11 +114,11 @@ async function probeMP4Ranges(url, headers) {
 }
 
 // Probe MP4 byte ranges from a local file (no network)
-function probeLocalMP4Ranges(filePath) {
-  const fd = fs.openSync(filePath, 'r');
+async function probeLocalMP4Ranges(filePath) {
+  const fd = await fs.promises.open(filePath, 'r');
   try {
     const headerBuf = Buffer.alloc(8192);
-    const bytesRead = fs.readSync(fd, headerBuf, 0, 8192, 0);
+    const { bytesRead } = await fd.read(headerBuf, 0, 8192, 0);
     if (bytesRead < 8) return null;
     const buf = headerBuf.subarray(0, bytesRead);
     let offset = 0, initEnd = 0, sidxStart = -1, sidxEnd = -1;
@@ -104,7 +138,7 @@ function probeLocalMP4Ranges(filePath) {
     }
     return (initEnd > 0 && sidxStart >= 0) ? { initRange: '0-' + initEnd, indexRange: sidxStart + '-' + sidxEnd } : null;
   } finally {
-    fs.closeSync(fd);
+    await fd.close();
   }
 }
 
@@ -157,28 +191,161 @@ function generateMPD(videoId, duration, formats, rangeMap) {
   return xml;
 }
 
+function representativeFormats(formats, maxCount) {
+  const byHeight = new Map();
+  for (const format of formats) {
+    const height = Number(format.height) || 0;
+    const previous = byHeight.get(height);
+    if (!previous || (Number(format.tbr) || 0) > (Number(previous.tbr) || 0)) byHeight.set(height, format);
+  }
+  const unique = [...byHeight.values()].sort((a, b) => (a.height || 0) - (b.height || 0));
+  if (unique.length <= maxCount) return unique;
+  const picked = [];
+  const seen = new Set();
+  for (let i = 0; i < maxCount; i++) {
+    const index = Math.round(i * (unique.length - 1) / (maxCount - 1));
+    const format = unique[index];
+    if (!seen.has(format.format_id)) {
+      seen.add(format.format_id);
+      picked.push(format);
+    }
+  }
+  return picked;
+}
+
+function selectStartupProbeFormats(videoFormats, audioFormats, language) {
+  const avc = videoFormats.filter(f => /^avc1/i.test(f.vcodec || ''));
+  const preferredVideoFamily = avc.length ? avc : videoFormats;
+  const videos = representativeFormats(preferredVideoFamily, 6);
+
+  const preferredAudio = audioFormats.filter(f => /^mp4a/i.test(f.acodec || ''));
+  const audioPool = preferredAudio.length ? preferredAudio : audioFormats;
+  const languageRoot = String(language || '').split('-')[0];
+  const audios = [...audioPool]
+    .sort((a, b) => {
+      const aOriginal = /original/i.test(a.format_note || '') || (languageRoot && String(a.language || '').split('-')[0] === languageRoot) ? 1 : 0;
+      const bOriginal = /original/i.test(b.format_note || '') || (languageRoot && String(b.language || '').split('-')[0] === languageRoot) ? 1 : 0;
+      return bOriginal - aOriginal || (Number(b.tbr) || 0) - (Number(a.tbr) || 0);
+    })
+    .slice(0, 2);
+  return { videos, audios };
+}
+
+async function mapWithConcurrency(items, concurrency, fn) {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+}
+
 // In-flight MPD build promises to deduplicate concurrent buildMPD calls
 const mpdInflight = new Map();
+const MANIFEST_LOCK_LEASE_MS = 30_000;
+const MANIFEST_LOCK_WAIT_MS = 15_000;
+
+async function getSharedManifest(videoId: string) {
+  const entry = await mpdCache.getAsync(videoId);
+  return entry?.data && Date.now() < entry.expires ? entry.data : null;
+}
+
+// Route admission must consult both cache tiers. A worker-local miss does not
+// mean extraction is needed when another worker already published the result.
+async function hasCachedPlayback(videoId) {
+  const manifest = await mpdCache.getAsync(videoId);
+  if (manifest && Date.now() < manifest.expires) return true;
+  const formats = await formatCache.getAsync(videoId);
+  return Boolean(formats?.data && Date.now() < formats.expires);
+}
 
 // Build (or return cached) MPD for a videoId
-async function buildMPD(videoId) {
-  const cached = mpdCache.get(videoId);
-  if (cached && Date.now() < cached.expires) return cached.data;
-
-  // Check Redis for cross-worker cache hit before rebuilding
-  if (hasRedis()) {
-    const redisEntry = await mpdCache.getAsync(videoId);
-    if (redisEntry && redisEntry.data && Date.now() < redisEntry.expires) return redisEntry.data;
+async function buildMPD(videoId, options: { priority?: 'playback' | 'background' | 'prefetch'; preferLocal?: boolean } = {}) {
+  const priority = options.priority || 'playback';
+  const preferLocal = options.preferLocal === true;
+  const buildStartedAt = Date.now();
+  if (!preferLocal) {
+    const cached = mpdCache.get(videoId);
+    if (cached && Date.now() < cached.expires) {
+      incrementMetric('manifest_requests_total', { result: 'l1_hit' });
+      return cached.data;
+    }
   }
 
-  return dedup(mpdInflight, videoId, async () => {
-    // Fast path: if local downloads exist, build MPD from disk (no extraction needed)
-    const localFormats = [];
-    for (const [key, entry] of bgDownloads) {
-      if (key.startsWith(videoId + ':') && entry.done && entry.bytesDownloaded > 0) {
-        localFormats.push({ itag: key.split(':')[1], filePath: entry.filePath, size: entry.bytesDownloaded });
+  // Check Redis for cross-worker cache hit before rebuilding
+  if (!preferLocal && hasCacheRedis()) {
+    const redisEntry = await mpdCache.getAsync(videoId);
+    if (redisEntry && redisEntry.data && Date.now() < redisEntry.expires) {
+      incrementMetric('manifest_requests_total', { result: 'l2_hit' });
+      return redisEntry.data;
+    }
+  }
+  incrementMetric('manifest_requests_total', { result: 'miss' });
+
+  if (priority === 'playback') void promoteExtraction(videoId);
+
+  return dedup(mpdInflight, `${videoId}:${preferLocal ? 'local' : 'default'}`, async () => {
+    const manifestLockKey = `manifest:${videoId}`;
+    let manifestLockToken: string | null = null;
+    let manifestLockRenewTimer: NodeJS.Timeout | null = null;
+
+    // Extraction has its own cluster-wide single-flight, but MP4 probing and
+    // manifest publication happen afterwards. Coordinate that second stage as
+    // well so page preloads landing on different workers do not repeat every
+    // CDN range probe.
+    if (!preferLocal && hasRedis() && hasCacheRedis()) {
+      manifestLockToken = await acquireLock(manifestLockKey, MANIFEST_LOCK_LEASE_MS);
+      if (!manifestLockToken) {
+        const waitStartedAt = Date.now();
+        incrementMetric('manifest_lock_contention_total');
+        const waitDeadline = waitStartedAt + MANIFEST_LOCK_WAIT_MS;
+        while (Date.now() < waitDeadline) {
+          await new Promise(resolve => setTimeout(resolve, 500 + Math.random() * 250));
+          const sharedManifest = await getSharedManifest(videoId);
+          if (sharedManifest) {
+            observeMetric('manifest_lock_wait_seconds', (Date.now() - waitStartedAt) / 1000, { result: 'cache_hit' });
+            incrementMetric('manifest_requests_total', { result: 'lock_wait_hit' });
+            return sharedManifest;
+          }
+        }
+        observeMetric('manifest_lock_wait_seconds', (Date.now() - waitStartedAt) / 1000, { result: 'timeout' });
+        incrementMetric('manifest_requests_total', { result: 'lock_wait_timeout' });
+        return {
+          unavailable: 'The stream manifest is still being prepared. Try again in a moment.',
+          overloaded: true,
+        };
+      }
+
+      // The first cache check and lock acquisition are separate operations.
+      // Re-check after becoming owner in case the preceding worker published
+      // immediately before releasing its lease.
+      const sharedManifest = await getSharedManifest(videoId);
+      if (sharedManifest) {
+        await releaseLock(manifestLockKey, manifestLockToken);
+        incrementMetric('manifest_requests_total', { result: 'lock_double_check_hit' });
+        return sharedManifest;
+      }
+      if (manifestLockToken !== 'local') {
+        manifestLockRenewTimer = setInterval(() => {
+          void renewLock(manifestLockKey, manifestLockToken!, MANIFEST_LOCK_LEASE_MS).then((renewed) => {
+            if (!renewed) console.warn(`[stream ${videoId}] manifest ownership lease was lost`);
+          });
+        }, Math.floor(MANIFEST_LOCK_LEASE_MS / 3));
+        manifestLockRenewTimer.unref?.();
       }
     }
+
+    try {
+    // Fast path: if local downloads exist, build MPD from disk (no extraction needed)
+    const localFormats = (await listDownloadedFormats(videoId))
+      .map(entry => ({
+        itag: entry.formatId,
+        filePath: entry.filePath,
+        size: entry.size,
+        ranges: entry.ranges,
+      }));
     if (localFormats.length >= 2) { // need at least video + audio
       const rangeMap = {};
       const fakeFormats = [];
@@ -211,46 +378,74 @@ async function buildMPD(videoId) {
         '250': { acodec: 'opus', tbr: 70, asr: 48000, ext: 'm4a' },
         '251': { acodec: 'opus', tbr: 160, asr: 48000, ext: 'm4a' },
       };
-      let allProbed = true;
-      for (const lf of localFormats) {
+      const newlyProbedRanges = {};
+      const localProbeResults = new Array(localFormats.length);
+      await mapWithConcurrency(localFormats, 4, async (lf, index) => {
         const meta = itagMeta[lf.itag];
-        if (!meta) { allProbed = false; break; }
+        if (!meta) return;
         try {
-          const ranges = probeLocalMP4Ranges(lf.filePath);
-          if (!ranges) { allProbed = false; break; }
-          rangeMap[lf.itag] = ranges;
-          fakeFormats.push({
-            format_id: lf.itag,
-            height: meta.height || 0,
-            width: meta.width || 0,
-            vcodec: meta.vcodec || 'none',
-            acodec: meta.acodec || 'none',
-            tbr: meta.tbr || (lf.size * 8 / 1000 / 300), // estimate ~5min
-            asr: meta.asr || 0,
-            ext: meta.ext || 'mp4',
-          });
-        } catch { allProbed = false; break; }
+          const ranges = lf.ranges || await probeLocalMP4Ranges(lf.filePath);
+          if (!ranges) return;
+          if (!lf.ranges) newlyProbedRanges[lf.itag] = ranges;
+          localProbeResults[index] = {
+            ranges,
+            format: {
+              format_id: lf.itag,
+              height: meta.height || 0,
+              width: meta.width || 0,
+              vcodec: meta.vcodec || 'none',
+              acodec: meta.acodec || 'none',
+              tbr: meta.tbr || (lf.size * 8 / 1000 / 300), // estimate ~5min
+              asr: meta.asr || 0,
+              ext: meta.ext || 'mp4',
+            },
+          };
+        } catch {}
+      });
+      const allProbed = localProbeResults.every(Boolean);
+      for (const result of localProbeResults) {
+        if (!result) continue;
+        rangeMap[result.format.format_id] = result.ranges;
+        fakeFormats.push(result.format);
       }
       if (allProbed && Object.keys(rangeMap).length >= 2) {
-        const duration = db.getDuration(videoId) || 0;
-        const mpd = generateMPD(videoId, duration, fakeFormats, rangeMap);
+        const [duration] = await Promise.all([
+          db.getDuration(videoId),
+          Object.keys(newlyProbedRanges).length
+            ? recordDownloadedFormatRanges(videoId, newlyProbedRanges).catch(error => {
+                console.warn(`[stream ${videoId}] could not persist local MP4 ranges:`, error.message);
+              })
+            : Promise.resolve(),
+        ]);
+        const mpd = generateMPD(videoId, duration || 0, fakeFormats, rangeMap);
         console.log(`[stream ${videoId}] using local downloads (${localFormats.length} files)`);
-        mpdCache.set(videoId, { data: mpd, meta: { playback: 'dash', via: 'local' }, expires: Date.now() + CACHE_TTL });
+        await mpdCache.setAsync(videoId, { data: mpd, meta: { playback: 'dash', via: 'local' }, expires: Date.now() + CACHE_TTL });
         notifyExtractionDone(videoId);
+        recordManifestBuild(priority, 'dash', buildStartedAt, { result: 'local' });
         return mpd;
       }
     }
 
     let info;
     try {
-      info = await extractFormats(videoId);
+      info = await extractFormats(videoId, { priority });
     } catch (err) {
       // Always close WebSocket/SSE status listeners when extraction itself
       // fails before manifest construction begins.
       notifyExtractionDone(videoId);
       throw err;
     }
-    if (info._unavailable) { notifyExtractionDone(videoId); return { unavailable: info._unavailable, scheduledStart: info._scheduledStart }; }
+    if (info._unavailable) {
+      notifyExtractionDone(videoId);
+      recordManifestBuild(priority, 'none', buildStartedAt, {
+        result: info._overloaded ? 'overloaded' : info._pending ? 'pending' : 'unavailable',
+      });
+      return {
+        unavailable: info._unavailable,
+        overloaded: info._overloaded === true,
+        scheduledStart: info._scheduledStart,
+      };
+    }
     notifyExtractionStep(videoId, 'building');
 
     try {
@@ -262,17 +457,18 @@ async function buildMPD(videoId) {
     const audioFmts = allFmts.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'));
     const mp4Video = videoFmts.filter(f => f.ext === 'mp4');
     const mp4Audio = audioFmts.filter(f => f.ext === 'm4a');
+    let dashProbeMs = 0;
+    let probedFormatsCount = 0;
 
     if (mp4Video.length && mp4Audio.length) {
-      // Overwrite URL entries — stale entries for removed formats expire via TTL
-      for (const f of [...mp4Video, ...mp4Audio]) {
-        urlLookup.set(`${videoId}:${f.format_id}`, { url: f.url, headers: sanitizeHeaders(f.http_headers), expires: Date.now() + CACHE_TTL });
-      }
-
-      // Probe each format for its own init/index byte ranges
+      // Probe a representative, broadly-compatible startup ladder. Probing
+      // every duplicate codec/height caused dozens of simultaneous CDN range
+      // requests and made the slowest optional rendition gate first playback.
+      const selected = selectStartupProbeFormats(mp4Video, mp4Audio, info.language);
+      let manifestFormats = [...selected.videos, ...selected.audios];
       const rangeMap = {};
-      // Check probe cache for already-probed formats
-      await Promise.all([...mp4Video, ...mp4Audio].map(async (f) => {
+      const probeStartedAt = Date.now();
+      const probeFormats = async (formats) => mapWithConcurrency(formats, 4, async (f) => {
         const probeKey = `${videoId}:${f.format_id}`;
         const cached = mp4ProbeCache.get(probeKey);
         if (cached) { rangeMap[f.format_id] = cached; return; }
@@ -283,16 +479,56 @@ async function buildMPD(videoId) {
             mp4ProbeCache.set(probeKey, ranges);
           }
         } catch (e) { if (e.name !== 'AbortError') console.warn(`[stream ${videoId}] probe failed for ${f.format_id}:`, e.message); }
-      }));
+      });
+      await probeFormats(manifestFormats);
 
-      const hasRanges = Object.keys(rangeMap).length > 0;
+      // If the preferred ladder did not produce both tracks, try only a small
+      // bounded reserve set before falling back to HLS/progressive playback.
+      let videoCount = selected.videos.filter(f => rangeMap[f.format_id]).length;
+      let audioCount = selected.audios.filter(f => rangeMap[f.format_id]).length;
+      if (!videoCount || !audioCount) {
+        const selectedIds = new Set(manifestFormats.map(f => f.format_id));
+        const reserve = [
+          ...mp4Video.filter(f => !selectedIds.has(f.format_id)).slice(0, 2),
+          ...mp4Audio.filter(f => !selectedIds.has(f.format_id)).slice(0, 1),
+        ];
+        await probeFormats(reserve);
+        manifestFormats = [...manifestFormats, ...reserve];
+        videoCount = manifestFormats.filter(f => f.vcodec && f.vcodec !== 'none' && rangeMap[f.format_id]).length;
+        audioCount = manifestFormats.filter(f => f.acodec && f.acodec !== 'none' && rangeMap[f.format_id]).length;
+      }
+      dashProbeMs = Date.now() - probeStartedAt;
+      probedFormatsCount = manifestFormats.length;
+
+      const hasRanges = videoCount > 0 && audioCount > 0;
       if (hasRanges) {
-        const mpd = generateMPD(videoId, info.duration || 0, [...mp4Video, ...mp4Audio], rangeMap);
-        const videoCount = mp4Video.filter(f => rangeMap[f.format_id]).length;
-        const audioCount = mp4Audio.filter(f => rangeMap[f.format_id]).length;
+        const mpd = generateMPD(videoId, info.duration || 0, manifestFormats, rangeMap);
         const via = info._extractedVia || 'yt-dlp';
         console.log(`[stream ${videoId}] using DASH (${videoCount} video + ${audioCount} audio), duration=${info.duration}s via ${via}`);
-        mpdCache.set(videoId, { data: mpd, meta: { playback: 'dash', via }, expires: Date.now() + CACHE_TTL });
+        const expires = Date.now() + CACHE_TTL;
+        const publishedFormats = manifestFormats.filter(f => rangeMap[f.format_id]);
+        await Promise.all([
+          ...publishedFormats.map(f => urlLookup.setAsync(`${videoId}:${f.format_id}`, {
+            url: f.url,
+            headers: sanitizeHeaders(f.http_headers),
+            expires,
+          })),
+          mpdCache.setAsync(videoId, { data: mpd, meta: { playback: 'dash', via }, expires }),
+        ]);
+        logger.sampledInfo('manifest-perf', 'manifest-perf', {
+          videoId,
+          priority,
+          playback: 'dash',
+          via,
+          probeMs: dashProbeMs,
+          probedFormats: probedFormatsCount,
+          sourceFormats: mp4Video.length + mp4Audio.length,
+          totalMs: Date.now() - buildStartedAt,
+        });
+        recordManifestBuild(priority, 'dash', buildStartedAt, {
+          probeMs: dashProbeMs,
+          probedFormats: probedFormatsCount,
+        });
         return mpd;
       }
     }
@@ -303,9 +539,26 @@ async function buildMPD(videoId) {
     if (hlsFmt) {
       const via = info._extractedVia || 'yt-dlp';
       console.log(`[stream ${videoId}] using HLS (${hlsFmt.height || '?'}p), duration=${info.duration}s via ${via}`);
-      hlsCache.set(videoId, { url: hlsFmt.manifest_url || hlsFmt.url, headers: sanitizeHeaders(hlsFmt.http_headers), expires: Date.now() + CACHE_TTL });
+      const expires = Date.now() + CACHE_TTL;
       const hlsResult = { hls: `/api/stream/${videoId}/hls.m3u8`, via };
-      mpdCache.set(videoId, { data: hlsResult, meta: { playback: 'hls', via }, expires: Date.now() + CACHE_TTL });
+      await Promise.all([
+        hlsCache.setAsync(videoId, { url: hlsFmt.manifest_url || hlsFmt.url, headers: sanitizeHeaders(hlsFmt.http_headers), expires }),
+        mpdCache.setAsync(videoId, { data: hlsResult, meta: { playback: 'hls', via }, expires }),
+      ]);
+      logger.sampledInfo('manifest-perf', 'manifest-perf', {
+        videoId,
+        priority,
+        playback: 'hls',
+        via,
+        probeMs: dashProbeMs,
+        probedFormats: probedFormatsCount,
+        sourceFormats: mp4Video.length + mp4Audio.length,
+        totalMs: Date.now() - buildStartedAt,
+      });
+      recordManifestBuild(priority, 'hls', buildStartedAt, {
+        probeMs: dashProbeMs,
+        probedFormats: probedFormatsCount,
+      });
       return hlsResult;
     }
 
@@ -315,20 +568,43 @@ async function buildMPD(videoId) {
       .sort((a, b) => (b.height || 0) - (a.height || 0))[0];
     if (muxed) {
       const via = info._extractedVia || 'yt-dlp';
-      urlLookup.set(`${videoId}:${muxed.format_id}`, { url: muxed.url, headers: sanitizeHeaders(muxed.http_headers), expires: Date.now() + CACHE_TTL });
+      const expires = Date.now() + CACHE_TTL;
       const result = { progressive: `/api/stream/${videoId}/progressive`, via };
-      mpdCache.set(videoId, { data: result, meta: { playback: 'progressive', via }, expires: Date.now() + CACHE_TTL });
+      await Promise.all([
+        urlLookup.setAsync(`${videoId}:${muxed.format_id}`, { url: muxed.url, headers: sanitizeHeaders(muxed.http_headers), expires }),
+        mpdCache.setAsync(videoId, { data: result, meta: { playback: 'progressive', via }, expires }),
+      ]);
       console.log(`[stream ${videoId}] using progressive (${muxed.height || '?'}p), duration=${info.duration}s via ${via}`);
+      logger.sampledInfo('manifest-perf', 'manifest-perf', {
+        videoId,
+        priority,
+        playback: 'progressive',
+        via,
+        probeMs: dashProbeMs,
+        probedFormats: probedFormatsCount,
+        sourceFormats: mp4Video.length + mp4Audio.length,
+        totalMs: Date.now() - buildStartedAt,
+      });
+      recordManifestBuild(priority, 'progressive', buildStartedAt, {
+        probeMs: dashProbeMs,
+        probedFormats: probedFormatsCount,
+      });
       return result;
     }
 
+    recordManifestBuild(priority, 'none', buildStartedAt, { result: 'no_formats' });
     return null;
     } finally {
       notifyExtractionDone(videoId);
     }
-  });
+    } finally {
+      if (manifestLockRenewTimer) clearInterval(manifestLockRenewTimer);
+      if (manifestLockToken) await releaseLock(manifestLockKey, manifestLockToken);
+    }
+  }, { name: 'stream_manifests', maxEntries: 256 });
 }
 
 export {
   buildMPD,
+  hasCachedPlayback,
 };

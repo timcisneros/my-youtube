@@ -1,7 +1,7 @@
 import { cacheVideoDetailsFromInfo } from '../../youtube/index.js';
-import { extractViaInnertube, extractViaInvidious } from '../../extractors.js';
-import { extractViaYtdlp, extractViaYtdlpAlt } from '../../lib/ytdlp-extract.js';
-import { acquireLock, releaseLock, hasRedis } from '../../lib/cache.js';
+import logger from '../../lib/logger.js';
+import { EXTRACTION_DEADLINE_MS, extractWithStrategy } from '../../lib/extraction-strategy.js';
+import { acquireLock, renewLock, releaseLock, hasRedis, hasCacheRedis } from '../../lib/cache.js';
 import {
   withYtdlpSlot,
   formatCache,
@@ -9,8 +9,14 @@ import {
   extractionInflight,
   CACHE_TTL,
 } from './shared.js';
-import { notifyExtractionStep, notifyExtractionDone } from './status.js';
+import { notifyExtractionStep } from './status.js';
 import { hasQueue as hasExtractionQueue, enqueueExtraction } from '../../lib/extraction-queue.js';
+import { compactExtractionResult } from '../../lib/extraction-result.js';
+import { incrementMetric, observeMetric } from '../../lib/performance-metrics.js';
+import { SingleFlightCapacityError } from '../../lib/bounded-singleflight.js';
+
+const EXTRACTION_LOCK_LEASE_MS = 30_000;
+const EXTRACTION_WAIT_MS = EXTRACTION_DEADLINE_MS + 10_000;
 
 // Stale-while-revalidate: return expired data immediately, refresh in background
 function getCached(videoId, { staleOk = false } = {}) {
@@ -22,137 +28,198 @@ function getCached(videoId, { staleOk = false } = {}) {
     if (!extractionInflight.has(videoId)) {
       // Keep stale entry — extractFormats overwrites on success via setCache.
       // If refresh fails, stale data is still available for the next caller.
-      extractFormats(videoId).catch(err => console.warn(`[stale-refresh ${videoId}]`, err.message));
+      extractFormats(videoId, { priority: 'background' }).catch(err => console.warn(`[stale-refresh ${videoId}]`, err.message));
     }
     return entry.data;
   }
-  formatCache.delete(videoId);
+  formatCache.deleteLocal(videoId);
   return null;
 }
 
 function setCache(videoId, data) {
-  formatCache.set(videoId, { data, expires: Date.now() + CACHE_TTL });
+  return formatCache.setAsync(videoId, { data, expires: Date.now() + CACHE_TTL });
 }
 
-async function extractFormats(videoId) {
+async function extractFormats(videoId, options: { priority?: 'playback' | 'background' | 'prefetch' } = {}) {
+  const priority = options.priority || 'playback';
   const cached = getCached(videoId);
   if (cached) return cached;
   const localRequest = extractionInflight.get(videoId);
   if (localRequest) return localRequest;
 
   // Cross-worker dedup: check if another worker already has the result in Redis
-  let ownsExtractionLock = false;
-  if (hasRedis()) {
+  let extractionLockToken: string | null = null;
+  let lockRenewTimer: NodeJS.Timeout | null = null;
+  if (hasCacheRedis()) {
     const redisEntry = await formatCache.getAsync(videoId);
     if (redisEntry && redisEntry.data && Date.now() < redisEntry.expires) return redisEntry.data;
+  }
 
+  // A distributed lock is only useful when its owner can publish the result
+  // to a shared cache for waiters. BullMQ still deduplicates extraction jobs if
+  // the volatile cache Redis is temporarily unavailable.
+  if (hasRedis() && hasCacheRedis()) {
     // Try to acquire extraction lock — if another worker is extracting, wait for result
-    const lockAcquired = await acquireLock(`extract:${videoId}`, 60000);
-    if (!lockAcquired) {
+    extractionLockToken = await acquireLock(`extract:${videoId}`, EXTRACTION_LOCK_LEASE_MS);
+    if (!extractionLockToken) {
       // A request in this process may have populated the in-flight map while
       // the Redis checks above were pending. Join it instead of polling Redis.
       const newlyLocalRequest = extractionInflight.get(videoId);
       if (newlyLocalRequest) return newlyLocalRequest;
       // Another worker is extracting — poll Redis for result
-      for (let i = 0; i < 30; i++) {
+      const waitDeadline = Date.now() + EXTRACTION_WAIT_MS;
+      while (Date.now() < waitDeadline) {
         await new Promise(r => setTimeout(r, 1000 + Math.random() * 500));
         const entry = await formatCache.getAsync(videoId);
         if (entry && entry.data && Date.now() < entry.expires) return entry.data;
       }
-      // Timeout — return temporary failure instead of duplicate extraction
-      const timeoutResult = { formats: [], duration: 0, _unavailable: 'Extraction in progress. Try again in a moment.' };
-      formatCache.set(videoId, { data: timeoutResult, expires: Date.now() + 10000 }); // short 10s TTL
-      return timeoutResult;
+      // Do not start a duplicate after waiting. The current owner may still be
+      // publishing its result, and a retry will join the same queue job.
+      return { formats: [], duration: 0, _pending: true, _unavailable: 'Extraction is still in progress. Try again in a moment.' };
     }
-    ownsExtractionLock = true;
+    if (extractionLockToken !== 'local') {
+      lockRenewTimer = setInterval(() => {
+        void renewLock(`extract:${videoId}`, extractionLockToken, EXTRACTION_LOCK_LEASE_MS).then((renewed) => {
+          if (!renewed) console.warn(`[stream ${videoId}] extraction ownership lease was lost`);
+        });
+      }, Math.floor(EXTRACTION_LOCK_LEASE_MS / 3));
+      if (typeof lockRenewTimer.unref === 'function') lockRenewTimer.unref();
+    }
   }
 
-  return dedup(extractionInflight, videoId, async () => {
-    try {
-    // Try extraction queue (separate worker process) if available
-    if (hasExtractionQueue()) {
+  try {
+    return await dedup(extractionInflight, videoId, async () => {
+      const startedAt = Date.now();
+      let queueWaitMs = 0;
+      let metricResult = 'error';
+      let metricMode = 'local';
       try {
+      // Redis deployments have one authoritative extraction path: the BullMQ
+      // worker. A wait timeout never starts the same expensive job in the web
+      // process while the worker is still alive.
+      if (hasExtractionQueue()) {
+        metricMode = 'worker';
         notifyExtractionStep(videoId, 'queue');
-        const result = await enqueueExtraction(videoId, 60000);
-        if (result && result.formats) {
+        const queued = await enqueueExtraction(videoId, {
+          timeoutMs: EXTRACTION_WAIT_MS,
+          priority,
+        });
+        queueWaitMs = queued?.waitMs || 0;
+        if (queued?.status === 'completed' && queued.result) {
+          const result = compactExtractionResult(queued.result);
           const fmts = result.formats || [];
-          const hlsCount = fmts.filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.vcodec && f.vcodec !== 'none').length;
-          const directCount = fmts.filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http')).length;
-          console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct) via extraction-worker (${result._extractedVia || 'unknown'})`);
-          setCache(videoId, result);
-          cacheVideoDetailsFromInfo(videoId, result);
+          if (fmts.length > 0) {
+            const hlsCount = fmts.filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.vcodec && f.vcodec !== 'none').length;
+            const directCount = fmts.filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http')).length;
+            console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct) via extraction-worker (${result._extractedVia || 'unknown'})`);
+            await setCache(videoId, result);
+            await cacheVideoDetailsFromInfo(videoId, result);
+          } else {
+            await formatCache.setAsync(videoId, { data: result, expires: Date.now() + 15_000 });
+          }
+          metricResult = fmts.length > 0 ? 'success' : 'unavailable';
+          logger.sampledInfo('extraction-perf', 'extraction-perf', {
+            videoId,
+            priority,
+            via: result._extractedVia || 'worker',
+            queueWaitMs,
+            totalMs: Date.now() - startedAt,
+            workerTimings: result._extractionTimings || null,
+          });
           return result;
         }
-        // Queue returned empty/null — fall through to in-process extraction
-        console.warn(`[stream ${videoId}] extraction queue returned no result, falling back to in-process`);
-      } catch (err) {
-        console.warn(`[stream ${videoId}] extraction queue error, falling back to in-process:`, err.message);
+        if (queued?.status === 'pending') {
+          metricResult = 'pending';
+          logger.sampledInfo('extraction-perf', 'extraction-perf', {
+            videoId,
+            priority,
+            status: 'pending',
+            queueWaitMs,
+            totalMs: Date.now() - startedAt,
+          });
+          return { formats: [], duration: 0, _pending: true, _unavailable: 'Extraction is queued and still running. Try again in a moment.' };
+        }
+        if (queued?.status === 'overloaded') {
+          metricResult = 'overloaded';
+          return {
+            formats: [],
+            duration: 0,
+            _overloaded: true,
+            _unavailable: priority === 'playback'
+              ? 'Playback capacity is temporarily full. Try again in a moment.'
+              : 'Background extraction capacity is full.',
+          };
+        }
+        metricResult = 'unavailable';
+        return { formats: [], duration: 0, _unavailable: 'The extraction worker could not complete this video. Try again shortly.' };
       }
-    }
 
-    // Level 1 & 2: yt-dlp (with cookies -> browser cookies)
-    notifyExtractionStep(videoId,'yt-dlp');
-    const failedBackends: string[] = [];
-    let lastError = '';
-    let info = await extractViaYtdlp(videoId, withYtdlpSlot, 'yt-dlp');
+      const extractedInfo = await extractWithStrategy(videoId, withYtdlpSlot, {
+        priority,
+        onStep: (step) => notifyExtractionStep(videoId, step),
+        logTag: 'yt-dlp',
+      });
+      const info = compactExtractionResult(extractedInfo);
 
-    // If permanently unavailable (livestream, premiere), cache and return immediately
-    if (info && info._permanent) {
-      const { _permanent, ...result } = info;
-      notifyExtractionDone(videoId);
-      setCache(videoId, result);
-      return result;
-    }
+      if (!info) {
+        metricResult = 'unavailable';
+        const msg = 'Extraction failed within the bounded backend deadline. YouTube may be rate-limiting or requiring fresh cookies.';
+        console.error(`[stream ${videoId}] ${msg}`);
+        const empty = { formats: [], duration: 0, _unavailable: msg };
+        await formatCache.setAsync(videoId, { data: empty, expires: Date.now() + 15_000 });
+        return empty;
+      }
 
-    // Level 3: yt-dlp with alternative client
-    if (!info) {
-      failedBackends.push('yt-dlp');
-      notifyExtractionStep(videoId,'yt-dlp-alt');
-      lastError = `[stream ${videoId}] yt-dlp failed, trying alt client`;
-      console.warn(lastError);
-      info = await extractViaYtdlpAlt(videoId, withYtdlpSlot, 'yt-dlp-alt');
-    }
+      if (info._permanent) {
+        metricResult = 'permanent';
+        const { _permanent, ...result } = info;
+        await setCache(videoId, result);
+        return result;
+      }
 
-    // Level 4: Innertube /player API (ANDROID_VR client)
-    if (!info) {
-      failedBackends.push('yt-dlp-alt');
-      notifyExtractionStep(videoId,'innertube');
-      lastError = `[stream ${videoId}] yt-dlp-alt failed, trying Innertube`;
-      console.warn(lastError);
-      info = await extractViaInnertube(videoId);
+      const fmts = info.formats || [];
+      const hlsCount = fmts.filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.vcodec && f.vcodec !== 'none').length;
+      const directCount = fmts.filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http')).length;
+      console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct), duration=${info.duration}s via ${info._extractedVia || 'yt-dlp'}`);
+      await setCache(videoId, info);
+      await cacheVideoDetailsFromInfo(videoId, info);
+      metricResult = 'success';
+      logger.sampledInfo('extraction-perf', 'extraction-perf', {
+        videoId,
+        priority,
+        via: info._extractedVia || 'yt-dlp',
+        queueWaitMs,
+        totalMs: Date.now() - startedAt,
+        backendTimings: info._extractionTimings || null,
+      });
+      return info;
+      } finally {
+        incrementMetric('extraction_requests_total', {
+          priority,
+          mode: metricMode,
+          result: metricResult,
+        });
+        observeMetric('extraction_request_duration_seconds', (Date.now() - startedAt) / 1000, {
+          priority,
+          mode: metricMode,
+          result: metricResult,
+        });
+        if (queueWaitMs > 0) {
+          observeMetric('extraction_queue_wait_seconds', queueWaitMs / 1000, { priority });
+        }
+        if (lockRenewTimer) clearInterval(lockRenewTimer);
+        if (extractionLockToken) await releaseLock(`extract:${videoId}`, extractionLockToken);
+      }
+    }, { name: 'stream_extraction', maxEntries: 256 });
+  } catch (error) {
+    // Capacity can be reached after a distributed lease was acquired but before
+    // the single-flight owner starts. Release that unused lease immediately.
+    if (error instanceof SingleFlightCapacityError) {
+      if (lockRenewTimer) clearInterval(lockRenewTimer);
+      if (extractionLockToken) await releaseLock(`extract:${videoId}`, extractionLockToken);
     }
-
-    // Level 5: Invidious API (third-party extraction)
-    if (!info) {
-      failedBackends.push('innertube');
-      notifyExtractionStep(videoId,'invidious');
-      lastError = `[stream ${videoId}] Innertube failed, trying Invidious`;
-      console.warn(lastError);
-      info = await extractViaInvidious(videoId);
-    }
-
-    // All backends failed — short 15s negative cache so manual retry works quickly
-    if (!info) {
-      failedBackends.push('invidious');
-      const msg = `Extraction failed (${failedBackends.join(' → ')}). Retrying may help — YouTube may be rate-limiting or requiring fresh cookies.`;
-      console.error(`[stream ${videoId}] ${msg}`);
-      const empty = { formats: [], duration: 0, _unavailable: msg };
-      formatCache.set(videoId, { data: empty, expires: Date.now() + 15 * 1000 });
-      return empty;
-    }
-
-    const fmts = info.formats || [];
-    const hlsCount = fmts.filter(f => f.protocol && f.protocol.startsWith('m3u8') && f.vcodec && f.vcodec !== 'none').length;
-    const directCount = fmts.filter(f => f.url && (!f.protocol || f.protocol === 'https' || f.protocol === 'http')).length;
-    console.log(`[stream ${videoId}] ${fmts.length} formats (${hlsCount} HLS, ${directCount} direct), duration=${info.duration}s via ${info._extractedVia || 'yt-dlp'}`);
-    setCache(videoId, info);
-    // Populate video details cache so /watch/details can return instantly
-    cacheVideoDetailsFromInfo(videoId, info);
-    return info;
-    } finally {
-      if (ownsExtractionLock) await releaseLock(`extract:${videoId}`);
-    }
-  });
+    throw error;
+  }
 }
 
 export {

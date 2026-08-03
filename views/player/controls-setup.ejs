@@ -199,12 +199,18 @@
         if (ccActive) {
           player.setTextTrackVisibility(false);
           ccActive = false;
-        } else if (player.getTextTracks().length > 0) {
-          var track = player.getActiveTextTrack() || player.getTextTracks()[0];
-          player.selectTextTrack(track).then(function () {
-            player.setTextTrackVisibility(true);
-            ccActive = true;
-            updateCcVisual();
+        } else {
+          var loadTracks = player.getTextTracks().length > 0 || !window._loadSubtitles
+            ? Promise.resolve()
+            : window._loadSubtitles();
+          loadTracks.then(function () {
+            if (!player.getTextTracks().length) return;
+            var track = player.getActiveTextTrack() || player.getTextTracks()[0];
+            return player.selectTextTrack(track).then(function () {
+              player.setTextTrackVisibility(true);
+              ccActive = true;
+              updateCcVisual();
+            });
           });
         }
         updateCcVisual();
@@ -350,8 +356,11 @@
         var wasOpen = isAnyMenuOpen();
         for (var i = 0; i < allMenus.length; i++) allMenus[i].classList.add('player-menu-hidden');
         if (wasOpen && !video.paused) {
-          clearTimeout(hideTimer);
-          hideTimer = setTimeout(hideControls, 300);
+          if (hideTimer) clearPlayerTimeout(hideTimer);
+          hideTimer = setPlayerTimeout(function () {
+            hideTimer = 0;
+            hideControls();
+          }, 300);
         }
       }
       function isAnyMenuOpen() {
@@ -383,16 +392,21 @@
       captionRow.button.addEventListener('click', function () {
         overflowMenu.classList.add('player-menu-hidden');
         captionMenu.classList.remove('player-menu-hidden');
+        if (window._loadSubtitles) window._loadSubtitles();
       });
 
       // Close menus on click outside
-      document.addEventListener('click', function (e) {
+      function onPlayerDocumentClick(e) {
         if (!isAnyMenuOpen()) return;
         for (var i = 0; i < allMenus.length; i++) {
           if (e.target.closest('.' + allMenus[i].className.split(' ')[0])) return;
         }
         if (e.target.closest('.player-settings-btn') || e.target.closest('.current-chapter')) return;
         closeAllMenus();
+      }
+      document.addEventListener('click', onPlayerDocumentClick);
+      addPlayerCleanup(function () {
+        document.removeEventListener('click', onPlayerDocumentClick);
       });
 
       // --- Play/pause button ---
@@ -479,3 +493,7 @@
       });
       document.addEventListener('fullscreenchange', updateFsIcon);
       document.addEventListener('webkitfullscreenchange', updateFsIcon);
+      addPlayerCleanup(function () {
+        document.removeEventListener('fullscreenchange', updateFsIcon);
+        document.removeEventListener('webkitfullscreenchange', updateFsIcon);
+      });

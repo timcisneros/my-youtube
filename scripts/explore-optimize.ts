@@ -71,7 +71,7 @@ if (cliUsers.length > 0) {
 } else {
   const candidates = ['admin', 'user', 'default', 'demo', 'test'];
   for (const uid of candidates) {
-    const watches = db.getAllWatchTimesForUser(uid);
+    const watches = await db.getAllWatchTimesForUser(uid);
     if (watches.length >= MIN_WATCHES) userIds.push(uid);
   }
 }
@@ -86,11 +86,11 @@ if (userIds.length === 0) {
 }
 
 /** Evaluate a config against holdout watches, returning a YouTube-aligned composite score. */
-function evaluateConfig(config: ExploreConfig, evalUserIds: string[]): number {
+async function evaluateConfig(config: ExploreConfig, evalUserIds: string[]): Promise<number> {
   const userScores: number[] = [];
 
   for (const userId of evalUserIds) {
-    const allWatches = db.getAllWatchTimesForUser(userId)
+    const allWatches = (await db.getAllWatchTimesForUser(userId))
       .filter(wt => wt.duration > 0 && (wt.last_position === 0 || wt.last_position / wt.duration > 0.3))
       .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
 
@@ -132,14 +132,14 @@ function evaluateConfig(config: ExploreConfig, evalUserIds: string[]): number {
     let concordanceScore = 0;
 
     try {
-      db.runInSavepoint(() => {
+      await db.runInSavepoint(async () => {
         for (const wt of holdout) {
-          db.setWatchTime(userId, wt.video_id, 0, 0);
+          await db.setWatchTime(userId, wt.video_id, 0, 0);
         }
 
         cache.exploreVideos.delete(userId);
 
-        const result = getExploreVideos(userId, undefined, config);
+        const result = await getExploreVideos(userId, undefined, config);
         const recommendedIds = result.videos.map(v => v.videoId);
 
         // Build rank map for holdout videos that appear in recommendations
@@ -209,7 +209,7 @@ function evaluateConfig(config: ExploreConfig, evalUserIds: string[]): number {
         // Expected — savepoint was rolled back, data restored
       } else {
         for (const orig of originalData) {
-          db.setWatchTime(userId, orig.videoId, orig.position, orig.duration);
+          await db.setWatchTime(userId, orig.videoId, orig.position, orig.duration);
         }
         console.error(`Error evaluating user ${userId}:`, e);
         continue;
@@ -243,7 +243,7 @@ function clampWeight(key: keyof ExploreConfig, value: number): number {
 
 // Initialize
 const bestConfig = { ...DEFAULT_EXPLORE_CONFIG };
-let bestScore = evaluateConfig(bestConfig, userIds);
+let bestScore = await evaluateConfig(bestConfig, userIds);
 
 console.log('Explore Weight Optimizer');
 console.log('=======================');
@@ -268,8 +268,8 @@ for (let pass = 1; pass <= MAX_PASSES; pass++) {
     const valuePlus = clampWeight(key, current + step);
     const valueMinus = clampWeight(key, current - step);
 
-    const scorePlus = valuePlus !== current ? evaluateConfig(withWeight(bestConfig, key, valuePlus), userIds) : -1;
-    const scoreMinus = valueMinus !== current ? evaluateConfig(withWeight(bestConfig, key, valueMinus), userIds) : -1;
+    const scorePlus = valuePlus !== current ? await evaluateConfig(withWeight(bestConfig, key, valuePlus), userIds) : -1;
+    const scoreMinus = valueMinus !== current ? await evaluateConfig(withWeight(bestConfig, key, valueMinus), userIds) : -1;
 
     if (scorePlus > bestScore && scorePlus >= scoreMinus) {
       bestConfig[key] = valuePlus;
@@ -304,7 +304,7 @@ for (let pass = 1; pass <= MAX_PASSES; pass++) {
 }
 
 // Output results
-const baselineScore = evaluateConfig({ ...DEFAULT_EXPLORE_CONFIG }, userIds);
+const baselineScore = await evaluateConfig({ ...DEFAULT_EXPLORE_CONFIG }, userIds);
 const improvement = bestScore - baselineScore;
 
 console.log('');

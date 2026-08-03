@@ -366,8 +366,10 @@
         }
       }
 
+      var _subtitleListPromise = null;
       window._loadSubtitles = function () {
-        fetch('/api/stream/<%= video.videoId %>/subtitles?token=' + streamToken)
+        if (_subtitleListPromise) return _subtitleListPromise;
+        _subtitleListPromise = fetch('/api/stream/<%= video.videoId %>/subtitles?token=' + streamToken)
           .then(function (r) { return r.ok ? r.json() : []; })
           .then(function (langs) {
             window._subtitleList = langs;
@@ -384,6 +386,11 @@
             });
             rebuildCaptionSubmenu();
             updateCcVisual();
+            return langs;
           })
-          .catch(function () {});
+          .catch(function () {
+            _subtitleListPromise = null;
+            return [];
+          });
+        return _subtitleListPromise;
       };

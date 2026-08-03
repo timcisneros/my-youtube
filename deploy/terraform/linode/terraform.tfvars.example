@@ -20,17 +20,13 @@ domain = "yourtube.example.com"
 web_instance_type     = "g6-standard-2"  # 2 vCPU, 4GB  — $24/mo
 worker_instance_type  = "g6-standard-4"  # 4 vCPU, 8GB  — $36/mo
 db_instance_type      = "g6-standard-2"  # 2 vCPU, 4GB  — $24/mo
-storage_instance_type = "g6-standard-2"  # 2 vCPU, 4GB  — $24/mo
 
 # Volume sizes
-db_volume_size      = 50   # GB for PostgreSQL data
-storage_volume_size = 200  # GB for MinIO media storage
+db_volume_size = 50  # GB for PostgreSQL data
 
 # Credentials — use strong random values!
 # Generate with: openssl rand -hex 32
 postgres_password = "CHANGE_ME_postgres_password"
 redis_password    = "CHANGE_ME_redis_password"
-s3_access_key     = "myyoutube-admin"
-s3_secret_key     = "CHANGE_ME_minio_secret"
 session_secret    = "CHANGE_ME_session_hex_secret"
 stream_secret     = "CHANGE_ME_stream_hex_secret"

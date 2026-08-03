@@ -13,7 +13,11 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 const execFileAsync = promisify(execFile);
 import { YTDLP_BIN, ytdlpArgs } from './ytdlp.js';
-import { createCircuitBreaker, refreshClientVersion, getClientVersion, USER_AGENT } from './extractors.js';
+import { createCircuitBreaker, getClientVersion, USER_AGENT } from './extractors.js';
+import { withYtSlot } from './youtube/shared.js';
+import { withYtdlpSlot } from './routes/stream/shared.js';
+import { readBodyBounded, readJsonBounded } from './lib/bounded-fetch.js';
+import { parseEmbeddedJsonBuffer } from './lib/upstream-parser.js';
 
 const breakers = {
   api:    createCircuitBreaker('player-api'),
@@ -24,69 +28,64 @@ const breakers = {
 // ---------------------------------------------------------------------------
 // Strategy 1: Internal player API
 // ---------------------------------------------------------------------------
-async function fetchViaAPI(videoId, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
-    method: 'POST',
-    signal: controller.signal,
-    headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
-    body: JSON.stringify({
-      videoId,
-      context: { client: { clientName: 'WEB', clientVersion: getClientVersion(), hl: 'en' } },
-    }),
-  });
-  if (!resp.ok) { clearTimeout(timer); throw new Error(`HTTP ${resp.status}`); }
-  const data = await resp.json();
-  clearTimeout(timer);
-  if (!data.videoDetails) throw new Error('No videoDetails in response');
-  return data.videoDetails;
+function deadlineSignal(timeoutMs, parentSignal) {
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  return parentSignal ? AbortSignal.any([parentSignal, timeoutSignal]) : timeoutSignal;
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : new DOMException('Aborted', 'AbortError');
+}
+
+async function fetchViaAPI(videoId, timeoutMs, signal) {
+  return withYtSlot(async () => {
+    throwIfAborted(signal);
+    const resp = await fetch('https://www.youtube.com/youtubei/v1/player', {
+      method: 'POST',
+      signal: deadlineSignal(timeoutMs, signal),
+      headers: { 'Content-Type': 'application/json', 'User-Agent': USER_AGENT },
+      body: JSON.stringify({
+        videoId,
+        context: { client: { clientName: 'WEB', clientVersion: getClientVersion(), hl: 'en' } },
+      }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await readJsonBounded(resp, 1024 * 1024, 'video-metadata-response-too-large');
+    if (!data.videoDetails) throw new Error('No videoDetails in response');
+    return data.videoDetails;
+  }, 'background', signal);
 }
 
 // ---------------------------------------------------------------------------
 // Strategy 2: Watch page scrape
 // ---------------------------------------------------------------------------
-async function fetchViaScrape(videoId, timeoutMs) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
-    signal: controller.signal,
-    headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'text/html' },
-    redirect: 'follow',
-  });
-  if (!resp.ok) { clearTimeout(timer); throw new Error(`HTTP ${resp.status}`); }
-  const html = await resp.text();
-  clearTimeout(timer);
-
-  const marker = 'var ytInitialPlayerResponse = ';
-  let idx = html.indexOf(marker);
-  if (idx === -1) throw new Error('No ytInitialPlayerResponse in page');
-  idx += marker.length;
-
-  let depth = 0;
-  for (let i = idx; i < html.length; i++) {
-    if (html[i] === '{') depth++;
-    else if (html[i] === '}') {
-      depth--;
-      if (depth === 0) {
-        const player = JSON.parse(html.slice(idx, i + 1));
-        if (!player.videoDetails) throw new Error('No videoDetails in scraped response');
-        return player.videoDetails;
-      }
-    }
-  }
-  throw new Error('Failed to parse ytInitialPlayerResponse');
+async function fetchViaScrape(videoId, timeoutMs, signal) {
+  return withYtSlot(async () => {
+    throwIfAborted(signal);
+    const resp = await fetch(`https://www.youtube.com/watch?v=${videoId}&hl=en`, {
+      signal: deadlineSignal(timeoutMs, signal),
+      headers: { 'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9', 'Accept': 'text/html' },
+      redirect: 'follow',
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const html = await readBodyBounded(resp, 4 * 1024 * 1024, 'watch-page-too-large');
+    const player = await parseEmbeddedJsonBuffer(html, 'ytInitialPlayerResponse');
+    if (!player.videoDetails) throw new Error('No videoDetails in scraped response');
+    return player.videoDetails;
+  }, 'background', signal);
 }
 
 // ---------------------------------------------------------------------------
 // Strategy 3: yt-dlp (single video, subprocess)
 // ---------------------------------------------------------------------------
-async function fetchViaYtdlp(videoId, timeoutMs) {
-  const { stdout } = await execFileAsync(YTDLP_BIN, [
-    ...ytdlpArgs(),
-    '--print', '%(duration)s %(live_status)s',
-    '--', videoId,
-  ], { timeout: timeoutMs });
+async function fetchViaYtdlp(videoId, timeoutMs, signal) {
+  throwIfAborted(signal);
+  const { stdout } = await withYtdlpSlot(() => execFileAsync(YTDLP_BIN, [
+      ...ytdlpArgs(),
+      '--print', '%(duration)s %(live_status)s',
+      '--', videoId,
+    ], { timeout: timeoutMs, signal }), { priority: 'background', signal });
   const parts = stdout.trim().split(/\s+/);
   const duration = parseFloat(parts[0]);
   const liveStatus = parts[1] || 'not_live';
@@ -116,46 +115,34 @@ function parseDetails(videoId, details) {
 
 // Fetch metadata for a single video. Tries strategies in order,
 // skipping any with an open circuit breaker.
-async function fetchVideoMeta(videoId, { timeoutMs = 6000 } = {}) {
+async function fetchVideoMeta(videoId, {
+  timeoutMs = 6000,
+  signal,
+  mode = 'full',
+}: {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  mode?: 'full' | 'lightweight';
+} = {}) {
   const strategies = [
     { name: 'api',    fn: fetchViaAPI,    breaker: breakers.api,    timeout: timeoutMs },
     { name: 'scrape', fn: fetchViaScrape, breaker: breakers.scrape, timeout: timeoutMs + 2000 },
     { name: 'ytdlp',  fn: fetchViaYtdlp,  breaker: breakers.ytdlp,  timeout: 15000 },
-  ];
+  ].slice(0, mode === 'lightweight' ? 1 : 3);
 
   for (const s of strategies) {
+    throwIfAborted(signal);
     if (s.breaker.isOpen) continue;
     try {
-      const details = await s.fn(videoId, s.timeout);
+      const details = await s.fn(videoId, s.timeout, signal);
       s.breaker.recordSuccess();
       return parseDetails(videoId, details);
     } catch {
+      throwIfAborted(signal);
       s.breaker.recordFailure();
     }
   }
   return null;
 }
 
-// Fetch metadata for multiple videos in parallel.
-// Returns a Map<videoId, { duration, liveStatus }>.
-async function fetchVideoMetaBatch(videoIds, { concurrency = 6, timeoutMs = 6000 } = {}) {
-  // Refresh client version periodically (non-blocking)
-  refreshClientVersion().catch(() => {});
-
-  const results = new Map();
-  for (let i = 0; i < videoIds.length; i += concurrency) {
-    const chunk = videoIds.slice(i, i + concurrency);
-    const settled = await Promise.allSettled(
-      chunk.map(id => fetchVideoMeta(id, { timeoutMs }))
-    );
-    for (const result of settled) {
-      if (result.status === 'fulfilled' && result.value) {
-        const v = result.value;
-        results.set(v.id, { duration: v.duration, liveStatus: v.liveStatus });
-      }
-    }
-  }
-  return results;
-}
-
-export { fetchVideoMetaBatch };
+export { fetchVideoMeta };

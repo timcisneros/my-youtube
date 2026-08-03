@@ -3,6 +3,10 @@
  */
 import { cache, withYtSlot, PLAYLIST_TTL } from './shared.js';
 import { getClientVersion } from '../extractors.js';
+import { fetchWithBodyTimeout, readBodyBounded, readJsonBounded } from '../lib/bounded-fetch.js';
+import { runBoundedSingleFlight } from '../lib/bounded-singleflight.js';
+import { parseEmbeddedJsonBuffer } from '../lib/upstream-parser.js';
+import { createHash } from 'node:crypto';
 
 interface PlaylistVideo {
   videoId: string;
@@ -26,7 +30,22 @@ interface PlaylistDetails {
   nextPageToken: string | null;
 }
 
+interface PlaylistRequestOptions {
+  priority?: 'interactive' | 'background';
+}
+
 const inFlightPlaylists = new Map<string, Promise<PlaylistDetails>>();
+const playlistSingleFlight = { name: 'playlist', maxEntries: 300 } as const;
+const inFlightPlaylistContinuations = new Map<string, Promise<PlaylistDetails>>();
+const playlistContinuationSingleFlight = { name: 'playlist_continuation', maxEntries: 1000 } as const;
+const PLAYLIST_CONTINUATION_TTL_MS = Math.min(PLAYLIST_TTL,
+  Math.max(60_000, Number(process.env.PLAYLIST_CONTINUATION_TTL_MS) || 5 * 60_000));
+const PLAYLIST_CONTINUATION_MAX_TOKEN_LENGTH = 4096;
+
+function playlistContinuationCacheKey(playlistId: string, continuation: string, startIndex: number) {
+  const tokenHash = createHash('sha256').update(continuation).digest('base64url').slice(0, 32);
+  return `${playlistId}:${startIndex}:${tokenHash}`;
+}
 
 function sanitizePlaylistId(value: unknown): string {
   const playlistId = typeof value === 'string' ? value.trim() : '';
@@ -195,39 +214,6 @@ function parsePlaylistInitialData(data: unknown, playlistId: string): PlaylistDe
   };
 }
 
-function extractInitialData(html: string): unknown {
-  const marker = 'ytInitialData';
-  const markerIndex = html.indexOf(marker);
-  if (markerIndex === -1) throw new Error('ytInitialData not found');
-  const start = html.indexOf('{', markerIndex);
-  if (start === -1) throw new Error('ytInitialData object not found');
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let i = start; i < html.length; i++) {
-    const ch = html[i];
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-      } else if (ch === '\\') {
-        escaped = true;
-      } else if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-    } else if (ch === '{') {
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0) return JSON.parse(html.slice(start, i + 1));
-    }
-  }
-  throw new Error('ytInitialData object was incomplete');
-}
-
 function parsePlaylistContinuationData(data: unknown, playlistId: string, startIndex = 1): PlaylistDetails {
   const { items, nextPageToken } = parsePlaylistItems(data, startIndex);
   const firstPlayable = items.find((item) => item.available && item.videoId);
@@ -246,76 +232,62 @@ function parsePlaylistContinuationData(data: unknown, playlistId: string, startI
 async function getPlaylistContinuation(rawPlaylistId: unknown, pageToken: unknown, startIndex = 1): Promise<PlaylistDetails> {
   const playlistId = extractPlaylistId(rawPlaylistId);
   const continuation = typeof pageToken === 'string' ? pageToken : '';
-  if (!playlistId || !continuation) throw new Error('Invalid playlist continuation');
-  return withYtSlot(async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    try {
-      const res = await fetch('https://www.youtube.com/youtubei/v1/browse', {
+  const boundedStartIndex = Math.min(100_000, Math.max(1, Math.floor(Number(startIndex) || 1)));
+  if (!playlistId || !continuation || continuation.length > PLAYLIST_CONTINUATION_MAX_TOKEN_LENGTH) {
+    throw new Error('Invalid playlist continuation');
+  }
+  const cacheKey = playlistContinuationCacheKey(playlistId, continuation, boundedStartIndex);
+  const cached = await cache.playlistContinuations.getAsync(cacheKey);
+  if (cached) return cached.data as PlaylistDetails;
+  return runBoundedSingleFlight(inFlightPlaylistContinuations, cacheKey, async () => {
+    const shared = await cache.playlistContinuations.getAsync(cacheKey);
+    if (shared) return shared.data as PlaylistDetails;
+    const page = await withYtSlot(async () => {
+      const res = await fetchWithBodyTimeout('https://www.youtube.com/youtubei/v1/browse', {
         method: 'POST',
-        signal: controller.signal,
         headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', Referer: '', Cookie: '' },
         body: JSON.stringify({
           continuation,
           context: { client: { clientName: 'WEB', clientVersion: getClientVersion(), hl: 'en' } },
         }),
-      });
+      }, { headerTimeoutMs: 10_000, bodyIdleMs: 10_000 });
       if (!res.ok) throw new Error(`YouTube playlist continuation returned ${res.status}`);
-      return parsePlaylistContinuationData(await res.json(), playlistId, startIndex);
-    } finally {
-      clearTimeout(timer);
-    }
-  });
+      return parsePlaylistContinuationData(
+        await readJsonBounded(res, 4 * 1024 * 1024, 'playlist-continuation-response-too-large'),
+        playlistId,
+        boundedStartIndex,
+      );
+    });
+    await cache.playlistContinuations.setAsync(cacheKey, {
+      data: page,
+      expires: Date.now() + PLAYLIST_CONTINUATION_TTL_MS,
+    });
+    return page;
+  }, playlistContinuationSingleFlight);
 }
 
-async function getPlaylistDetails(rawPlaylistId: unknown): Promise<PlaylistDetails> {
+async function getPlaylistDetails(
+  rawPlaylistId: unknown,
+  options: PlaylistRequestOptions = {},
+): Promise<PlaylistDetails> {
   const playlistId = extractPlaylistId(rawPlaylistId);
   if (!playlistId) throw new Error('Invalid playlist ID');
-  const cached = cache.playlists.get(playlistId);
+  const cached = await cache.playlists.getAsync(playlistId);
   if (cached && Date.now() < cached.expires) return cached.data as PlaylistDetails;
-  const activeRequest = inFlightPlaylists.get(playlistId);
-  if (activeRequest !== undefined) return activeRequest;
-
-  const request = withYtSlot(async () => {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 10000);
-    try {
-      const res = await fetch(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}&hl=en&gl=US`, {
-        signal: controller.signal,
+  return runBoundedSingleFlight(inFlightPlaylists, playlistId, async () => {
+    const request = withYtSlot(async () => {
+      const res = await fetchWithBodyTimeout(`https://www.youtube.com/playlist?list=${encodeURIComponent(playlistId)}&hl=en&gl=US`, {
         headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', Referer: '', Cookie: '' },
-      });
+      }, { headerTimeoutMs: 10_000, bodyIdleMs: 10_000 });
       if (!res.ok) throw new Error(`YouTube playlist returned ${res.status}`);
-      const html = await res.text();
-      return parsePlaylistInitialData(extractInitialData(html), playlistId);
-    } finally {
-      clearTimeout(timer);
-    }
-  });
-  inFlightPlaylists.set(playlistId, request);
-  try {
+      const html = await readBodyBounded(res, 8 * 1024 * 1024, 'playlist-page-response-too-large');
+      const initialData = await parseEmbeddedJsonBuffer(html, 'ytInitialData');
+      return parsePlaylistInitialData(initialData, playlistId);
+    }, options.priority || 'interactive');
     const playlist = await request;
-    cache.playlists.set(playlistId, { data: playlist, expires: Date.now() + PLAYLIST_TTL });
+    await cache.playlists.setAsync(playlistId, { data: playlist, expires: Date.now() + PLAYLIST_TTL });
     return playlist;
-  } finally {
-    if (inFlightPlaylists.get(playlistId) === request) inFlightPlaylists.delete(playlistId);
-  }
+  }, playlistSingleFlight);
 }
 
-async function getExpandedPlaylistDetails(rawPlaylistId: unknown, maxItems = 500): Promise<PlaylistDetails> {
-  const first = await getPlaylistDetails(rawPlaylistId);
-  let result = first;
-  let token = first.nextPageToken;
-  while (token && result.items.length < maxItems) {
-    const page = await getPlaylistContinuation(first.playlistId, token, result.items.length + 1);
-    result = {
-      ...result,
-      items: result.items.concat(page.items),
-      nextPageToken: page.nextPageToken,
-    };
-    token = page.nextPageToken;
-    if (page.items.length === 0) break;
-  }
-  return result.items.length >= maxItems ? { ...result, nextPageToken: token } : result;
-}
-
-export { extractPlaylistId, getExpandedPlaylistDetails, getPlaylistContinuation, getPlaylistDetails, parsePlaylistContinuationData, parsePlaylistInitialData, sanitizePlaylistId };
+export { extractPlaylistId, getPlaylistContinuation, getPlaylistDetails, parsePlaylistContinuationData, parsePlaylistInitialData, playlistContinuationCacheKey, sanitizePlaylistId };

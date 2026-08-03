@@ -1,5 +1,8 @@
 import { extractionStatus } from './shared.js';
 import * as wsStatus from '../../lib/ws-status.js';
+import { acquireStatusConnection } from '../../lib/status-connection-limiter.js';
+
+const STATUS_CONNECTION_MAX_AGE_MS = Math.max(10_000, Number(process.env.STATUS_CONNECTION_MAX_AGE_MS) || 45_000);
 
 // SSE: push extraction progress to the client as backends are tried
 const extractionListeners = new Map(); // videoId -> Set<res>
@@ -14,7 +17,7 @@ function notifyExtractionStep(videoId, step) {
   if (listeners) {
     for (const res of listeners) {
       try {
-        res.write(`data: ${JSON.stringify({ step })}\n\n`);
+        if (!res.write(`data: ${JSON.stringify({ step })}\n\n`)) res.end();
         if (typeof res.flush === 'function') res.flush();
       } catch { listeners.delete(res); }
     }
@@ -42,6 +45,11 @@ function notifyExtractionDone(videoId) {
 function mountStatusRoutes(router) {
   router.get('/:videoId/status', (req, res) => {
     const { videoId } = req.params;
+    const releaseConnection = acquireStatusConnection(req.ip, 'sse');
+    if (!releaseConnection) {
+      res.set('Retry-After', '5');
+      return res.status(429).end();
+    }
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no' });
     res.flushHeaders();
     // Send current step immediately if extraction is in-flight
@@ -51,20 +59,26 @@ function mountStatusRoutes(router) {
       if (typeof res.flush === 'function') res.flush();
     }
     // Keep connection open — extraction may start soon (e.g. manifest request pending)
-    // Auto-close after 30s if no extraction happens
+    // Auto-close even if a client forgets to disconnect after extraction.
     if (!extractionListeners.has(videoId)) extractionListeners.set(videoId, new Set());
     extractionListeners.get(videoId).add(res);
     const timeout = setTimeout(() => {
       res.write('event: done\ndata: {}\n\n');
       res.end();
-      const set = extractionListeners.get(videoId);
-      if (set) { set.delete(res); if (set.size === 0) extractionListeners.delete(videoId); }
-    }, 30000);
-    req.on('close', () => {
+    }, STATUS_CONNECTION_MAX_AGE_MS);
+    timeout.unref?.();
+    let cleanedUp = false;
+    const cleanupConnection = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
       clearTimeout(timeout);
+      releaseConnection();
       const set = extractionListeners.get(videoId);
       if (set) { set.delete(res); if (set.size === 0) extractionListeners.delete(videoId); }
-    });
+    };
+    req.once('aborted', cleanupConnection);
+    res.once('close', cleanupConnection);
+    res.once('finish', cleanupConnection);
   });
 }
 

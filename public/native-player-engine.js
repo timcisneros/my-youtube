@@ -31,6 +31,14 @@
   var SOURCEBUFFER_WATCHDOG_MS = 1200;
   var SEGMENT_BUSY_WATCHDOG_MS = 2500;
   var MAX_NETWORK_HOLD_CYCLES = 2;
+  var MANIFEST_REQUEST_TIMEOUT_MS = 120000;
+  var SEGMENT_REQUEST_TIMEOUT_MS = 20000;
+  var AUX_REQUEST_TIMEOUT_MS = 15000;
+  var STARTUP_STALL_RECOVERY_MS = 8000;
+  var PLAYBACK_STALL_RECOVERY_MS = 14000;
+  var STARTUP_READY_TIMEOUT_MS = 30000;
+  var BUFFERED_SEEK_PADDING = 0.05;
+  var TS_STARTUP_ALIGNMENT_MIN_GAP = 0.1;
 
   function PlayerEngine(videoElement, opts) {
     this.video = videoElement;
@@ -58,17 +66,36 @@
     this._state = 'idle';
     this._fallbackReason = '';
     this._nativeTerminalReason = '';
+    this._terminalError = null;
+    this._terminalErrorGeneration = -1;
+    this._terminalErrorPhase = '';
+    this._terminalErrorCount = 0;
     this._loadStartedAt = 0;
     this._loadGeneration = 0;
+    this._startupTransaction = null;
+    this._startupReadyGeneration = -1;
+    this._startupReadyTimeoutMs = Math.max(250, Number(opts.startupReadyTimeoutMs) || STARTUP_READY_TIMEOUT_MS);
     this._offlinePlayback = false;
     this._manifestFromServiceWorker = false;
     this._lastOfflineError = '';
+    this._internalStallWatch = true;
+    this._stallWatchTimer = 0;
+    this._stallWatchLastTime = -1;
+    this._stallWatchLastProgressAt = 0;
+    this._stallWatchWaiting = false;
+    this._stallWatchReportCount = 0;
+    var configuredStallRecoveryDelay = Number(opts.stallRecoveryDelayMs) || 0;
+    this._stallRecoveryDelayMs = configuredStallRecoveryDelay > 0
+      ? Math.max(100, configuredStallRecoveryDelay)
+      : 0;
     this.recovering = false;
     this.recoveryTransition = false;
     this.networkTrouble = false;
     this._networkingEngine = new NativeNetworkingEngine(this);
     this._player = new PlayerAdapter(this);
-    this._telemetry = new PlayerTelemetry(this);
+    // Production builds split telemetry out of the critical playback bundle.
+    // The source build remains self-contained for debugging and direct use.
+    this._telemetry = new (window.PlayerTelemetry || PlayerTelemetry)(this);
   }
 
   PlayerEngine.prototype.on = function (event, fn) {
@@ -124,11 +151,33 @@
     if (this._initialized) return Promise.resolve();
     this._initialized = true;
     this._telemetry.attach();
+    this._startInternalStallWatch();
     this._listen(this.video, 'timeupdate', function () {
       if (!self.video.seeking && !self.video.paused && isFinite(self.video.currentTime)) {
         self.lastGoodTime = self.video.currentTime;
       }
     });
+    this._listen(this.video, 'waiting', function () {
+      if (self.video.ended || self.destroyed) return;
+      var currentTime = Number(self.video.currentTime) || 0;
+      var waitingStarted = !self._stallWatchWaiting;
+      self._stallWatchWaiting = true;
+      // Some media stacks emit repeated `waiting` events while remaining in
+      // the same stalled state. Only the edge into waiting (or real clock
+      // movement) starts a new watchdog window; repeated events must not keep
+      // postponing recovery forever.
+      if (waitingStarted || self._stallWatchLastTime < 0 || Math.abs(currentTime - self._stallWatchLastTime) >= 0.1) {
+        self._stallWatchLastTime = currentTime;
+        self._stallWatchLastProgressAt = Date.now();
+      }
+    });
+    this._listen(this.video, 'playing', function () {
+      self._stallWatchWaiting = false;
+      self._stallWatchLastTime = Number(self.video.currentTime) || 0;
+      self._stallWatchLastProgressAt = Date.now();
+    });
+    this._listen(this.video, 'pause', function () { self._resetInternalStallWatch(); });
+    this._listen(this.video, 'ended', function () { self._resetInternalStallWatch(); });
     this._listen(this.video, 'error', function () {
       var e = self.video.error;
       if (!e || self.destroyed || self._serverDown || self._recovering) return;
@@ -144,13 +193,66 @@
         }).catch(function () {
           if (self.destroyed) return;
           self._setRecovering(false);
-          self._completeNativeTerminalError(nativeTerminalError(self._provider, 'video-error-' + e.code)).catch(function (terminalErr) {
-            console.error('[player-engine] native terminal failed:', terminalErr);
-          });
+          self._completeNativeTerminalError(
+            nativeTerminalError(self._provider, 'video-error-' + e.code),
+            { phase: 'runtime' }
+          );
         });
       }
     });
     return Promise.resolve();
+  };
+
+  PlayerEngine.prototype._startInternalStallWatch = function () {
+    if (this._stallWatchTimer) return;
+    var self = this;
+    var intervalMs = this._stallRecoveryDelayMs
+      ? Math.max(50, Math.min(1000, this._stallRecoveryDelayMs / 2))
+      : 1000;
+    this._stallWatchTimer = setInterval(function () {
+      if (
+        self.destroyed
+        || self._state === 'error'
+        || self.video.ended
+        || self.video.seeking
+        || self.isRecovering()
+        || (self.video.paused && !self._stallWatchWaiting)
+      ) {
+        if (!self._stallWatchWaiting) self._resetInternalStallWatch();
+        return;
+      }
+      var now = Date.now();
+      var currentTime = Number(self.video.currentTime) || 0;
+      if (self._stallWatchLastTime < 0 || Math.abs(currentTime - self._stallWatchLastTime) >= 0.1) {
+        self._stallWatchLastTime = currentTime;
+        self._stallWatchLastProgressAt = now;
+        return;
+      }
+      var providerStarted = !!(self._provider && self._provider.startupBufferComplete);
+      var threshold = self._stallRecoveryDelayMs
+        || (providerStarted ? PLAYBACK_STALL_RECOVERY_MS : STARTUP_STALL_RECOVERY_MS);
+      if (!self._stallWatchLastProgressAt) self._stallWatchLastProgressAt = now;
+      if (now - self._stallWatchLastProgressAt < threshold) return;
+      self._stallWatchLastProgressAt = now;
+      self._stallWatchReportCount++;
+      self._telemetry.record('stall-watchdog', {
+        startup: !providerStarted,
+        currentTime: currentTime
+      });
+      self.reportStall();
+    }, intervalMs);
+  };
+
+  PlayerEngine.prototype._resetInternalStallWatch = function () {
+    this._stallWatchWaiting = false;
+    this._stallWatchLastTime = -1;
+    this._stallWatchLastProgressAt = 0;
+  };
+
+  PlayerEngine.prototype._stopInternalStallWatch = function () {
+    if (this._stallWatchTimer) clearInterval(this._stallWatchTimer);
+    this._stallWatchTimer = 0;
+    this._resetInternalStallWatch();
   };
 
   PlayerEngine.prototype.getPlayer = function () { return this._player; };
@@ -160,29 +262,156 @@
   PlayerEngine.prototype.setLive = function (live) { this.isLive = live; };
   PlayerEngine.prototype.isRecovering = function () { return this._serverDown || this._recovering; };
 
+  PlayerEngine.prototype._cancelStartupReadiness = function (err) {
+    var transaction = this._startupTransaction;
+    if (!transaction || transaction.settled) return false;
+    transaction.settled = true;
+    transaction.error = err || abortError();
+    if (transaction.timer) clearTimeout(transaction.timer);
+    transaction.timer = 0;
+    var waiters = transaction.waiters.splice(0);
+    for (var i = 0; i < waiters.length; i++) waiters[i].reject(transaction.error);
+    return true;
+  };
+
+  PlayerEngine.prototype._beginStartupReadiness = function (generation) {
+    this._cancelStartupReadiness(abortError());
+    this._startupTransaction = {
+      generation: generation,
+      provider: null,
+      attached: false,
+      settled: false,
+      ready: false,
+      error: null,
+      timer: 0,
+      waiters: []
+    };
+    return this._startupTransaction;
+  };
+
+  PlayerEngine.prototype._markStartupAttached = function (provider, generation) {
+    generation = generation == null ? this._loadGeneration : generation;
+    var transaction = this._startupTransaction;
+    if (
+      !transaction
+      || transaction.settled
+      || transaction.generation !== generation
+      || generation !== this._loadGeneration
+      || this.destroyed
+      || (provider && this._provider !== provider)
+    ) return false;
+    if (transaction.provider && transaction.provider !== provider) return false;
+    transaction.provider = provider || this._provider;
+    transaction.attached = true;
+    if (transaction.provider) transaction.provider.loadGeneration = generation;
+    if (this._state === 'loading') this._setState('buffering');
+    if (!transaction.timer) {
+      var self = this;
+      transaction.timer = setTimeout(function () {
+        if (self._startupTransaction !== transaction || transaction.settled) return;
+        var err = nativeTerminalError(transaction.provider, 'startup-buffer-timeout');
+        err.name = 'TimeoutError';
+        self._telemetry.record('startup-buffer-timeout', { loadGeneration: generation });
+        self._setRecovering(true);
+        self._rejectStartupReadiness(transaction, err);
+      }, this._startupReadyTimeoutMs);
+    }
+    return true;
+  };
+
+  PlayerEngine.prototype._rejectStartupReadiness = function (transaction, err) {
+    if (!transaction || transaction !== this._startupTransaction || transaction.settled) return false;
+    transaction.settled = true;
+    transaction.error = err || nativeTerminalError(transaction.provider, 'startup-buffer-failed');
+    if (transaction.timer) clearTimeout(transaction.timer);
+    transaction.timer = 0;
+    var waiters = transaction.waiters.splice(0);
+    for (var i = 0; i < waiters.length; i++) waiters[i].reject(transaction.error);
+    return true;
+  };
+
+  PlayerEngine.prototype._markStartupReady = function (provider, generation) {
+    generation = generation == null ? this._loadGeneration : generation;
+    var transaction = this._startupTransaction;
+    if (
+      !transaction
+      || transaction.settled
+      || transaction.generation !== generation
+      || generation !== this._loadGeneration
+      || this.destroyed
+      || (provider && this._provider !== provider)
+    ) return false;
+    if (!transaction.attached && !this._markStartupAttached(provider, generation)) return false;
+    if (transaction.provider && provider && transaction.provider !== provider) return false;
+    transaction.settled = true;
+    transaction.ready = true;
+    if (transaction.timer) clearTimeout(transaction.timer);
+    transaction.timer = 0;
+    this._startupReadyGeneration = generation;
+    this._recovering = false;
+    var seekInProgress = !!(provider && (provider.seekBufferPending || provider.seekInteractionPending));
+    if (!this._serverDown && !seekInProgress) this._setState('ready');
+    var detail = { loadGeneration: generation, provider: this._providerName || '' };
+    this.emit('startup-ready', detail);
+    if (this._player) this._player.emit('startupready', detail);
+    var waiters = transaction.waiters.splice(0);
+    for (var i = 0; i < waiters.length; i++) waiters[i].resolve(detail);
+    return true;
+  };
+
+  PlayerEngine.prototype.waitForStartupReady = function (generation) {
+    generation = generation == null ? this._loadGeneration : generation;
+    var transaction = this._startupTransaction;
+    if (generation !== this._loadGeneration || this.destroyed) return Promise.reject(abortError());
+    if (this._startupReadyGeneration === generation) {
+      return Promise.resolve({ loadGeneration: generation, provider: this._providerName || '' });
+    }
+    if (!transaction || transaction.generation !== generation) {
+      return Promise.reject(abortError());
+    }
+    if (transaction.ready) return Promise.resolve({ loadGeneration: generation, provider: this._providerName || '' });
+    if (transaction.error) return Promise.reject(transaction.error);
+    return new Promise(function (resolve, reject) {
+      transaction.waiters.push({ resolve: resolve, reject: reject });
+    });
+  };
+
   PlayerEngine.prototype.load = function (url, startTime, mimeType) {
     var self = this;
     if (this.destroyed) return Promise.reject(new Error('player-destroyed'));
     var generation = ++this._loadGeneration;
+    this._beginStartupReadiness(generation);
+    this._resetInternalStallWatch();
     url = url || this.manifestUrl;
     this._pendingLoadStartTime = isFinite(Number(startTime)) && Number(startTime) >= 0 ? Number(startTime) : null;
     this.setLive(false);
     this._loadStartedAt = performance.now();
     this._nativeTerminalReason = '';
+    this._terminalError = null;
+    this._terminalErrorGeneration = -1;
+    this._terminalErrorPhase = '';
     this._telemetry.record('load-start');
     this._setState('loading');
     return Promise.resolve().then(function () {
       return self._loadNative(url, mimeType, generation);
     }).then(function () {
       if (generation !== self._loadGeneration) throw abortError();
+      if (self._terminalError && self._terminalErrorGeneration === generation) throw self._terminalError;
       return seekToStartTime(self, startTime);
+    }).then(function (value) {
+      if (generation !== self._loadGeneration) throw abortError();
+      // Test and extension providers opt into the readiness contract
+      // explicitly; all built-in providers do so below.
+      if (!self._provider || !self._provider._usesStartupReadiness) return value;
+      return self.waitForStartupReady(generation).then(function () { return value; });
     }).catch(function (err) {
       if (generation !== self._loadGeneration || err && err.name === 'AbortError') throw abortError();
       if (err && err.serverError) throw err;
-      if (self._shouldKeepNativeOffline(err)) throw err;
-      if (isNativeTerminalError(err)) return self._completeNativeTerminalError(err);
-      if (isNativeLoadTerminalError(err)) return self._completeNativeTerminalError(nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed'));
-      return self._completeNativeTerminalError(nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed'));
+      self._recordOfflineLoadFailure(err);
+      var terminalError = isNativeTerminalError(err)
+        ? err
+        : nativeTerminalError(self._provider, err && err.message ? err.message : 'native-load-failed');
+      throw self._completeNativeTerminalError(terminalError, { phase: 'load', generation: generation });
     }).then(function (value) {
       if (generation === self._loadGeneration) self._pendingLoadStartTime = null;
       return value;
@@ -280,9 +509,26 @@
     });
   };
 
-  PlayerEngine.prototype._completeNativeTerminalError = function (err) {
+  PlayerEngine.prototype._completeNativeTerminalError = function (err, options) {
+    options = options || {};
+    var generation = options.generation == null ? this._loadGeneration : options.generation;
+    if (generation !== this._loadGeneration) return abortError();
+    if (this._terminalError && this._terminalErrorGeneration === generation) return this._terminalError;
     var reason = err && err.message ? err.message : 'native-unsupported';
+    if (!isNativeTerminalError(err)) err = nativeTerminalError(this._provider, reason);
+    var phase = options.phase || (this._state === 'loading' ? 'load' : 'runtime');
+    err.nativeTerminal = true;
+    err.phase = phase;
+    err.loadGeneration = generation;
+    err.provider = this._providerName || 'native-terminal';
     this._nativeTerminalReason = reason;
+    this._terminalError = err;
+    this._terminalErrorGeneration = generation;
+    this._terminalErrorPhase = phase;
+    this._terminalErrorCount++;
+    if (this._startupTransaction && this._startupTransaction.generation === generation) {
+      this._rejectStartupReadiness(this._startupTransaction, err);
+    }
     if (this._provider) {
       this._provider.lastError = reason;
       this._provider.fatalError = reason;
@@ -291,13 +537,32 @@
       this._providerName = this._providerName || 'native-terminal';
       window._playerProvider = this._providerName;
     }
+    if (this._provider && this._provider.quiesce) {
+      try { this._provider.quiesce('terminal-' + phase); } catch (quiesceError) {
+        console.warn('[player-engine] provider terminal quiesce failed:', quiesceError);
+      }
+    }
+    this._recovering = false;
+    this._serverDown = false;
+    this._stopServerProbe();
+    this._clearHeldRequests('player-terminal');
+    try { if (!this.video.paused) this.video.pause(); } catch (pauseError) {}
     this._setState('error');
     this._telemetry.record('native-unsupported', {
       lastError: reason,
       hlsEncryptionMethod: err && err.hlsEncryptionMethod ? err.hlsEncryptionMethod : '',
       hlsKeyFormat: err && err.hlsKeyFormat ? err.hlsKeyFormat : ''
     });
-    return Promise.resolve();
+    var detail = {
+      error: err,
+      reason: reason,
+      phase: phase,
+      loadGeneration: generation,
+      provider: err.provider
+    };
+    this.emit('terminal-error', detail);
+    if (this._player) this._player.emit('error', detail);
+    return err;
   };
 
   PlayerEngine.prototype._recordManifestSource = function (manifest) {
@@ -318,26 +583,29 @@
     this._lastOfflineError = err && err.message ? err.message : 'offline-native-playback-error';
   };
 
-  PlayerEngine.prototype._shouldKeepNativeOffline = function (err) {
+  PlayerEngine.prototype._recordOfflineLoadFailure = function (err) {
     if (this._offlinePlayback || this._manifestFromServiceWorker || !isOnline()) {
       this._recordOfflineError(err);
-      return true;
     }
-    return false;
   };
 
   PlayerEngine.prototype._setState = function (state) {
     if (this._state === state) return;
+    var previousState = this._state;
     this._state = state;
     this.recovering = state === 'recovering';
     this.recoveryTransition = state === 'recovering' || state === 'seeking';
     this.networkTrouble = this._serverDown;
     console.debug('[player-engine] state=' + state + ' provider=' + (this._providerName || 'none'));
+    var detail = { state: state, previousState: previousState, loadGeneration: this._loadGeneration };
+    this.emit('state-change', detail);
+    if (this._player) this._player.emit('statechanged', detail);
   };
 
   PlayerEngine.prototype._setRecovering = function (recovering) {
     this._recovering = recovering;
-    this._setState(recovering ? 'recovering' : 'ready');
+    var startupPending = !!(this._startupTransaction && !this._startupTransaction.settled);
+    this._setState(recovering ? 'recovering' : (startupPending ? 'buffering' : 'ready'));
   };
 
   PlayerEngine.prototype.seekDuringRecovery = function (targetTime) {
@@ -496,7 +764,9 @@
 
   PlayerEngine.prototype.unload = function () {
     this._loadGeneration++;
+    this._cancelStartupReadiness(abortError());
     this._pendingLoadStartTime = null;
+    this._resetInternalStallWatch();
     this._stopServerProbe();
     this._clearHeldRequests('player-unloaded');
     this._serverDown = false;
@@ -506,6 +776,10 @@
     this.networkTrouble = false;
     this._networkHoldStartedAt = 0;
     this._fallbackReason = '';
+    this._nativeTerminalReason = '';
+    this._terminalError = null;
+    this._terminalErrorGeneration = -1;
+    this._terminalErrorPhase = '';
     this._destroyProvider();
     this._providerName = '';
     window._playerProvider = '';
@@ -521,7 +795,9 @@
   PlayerEngine.prototype.destroy = function () {
     if (this.destroyed) return;
     this._loadGeneration++;
+    this._cancelStartupReadiness(abortError());
     this._pendingLoadStartTime = null;
+    this._stopInternalStallWatch();
     this._telemetry.record('unload-summary');
     this._telemetry.flush();
     this.destroyed = true;
@@ -695,6 +971,7 @@
       mediaFetchRetryCount: stats.mediaFetchRetryCount || 0,
       mediaUrlRefreshCount: stats.mediaUrlRefreshCount || 0,
       networkHoldCount: stats.networkHoldCount || 0,
+      networkTimeoutCount: stats.networkTimeoutCount || 0,
       networkResumeCount: stats.networkResumeCount || 0,
       networkHoldMs: stats.networkHoldMs || 0,
       networkHoldReason: stats.networkHoldReason || "",
@@ -718,18 +995,44 @@
       ts: Date.now()
     };
     if (extra) merge(event, extra);
-    this.events.push(event);
+    // Scheduler and media completion events can fire for every segment. Keep
+    // the newest cumulative snapshot for these event types instead of sending
+    // a request-sized telemetry stream back to the application server.
+    var coalesced = type === 'media-fetch-complete'
+      || type === 'scheduler-drain'
+      || type === 'scheduler-backpressure';
+    var replaced = false;
+    if (coalesced) {
+      for (var eventIndex = this.events.length - 1; eventIndex >= 0; eventIndex--) {
+        if (this.events[eventIndex].type === type) {
+          this.events[eventIndex] = event;
+          replaced = true;
+          break;
+        }
+      }
+    }
+    if (!replaced) this.events.push(event);
     if (this.events.length > 30) this.events.splice(0, this.events.length - 30);
-    this.scheduleFlush();
+    this.scheduleFlush(
+      type === 'fatal-error'
+      || type === 'video-error'
+      || type === 'native-unsupported'
+      || type === 'server-down'
+      || type === 'recovery'
+      || type === 'first-frame'
+    );
   };
 
-  PlayerTelemetry.prototype.scheduleFlush = function () {
+  PlayerTelemetry.prototype.scheduleFlush = function (urgent) {
     var self = this;
-    if (this.flushTimer) return;
+    if (this.flushTimer) {
+      if (!urgent) return;
+      clearTimeout(this.flushTimer);
+    }
     this.flushTimer = setTimeout(function () {
       self.flushTimer = 0;
       self.flush();
-    }, 500);
+    }, urgent ? 250 : 2000);
   };
 
   PlayerTelemetry.prototype.flush = function () {
@@ -743,7 +1046,10 @@
     try {
       if (navigator.sendBeacon) {
         var blob = new Blob([payload], { type: 'application/json' });
-        if (navigator.sendBeacon('/api/player-events', blob)) return;
+        if (navigator.sendBeacon('/api/player-events', blob)) {
+          if (this.events.length) this.scheduleFlush(false);
+          return;
+        }
       }
     } catch (e) {}
     try {
@@ -754,6 +1060,7 @@
         keepalive: true
       }).catch(function () {});
     } catch (e) {}
+    if (this.events.length) this.scheduleFlush(false);
   };
 
   PlayerTelemetry.prototype.destroy = function () {
@@ -1133,7 +1440,8 @@
       networkHeldRequestCount: 0,
       networkResumeCount: 0,
       networkHoldReason: "",
-      networkHoldMs: 0
+      networkHoldMs: 0,
+      networkTimeoutCount: 0
     };
     this.RequestType = NativeNetworkingEngine.RequestType;
   }
@@ -1191,12 +1499,14 @@
       method: request.method || "GET",
       headers: request.headers || {}
     };
-    if (opts.signal) init.signal = opts.signal;
+    var timedSignal = createTimedRequestSignal(opts.signal, networkTimeoutFor(type, opts));
+    init.signal = timedSignal.signal;
     if (request.body != null) init.body = request.body;
     return fetch(fetchUri, init).then(function (resp) {
       var responseStarted = performance.now();
       return resp.arrayBuffer().then(function (data) {
         var completed = performance.now();
+        timedSignal.cleanup();
         var elapsed = Math.max(0, completed - started);
         var response = {
           uri: resp.url || fetchUri,
@@ -1216,7 +1526,16 @@
           return response;
         });
       });
-    }).catch(function (err) {
+    }).then(function (response) {
+      timedSignal.cleanup();
+      return response;
+    }, function (err) {
+      var timedOut = timedSignal.timedOut();
+      timedSignal.cleanup();
+      if (timedOut) {
+        self.stats.networkTimeoutCount++;
+        err = networkTimeoutError();
+      }
       if (err && err.name === "AbortError") throw err;
       if (shouldHoldNetworkError(self.engine, type, err, opts)) {
         return self._holdAndRetry(type, request, opts, started, "network-error", 0);
@@ -1280,6 +1599,7 @@
     this.mode = mode || (url.indexOf('.m3u8') !== -1 ? 'hls' : 'progressive');
     this.name = 'native-url';
     this.isAdaptive = false;
+    this._usesStartupReadiness = true;
     this.retryCount = 0;
     this.recoveryCount = 0;
     this.rebufferCount = 0;
@@ -1289,6 +1609,13 @@
     this.fatalError = '';
     this.nativeUnsupportedReason = '';
     this.assetUri = '';
+    this.startupBufferComplete = false;
+    this.startupBufferStartedAt = 0;
+    this.startupBufferMs = 0;
+    this.destroyed = false;
+    this._terminalQuiesced = false;
+    this._loadCleanup = null;
+    this._rejectLoad = null;
   }
 
   NativeUrlProvider.prototype.load = function () {
@@ -1301,17 +1628,37 @@
       function cleanup() {
         self.video.removeEventListener('loadedmetadata', onLoaded);
         self.video.removeEventListener('error', onError);
+        if (self._loadCleanup === cleanup) self._loadCleanup = null;
+        self._rejectLoad = null;
       }
       function onLoaded() {
+        if (self.destroyed) {
+          cleanup();
+          reject(abortError());
+          return;
+        }
         cleanup();
         self.video.addEventListener('waiting', self._boundWaiting = function () { self._onWaiting(); });
         self.video.addEventListener('playing', self._boundPlaying = function () { self._onPlaying(); });
         self.video.addEventListener('error', self._boundRuntimeError = function () { self._onRuntimeError(); });
-        self.engine._setState('ready');
+        var initialTarget = pendingLoadStartTime(self);
+        if (initialTarget != null) assignInternalMediaTime(self, initialTarget);
+        self.startupBufferStartedAt = performance.now();
+        self._boundStartupReady = function () { self._checkStartupReady(); };
+        self.video.addEventListener('loadeddata', self._boundStartupReady);
+        self.video.addEventListener('canplay', self._boundStartupReady);
+        self.video.addEventListener('playing', self._boundStartupReady);
+        if (self.engine && self.engine._markStartupAttached) self.engine._markStartupAttached(self);
         self.engine._player.emit('loaded');
         resolve();
+        self._checkStartupReady();
       }
       function onError() {
+        if (self.destroyed) {
+          cleanup();
+          reject(abortError());
+          return;
+        }
         if (self.retryCount < 1) {
           self.retryCount++;
           self.recoveryCount++;
@@ -1331,15 +1678,47 @@
         self.fatalError = 'native-url-error';
         reject(nativeTerminalError(self, 'native-url-error'));
       }
+      self._loadCleanup = cleanup;
+      self._rejectLoad = reject;
       self.video.addEventListener('loadedmetadata', onLoaded);
       self.video.addEventListener('error', onError);
     });
   };
 
-  NativeUrlProvider.prototype.destroy = function () {
+  NativeUrlProvider.prototype._checkStartupReady = function () {
+    if (this.destroyed || this.startupBufferComplete) return false;
+    if (!this.video || this.video.readyState < 2) return false;
+    var ready = markStartupBufferReady(this);
+    if (this.startupBufferComplete) this._clearStartupReadyListeners();
+    return ready;
+  };
+
+  NativeUrlProvider.prototype._clearStartupReadyListeners = function () {
+    if (!this._boundStartupReady) return;
+    this.video.removeEventListener('loadeddata', this._boundStartupReady);
+    this.video.removeEventListener('canplay', this._boundStartupReady);
+    this.video.removeEventListener('playing', this._boundStartupReady);
+    this._boundStartupReady = null;
+  };
+
+  NativeUrlProvider.prototype.quiesce = function () {
+    if (this._terminalQuiesced) return false;
+    this._terminalQuiesced = true;
+    this.destroyed = true;
+    var rejectLoad = this._rejectLoad;
+    if (this._loadCleanup) this._loadCleanup();
+    if (rejectLoad) {
+      try { rejectLoad(abortError()); } catch (e) {}
+    }
     if (this._boundWaiting) this.video.removeEventListener('waiting', this._boundWaiting);
     if (this._boundPlaying) this.video.removeEventListener('playing', this._boundPlaying);
     if (this._boundRuntimeError) this.video.removeEventListener('error', this._boundRuntimeError);
+    this._clearStartupReadyListeners();
+    return true;
+  };
+
+  NativeUrlProvider.prototype.destroy = function () {
+    this.quiesce('destroy');
     this.video.removeAttribute('src');
     this.video.load();
   };
@@ -1389,6 +1768,8 @@
       totalFrames: quality ? quality.totalVideoFrames : 0,
       rebufferCount: this.rebufferCount,
       rebufferDuration: this.rebufferDuration + (this.rebufferStartedAt ? (performance.now() - this.rebufferStartedAt) / 1000 : 0),
+      startupBufferComplete: this.startupBufferComplete,
+      startupBufferMs: this.startupBufferMs,
       recoveryCount: this.recoveryCount,
       quotaRecoveries: this.quotaRecoveries,
       lastError: this.lastError,
@@ -1409,6 +1790,7 @@
   };
 
   NativeUrlProvider.prototype._onWaiting = function () {
+    if (this.destroyed) return;
     if (this.rebufferStartedAt || this.video.paused || this.video.seeking) return;
     this.rebufferStartedAt = performance.now();
     this.rebufferCount++;
@@ -1417,6 +1799,7 @@
   };
 
   NativeUrlProvider.prototype._onPlaying = function () {
+    if (this.destroyed) return;
     if (!this.rebufferStartedAt) return;
     this.rebufferDuration += (performance.now() - this.rebufferStartedAt) / 1000;
     this.rebufferStartedAt = 0;
@@ -1424,6 +1807,7 @@
   };
 
   NativeUrlProvider.prototype._onRuntimeError = function () {
+    if (this.destroyed) return;
     var mediaError = this.video.error;
     if (mediaError && mediaError.code === 2 && isOnline() && this.engine && !this.engine._serverDown) {
       this.lastError = 'native-url-network-error';
@@ -1450,7 +1834,7 @@
   };
 
   NativeUrlProvider.prototype.resumeAfterServerRecovery = function () {
-    if (!this.engine || this.engine.destroyed) return;
+    if (this.destroyed || !this.engine || this.engine.destroyed) return;
     var position = this.engine.lastGoodTime || this.video.currentTime || 0;
     var wasLive = this.isLive();
     var shouldResume = !this.video.paused;
@@ -1474,6 +1858,7 @@
     this.playlistUrl = playlistUrl;
     this.name = 'native-hls';
     this.isAdaptive = true;
+    this._usesStartupReadiness = true;
     this.mediaSource = null;
     this.objectUrl = '';
     this.sb = null;
@@ -1492,6 +1877,7 @@
     this.activeRanges = {};
     this.controllers = [];
     this.destroyed = false;
+    this._terminalQuiesced = false;
     this.bandwidth = engine._player.config.abr.defaultBandwidthEstimate || DEFAULT_BANDWIDTH_ESTIMATE;
     this.bandwidthSamples = 0;
     this.lastBandwidthSample = 0;
@@ -1507,6 +1893,12 @@
     this.lastSwitchAt = 0;
     this.variantSwitchInFlight = false;
     this.pendingManualVariantSwitch = null;
+    this.pendingAudioTrackSwitch = null;
+    this.trackTransitionGeneration = 0;
+    this.trackTransitionInFlight = null;
+    this.trackTransitionCommitCount = 0;
+    this.trackTransitionRollbackCount = 0;
+    this.trackTransitionRollbackFailureCount = 0;
     this.lastFrameSampleAt = 0;
     this.lastDroppedFrames = 0;
     this.lastTotalFrames = 0;
@@ -1522,6 +1914,8 @@
     this.stallRecoveryStage = 0;
     this.gapJumpCount = 0;
     this.lastGapSize = 0;
+    this.manifestGapJumpCount = 0;
+    this.lastManifestGapSize = 0;
     this.blacklisted = {};
     this.capabilityProbeCount = 0;
     this.unsupportedCapabilityCount = 0;
@@ -1548,31 +1942,129 @@
     this.schedulerDrainCount = 0;
     this.schedulerBackpressureCount = 0;
     this.sourceBufferAbortCount = 0;
+    this.hlsSegmentLedgerReconcileCount = 0;
+    this.hlsSegmentLedgerInvalidationCount = 0;
     this.startupBufferComplete = false;
     this.startupBufferStartedAt = 0;
     this.startupBufferMs = 0;
     this.seekBufferPending = false;
+    this.seekInteractionPending = false;
     this.seekBufferReadyCount = 0;
     this.bufferedSeekCount = 0;
     this.seekCount = 0;
     this.seekCancelCount = 0;
     this.seekAbortCount = 0;
+    this.seekGeneration = 0;
+    this.activeSeekGeneration = 0;
+    this.completedSeekGeneration = 0;
     this.lastSeekTarget = 0;
     this.lastSeekStartedAt = 0;
     this.lastSeekMs = 0;
     this._lastSeekHandledTarget = null;
     this._lastSeekHandledAt = 0;
+    this._lastSeekHandledGeneration = 0;
     this.lastSwitchReason = 'startup';
     this.liveWindow = null;
     this.liveLatency = 0;
     this.atLiveEdge = false;
     this.startupLiveTarget = null;
     this.liveWindowDriftRecoveryCount = 0;
+    this.videoDuration = 0;
+    this.videoEndList = false;
+    this.audioEndList = null;
+    this.liveToVodTransitionCount = 0;
     this.vodEndOfStreamCount = 0;
+    this.vodEndOfStreamPending = false;
+    this.vodEndOfStreamRetryCount = 0;
+    this.vodEndOfStreamRefillPending = false;
+    this.vodEndOfStreamReopenCount = 0;
+    this.vodFinalDuration = 0;
+    this._vodEndOfStreamRetryAttempt = 0;
+    this._vodEndOfStreamScheduled = false;
+    this._vodEndOfStreamRetryTimer = 0;
     this.mediaSequence = 0;
     this.discontinuitySequence = 0;
     this.discontinuityCount = 0;
     this.playlistRefreshFailed = false;
+    this.staleManifestResponseCount = 0;
+    this.playlistCursorByUrl = {};
+    this.playlistResetCandidateByUrl = {};
+    this.playlistEpochByUrl = {};
+    this.playlistEpochResetCount = 0;
+    this.lastPlaylistEpochResetTrack = '';
+    this.lastPlaylistEpochResetOffset = 0;
+    this.playlistEpochHoldCount = 0;
+    this.lastPlaylistEpochHoldReason = '';
+    this.hlsInitTimescaleByKey = {};
+    this.hlsInitTrackInfoByKey = {};
+    this.hlsInitTimescaleParseFailureCount = 0;
+    this.hlsFragmentTimestampParseCount = 0;
+    this.hlsFragmentTimestampFallbackCount = 0;
+    this.hlsTimestampResolutionRetryCount = 0;
+    this.hlsTimestampResolutionFailureCount = 0;
+    this.lastHlsFragmentDecodeTime = 0;
+    this.lastHlsFragmentTimestampOffset = 0;
+    this.hlsTimestampGenerationByKey = {};
+    this.hlsTimestampGenerationResolutionCount = 0;
+    this.hlsDiscontinuityTimestampResolutionCount = 0;
+    this.hlsDiscontinuityTimestampFallbackCount = 0;
+    this.hlsInitMapSwitchCount = 0;
+    this.hlsInitGenerationRefreshCount = 0;
+    this.hlsContainerDetectionCount = 0;
+    this.hlsContainerMismatchCount = 0;
+    this.hlsTransmuxedTimestampResolutionCount = 0;
+    this.hlsTimestampGenerationPruneCount = 0;
+    this.hlsTsTimelineByGeneration = {};
+    this.hlsTsSharedDemuxCount = 0;
+    this.hlsTsTimestampRolloverCount = 0;
+    this.hlsTsOutOfOrderSegmentCount = 0;
+    this.hlsTsCompositionOffsetSampleCount = 0;
+    this.hlsTsMaxCompositionOffsetMs = 0;
+    this.hlsTsMuxedAvStartOffsetMs = 0;
+    this.hlsTsInitAppendCount = 0;
+    this.hlsTsInitSkipCount = 0;
+    this.hlsTsMuxedQuotaRetryCount = 0;
+    this.hlsTsMuxedQuotaAudioResumeCount = 0;
+    this.hlsTsMuxedQuotaVideoResumeCount = 0;
+    this.hlsAppendEpoch = 0;
+    this.hlsAppendInvalidationCount = 0;
+    this.hlsStaleAppendAbortCount = 0;
+    this.hlsStaleRecoveryAbortCount = 0;
+    this.lastHlsAppendInvalidationReason = '';
+    this.hlsQuotaForwardEvictionCount = 0;
+    this.hlsQuotaDownswitchCount = 0;
+    this.hlsMuxedWatchdogCompletionCount = 0;
+    this.hlsMuxedAppendLedger = {};
+    this.hlsMuxedPartialCarryCount = 0;
+    this.hlsMuxedLedgerResumeCount = 0;
+    this.hlsMuxedLedgerCompletionCount = 0;
+    this.encryptedInitSegmentCount = 0;
+    this.lastHlsTimestampGenerationKey = '';
+    this.playlistRefreshGeneration = 0;
+    this.playlistManifestCommitGeneration = 0;
+    this.playlistManifestStageCount = 0;
+    this.playlistManifestCommitCount = 0;
+    this.playlistManifestDiscardCount = 0;
+    this.playlistManifestCommitInProgress = false;
+    this.playlistRefreshPromise = null;
+    this.playlistRefreshKey = '';
+    this.playlistRefreshReasonInFlight = '';
+    this.trackLifecyclePromise = null;
+    this._sourceBufferVideoInitSegment = null;
+    this._sourceBufferAudioInitSegment = null;
+    this._appendedVideoInitGenerationKey = '';
+    this._appendedAudioInitGenerationKey = '';
+    this.videoSourceBufferMime = '';
+    this.audioSourceBufferMime = '';
+    this.trackActivationCount = 0;
+    this.trackSuppressionCount = 0;
+    this.sourceBufferTypeChangeCount = 0;
+    this.sourceBufferTypeRebuildCount = 0;
+    this.sourceBufferTypeRollbackCount = 0;
+    this.suppressedAudioGapTrack = false;
+    this.suppressedVideoGapTrack = false;
+    this.suppressedGapTrackCount = 0;
+    this.lastManifestGapTrack = '';
     this.manifestCompatibilityWarnings = [];
     this.tsTransmuxer = null;
     this.tsVideoTransmuxer = null;
@@ -1720,14 +2212,34 @@
     });
   };
 
-  NativeHlsProvider.prototype._loadMediaPlaylist = function (text, url) {
-    var parsed = parseHlsPlaylist(text, url);
+  NativeHlsProvider.prototype._loadMediaPlaylist = function (text, url, expectedVariant, preparedPlaylist) {
+    var previousCursor = hlsDeliveryCursor(this);
+    var previousSignature = hlsTrackSignature(this);
+    var parsed = preparedPlaylist || parseHlsPlaylist(text, url);
     if (parsed.unsupportedEncryption) throw hlsUnsupportedEncryptionError(this, parsed);
-    var isTs = hasMpegTsSegments(parsed.segments);
+    var isTs = hasMpegTsSegments(parsed.segments) || !parsed.map;
     if (!parsed.map && !isTs) throw new Error('hls-playlist-unsupported');
     if (!parsed.segments.length) throw new Error('hls-playlist-unsupported');
-    reconcileHlsPreloadHints(this, this, parsed);
-    this.segments = mergeSegmentState(this.segments, parsed.segments) || parsed.segments;
+    if (expectedVariant && expectedVariant !== this.activeVariant) {
+      this.staleManifestResponseCount = (this.staleManifestResponseCount || 0) + 1;
+      return hlsTrackRefreshOutcome('video', false, true, false, false);
+    }
+    if (this.videoEndList && !parsed.endList) {
+      this.staleManifestResponseCount = (this.staleManifestResponseCount || 0) + 1;
+      return hlsTrackRefreshOutcome('video', false, true, false, false);
+    }
+    if (!acceptHlsPlaylistCursor(this, url, parsed, 'video')) {
+      this.staleManifestResponseCount = (this.staleManifestResponseCount || 0) + 1;
+      return hlsTrackRefreshOutcome('video', false, true, false, false);
+    }
+    applyHlsPlaylistEpoch(this, url, parsed, this.segments, 'video');
+    assignHlsTimestampGenerations(this, url, parsed, 'video');
+    if (parsed._hlsEpochReset) clearHlsPreloadHintEpochState(this);
+    else reconcileHlsPreloadHints(this, this, parsed);
+    this.segments = parsed._hlsEpochReset
+      ? parsed.segments
+      : (mergeSegmentState(this.segments, parsed.segments) || parsed.segments);
+    pruneHlsTimestampGenerations(this);
     this.initSegment = parsed.map;
     this.isTsPlaylist = isTs;
     this.lowLatencyPlaylist = !!parsed.lowLatencyPlaylist;
@@ -1740,8 +2252,9 @@
     this.renditionReportCount = parsed.renditionReports ? parsed.renditionReports.length : 0;
     this.skippedSegmentCount = parsed.skippedSegmentCount || 0;
     this.manifestCompatibilityWarnings = mergeUnique(this.manifestCompatibilityWarnings, parsed.warnings || []);
-    this.duration = parsed.duration;
-    this.live = !parsed.endList;
+    this.videoDuration = parsed.duration || 0;
+    this.videoEndList = this.videoEndList || !!parsed.endList;
+    this._syncPresentationState();
     this.manifestStartTime = manifestStartTimeFor(parsed.start, this.liveWindow || (parsed.segments.length ? { start: parsed.segments[0].start, end: parsed.segments[parsed.segments.length - 1].end } : null), parsed.duration);
     this.mediaSequence = parsed.mediaSequence || 0;
     this.discontinuitySequence = parsed.discontinuitySequence || 0;
@@ -1773,18 +2286,59 @@
         this.muxedTsAudio
           ? this._ensureTsTransmuxer('audio', this.activeVariant.audioCodecs || audioCodecsOnly(rawCodecs) || 'mp4a.40.2')
           : Promise.resolve()
-      ]).then(function () {});
+      ]).then(function () {
+        var outcome = hlsTrackRefreshOutcome(
+          'video',
+          true,
+          false,
+          !!parsed._hlsEpochReset || hlsCursorAdvanced(previousCursor, hlsDeliveryCursor(this)),
+          previousSignature !== hlsTrackSignature(this)
+        );
+        outcome.epochReset = !!parsed._hlsEpochReset;
+        outcome.playlistEpoch = parsed._hlsPlaylistEpoch || 0;
+        return outcome;
+      }.bind(this));
     }
+    var outcome = hlsTrackRefreshOutcome(
+      'video',
+      true,
+      false,
+      !!parsed._hlsEpochReset || hlsCursorAdvanced(previousCursor, hlsDeliveryCursor(this)),
+      previousSignature !== hlsTrackSignature(this)
+    );
+    outcome.epochReset = !!parsed._hlsEpochReset;
+    outcome.playlistEpoch = parsed._hlsPlaylistEpoch || 0;
+    return outcome;
   };
 
-  NativeHlsProvider.prototype._loadAudioPlaylist = function (text, url) {
-    var parsed = parseHlsPlaylist(text, url);
+  NativeHlsProvider.prototype._loadAudioPlaylist = function (text, url, expectedAudio, preparedPlaylist) {
+    var previousCursor = hlsDeliveryCursor(this.activeAudio);
+    var previousSignature = hlsTrackSignature(this.activeAudio);
+    var parsed = preparedPlaylist || parseHlsPlaylist(text, url);
     if (parsed.unsupportedEncryption) throw hlsUnsupportedEncryptionError(this, parsed);
-    var isTs = hasMpegTsSegments(parsed.segments);
+    var isTs = hasMpegTsSegments(parsed.segments) || !parsed.map;
     if ((!parsed.map && !isTs) || !parsed.segments.length) throw new Error(isTs ? 'hls-mpegts-unsupported' : 'hls-audio-playlist-unsupported');
     if (!this.activeAudio) throw new Error('hls-audio-unavailable');
-    reconcileHlsPreloadHints(this, this.activeAudio, parsed);
-    this.activeAudio.segments = mergeSegmentState(this.activeAudio.segments, parsed.segments) || parsed.segments;
+    if (expectedAudio && expectedAudio !== this.activeAudio) {
+      this.staleManifestResponseCount = (this.staleManifestResponseCount || 0) + 1;
+      return hlsTrackRefreshOutcome('audio', false, true, false, false);
+    }
+    if (this.activeAudio.endList === true && !parsed.endList) {
+      this.staleManifestResponseCount = (this.staleManifestResponseCount || 0) + 1;
+      return hlsTrackRefreshOutcome('audio', false, true, false, false);
+    }
+    if (!acceptHlsPlaylistCursor(this, url, parsed, 'audio')) {
+      this.staleManifestResponseCount = (this.staleManifestResponseCount || 0) + 1;
+      return hlsTrackRefreshOutcome('audio', false, true, false, false);
+    }
+    applyHlsPlaylistEpoch(this, url, parsed, this.activeAudio.segments, 'audio');
+    assignHlsTimestampGenerations(this, url, parsed, 'audio');
+    if (parsed._hlsEpochReset) clearHlsPreloadHintEpochState(this);
+    else reconcileHlsPreloadHints(this, this.activeAudio, parsed);
+    this.activeAudio.segments = parsed._hlsEpochReset
+      ? parsed.segments
+      : (mergeSegmentState(this.activeAudio.segments, parsed.segments) || parsed.segments);
+    pruneHlsTimestampGenerations(this);
     this.activeAudio.initSegment = parsed.map;
     this.activeAudio.isTsPlaylist = isTs;
     this.activeAudio.lowLatencyPlaylist = !!parsed.lowLatencyPlaylist;
@@ -1801,13 +2355,37 @@
     this.activeAudio.mediaSequence = parsed.mediaSequence || 0;
     this.activeAudio.discontinuitySequence = parsed.discontinuitySequence || 0;
     this.activeAudio.discontinuityCount = parsed.discontinuityCount || 0;
+    this.activeAudio.duration = parsed.duration || 0;
+    this.activeAudio.endList = this.activeAudio.endList === true || !!parsed.endList;
+    this.audioEndList = this.activeAudio.endList;
     this.activeAudio.playlistUrl = url;
     this.audioSegments = this.activeAudio.segments;
     this.audioInitSegment = this.activeAudio.initSegment;
     var codecs = this.activeAudio.codecs || audioCodecsOnly((this.activeVariant && this.activeVariant.codecs) || '') || 'mp4a.40.2';
     this.audioMimeType = 'audio/mp4; codecs="' + codecs + '"';
     if (!MediaSource.isTypeSupported(this.audioMimeType)) throw new Error('hls-audio-codec-unsupported');
-    if (isTs) return this._ensureTsTransmuxer('audio', codecs);
+    this._syncPresentationState();
+    var outcome = hlsTrackRefreshOutcome(
+      'audio',
+      true,
+      false,
+      !!parsed._hlsEpochReset || hlsCursorAdvanced(previousCursor, hlsDeliveryCursor(this.activeAudio)),
+      previousSignature !== hlsTrackSignature(this.activeAudio)
+    );
+    outcome.epochReset = !!parsed._hlsEpochReset;
+    outcome.playlistEpoch = parsed._hlsPlaylistEpoch || 0;
+    if (isTs) return this._ensureTsTransmuxer('audio', codecs).then(function () { return outcome; });
+    return outcome;
+  };
+
+  NativeHlsProvider.prototype._syncPresentationState = function () {
+    var separateAudioPendingEnd = !!(this.activeAudio && this.audioEndList === false);
+    var live = !this.videoEndList || separateAudioPendingEnd;
+    var duration = Math.max(
+      this.videoDuration || 0,
+      this.activeAudio && this.activeAudio.duration ? this.activeAudio.duration : 0
+    );
+    applyProviderPresentationState(this, live, duration);
   };
 
   NativeHlsProvider.prototype._loadStartupMediaPlaylists = function () {
@@ -1824,9 +2402,9 @@
         ? self._fetchPlaylistText(selectedAudio.url)
         : Promise.resolve(null);
       return Promise.all([videoPlaylist, audioPlaylist]).then(function (playlists) {
-        return Promise.resolve(self._loadMediaPlaylist(playlists[0], selectedVariant.url)).then(function () {
+        return Promise.resolve(self._loadMediaPlaylist(playlists[0], selectedVariant.url, selectedVariant)).then(function () {
           if (playlists[1] == null) return;
-          return self._loadAudioPlaylist(playlists[1], selectedAudio.url);
+          return self._loadAudioPlaylist(playlists[1], selectedAudio.url, selectedAudio);
         });
       }).catch(function (err) {
         if (!isRefreshableRequestError(err)) throw err;
@@ -1903,11 +2481,20 @@
   NativeHlsProvider.prototype._open = function () {
     var self = this;
     this.mediaSource.duration = this.live ? Infinity : (this.duration || NaN);
-    this.sb = this.mediaSource.addSourceBuffer(this.mimeType);
-    this.sb.mode = 'segments';
-    if (this.audioInitSegment || this.muxedTsAudio || (this.activeAudio && this.activeAudio.isTsPlaylist)) {
+    var videoOnlyGaps = allSegmentsDeclaredGap(this.segments);
+    var audioOnlyGaps = !!(this.activeAudio && allSegmentsDeclaredGap(this.audioSegments));
+    this.suppressedVideoGapTrack = !!(videoOnlyGaps && this.activeAudio && !audioOnlyGaps);
+    this.suppressedAudioGapTrack = audioOnlyGaps;
+    this.suppressedGapTrackCount = (this.suppressedVideoGapTrack ? 1 : 0) + (this.suppressedAudioGapTrack ? 1 : 0);
+    if (!this.suppressedVideoGapTrack) {
+      this.sb = this.mediaSource.addSourceBuffer(this.mimeType);
+      this.sb.mode = 'segments';
+      this.videoSourceBufferMime = this.mimeType;
+    }
+    if (!this.suppressedAudioGapTrack && (this.audioInitSegment || this.muxedTsAudio || (this.activeAudio && this.activeAudio.isTsPlaylist))) {
       this.audioSb = this.mediaSource.addSourceBuffer(this.audioMimeType);
       this.audioSb.mode = 'segments';
+      this.audioSourceBufferMime = this.audioMimeType;
     }
     this.video.addEventListener('waiting', this._boundWaiting = function () { self._onWaiting(); });
     this.video.addEventListener('playing', this._boundPlaying = function () { self._onPlaying(); });
@@ -1922,17 +2509,41 @@
     });
     // Video and audio have independent SourceBuffers, so their init requests and
     // appends do not need to sit on the same startup critical path.
-    var videoInitPromise = this.initSegment
+    var videoInitPromise = this.initSegment && this.sb
       ? this._fetchRange(this.initSegment.url, this.initSegment.range, { phase: 'metadata' }).then(function (initData) {
-        return appendBuffer(self.sb, initData).then(function () {
+        var generationKey = hlsTrackInitialTimestampGenerationKey(self, self);
+        var sourceBuffer = self.sb;
+        return appendHlsInitBuffer(
+          self,
+          self,
+          sourceBuffer,
+          self.initSegment,
+          initData,
+          generationKey,
+          sourceBufferIdentityGuard(self, 'sb', sourceBuffer)
+        ).then(function () {
           self._appendedVideoInitKey = hlsInitSegmentKey(self.initSegment);
+          self._appendedVideoInitGenerationKey = generationKey;
+          self._sourceBufferVideoInitSegment = self.initSegment;
         });
       })
       : Promise.resolve();
     var audioInitPromise = this.audioInitSegment && this.audioSb
       ? this._fetchRange(this.audioInitSegment.url, this.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
-        return appendBuffer(self.audioSb, initData).then(function () {
+        var generationKey = hlsTrackInitialTimestampGenerationKey(self, self.activeAudio);
+        var sourceBuffer = self.audioSb;
+        return appendHlsInitBuffer(
+          self,
+          self.activeAudio,
+          sourceBuffer,
+          self.audioInitSegment,
+          initData,
+          generationKey,
+          sourceBufferIdentityGuard(self, 'audioSb', sourceBuffer)
+        ).then(function () {
           self._appendedAudioInitKey = hlsInitSegmentKey(self.audioInitSegment);
+          self._appendedAudioInitGenerationKey = generationKey;
+          self._sourceBufferAudioInitSegment = self.audioInitSegment;
         });
       })
       : Promise.resolve();
@@ -1947,34 +2558,455 @@
         assignInternalMediaTime(self, self.manifestStartTime);
       }
       self.startupBufferStartedAt = performance.now();
+      if (self.engine && self.engine._markStartupAttached) self.engine._markStartupAttached(self);
       if (self.live) self._schedulePlaylistRefresh();
       self._tick(true);
       return applyPendingLoadStartTime(self).then(function () {
         self.engine._player.emit('loaded');
         self.engine._player.emit('trackschanged');
-        self.engine._setState('ready');
       });
     });
   };
 
+  NativeHlsProvider.prototype._appendTrackInitIfNeeded = function (kind, force) {
+    var self = this;
+    var isAudio = kind === 'audio';
+    var generation = arguments.length > 2 && arguments[2] != null
+      ? arguments[2]
+      : (this.trackTransitionGeneration || 0);
+    var sb = isAudio ? this.audioSb : this.sb;
+    var initSegment = isAudio ? this.audioInitSegment : this.initSegment;
+    var keyField = isAudio ? '_appendedAudioInitKey' : '_appendedVideoInitKey';
+    var generationKeyField = isAudio ? '_appendedAudioInitGenerationKey' : '_appendedVideoInitGenerationKey';
+    var initField = isAudio ? '_sourceBufferAudioInitSegment' : '_sourceBufferVideoInitSegment';
+    var bufferField = isAudio ? 'audioSb' : 'sb';
+    if (!sb || !initSegment) return Promise.resolve(false);
+    var initKey = hlsInitSegmentKey(initSegment);
+    var timestampGenerationKey = hlsTrackInitialTimestampGenerationKey(this, isAudio ? this.activeAudio : this);
+    if (!force && initKey && this[keyField] === initKey && this[generationKeyField] === timestampGenerationKey) return Promise.resolve(false);
+    assertHlsTrackTransitionCurrent(this, generation);
+    return this._fetchRange(initSegment.url, initSegment.range, { phase: 'metadata' }).then(function (initData) {
+      assertHlsTrackTransitionCurrent(self, generation);
+      if (self[bufferField] !== sb) throw abortError();
+      return appendHlsInitBuffer(self, isAudio ? self.activeAudio : self, sb, initSegment, initData, timestampGenerationKey);
+    }).then(function () {
+      assertHlsTrackTransitionCurrent(self, generation);
+      if (self[bufferField] !== sb) throw abortError();
+      self[keyField] = initKey;
+      self[generationKeyField] = timestampGenerationKey;
+      self[initField] = initSegment;
+      return true;
+    });
+  };
+
+  NativeHlsProvider.prototype._restoreTrackSourceBuffer = function (kind, desired, generation) {
+    var self = this;
+    var isAudio = kind === 'audio';
+    var field = isAudio ? 'audioSb' : 'sb';
+    var mimeField = isAudio ? 'audioSourceBufferMime' : 'videoSourceBufferMime';
+    var keyField = isAudio ? '_appendedAudioInitKey' : '_appendedVideoInitKey';
+    var generationKeyField = isAudio ? '_appendedAudioInitGenerationKey' : '_appendedVideoInitGenerationKey';
+    var initField = isAudio ? '_sourceBufferAudioInitSegment' : '_sourceBufferVideoInitSegment';
+    desired = desired || { exists: false, sourceBuffer: null, mime: '', initKey: '', initGenerationKey: '', initSegment: null };
+    generation = generation == null ? (this.trackTransitionGeneration || 0) : generation;
+
+    function assertCurrent() {
+      assertHlsTrackTransitionCurrent(self, generation);
+    }
+
+    function removeCurrent() {
+      var current = self[field];
+      if (!current) return Promise.resolve();
+      return waitForVodSourceBufferQueue(current).then(function () {
+        assertCurrent();
+        if (self[field] !== current) return;
+        self.mediaSource.removeSourceBuffer(current);
+        self[field] = null;
+        self[mimeField] = '';
+        self[keyField] = '';
+        self[generationKeyField] = '';
+        self[initField] = null;
+      });
+    }
+
+    function addDesired() {
+      assertCurrent();
+      var replacement = self.mediaSource.addSourceBuffer(desired.mime);
+      replacement.mode = 'segments';
+      self[field] = replacement;
+      self[mimeField] = desired.mime;
+      self[keyField] = '';
+      self[generationKeyField] = '';
+      self[initField] = null;
+      reconcileHlsSegmentLedgers(self, kind, null, isAudio ? self.activeAudio : self, null, true);
+      if (!desired.initSegment) {
+        self[keyField] = desired.initKey || '';
+        self[generationKeyField] = desired.initGenerationKey || '';
+        return Promise.resolve(replacement);
+      }
+      return self._fetchRange(desired.initSegment.url, desired.initSegment.range, { phase: 'metadata' }).then(function (initData) {
+        assertCurrent();
+        if (self[field] !== replacement) throw abortError();
+        return appendHlsInitBuffer(self, isAudio ? self.activeAudio : self, replacement, desired.initSegment, initData, desired.initGenerationKey || '');
+      }).then(function () {
+        assertCurrent();
+        if (self[field] !== replacement) throw abortError();
+        self[keyField] = desired.initKey || hlsInitSegmentKey(desired.initSegment);
+        self[generationKeyField] = desired.initGenerationKey || '';
+        self[initField] = desired.initSegment;
+        return replacement;
+      });
+    }
+
+    assertCurrent();
+    if (!desired.exists) {
+      return removeCurrent().then(function () {
+        self[field] = null;
+        self[mimeField] = '';
+        self[keyField] = '';
+        self[generationKeyField] = '';
+        self[initField] = null;
+        return false;
+      });
+    }
+    if (!desired.mime) return Promise.reject(new Error('hls-' + kind + '-rollback-mime-unavailable'));
+    var current = this[field];
+    if (current === desired.sourceBuffer && (this[mimeField] || desired.mime) === desired.mime) {
+      this[mimeField] = desired.mime;
+      if (
+        !desired.initSegment
+        || (this[keyField] || '') === (desired.initKey || '')
+          && (this[generationKeyField] || '') === (desired.initGenerationKey || '')
+          && this[initField] === desired.initSegment
+      ) {
+        this[keyField] = desired.initKey || '';
+        this[generationKeyField] = desired.initGenerationKey || '';
+        this[initField] = desired.initSegment || null;
+        return Promise.resolve(false);
+      }
+      return this._fetchRange(desired.initSegment.url, desired.initSegment.range, { phase: 'metadata' }).then(function (initData) {
+        assertCurrent();
+        if (self[field] !== current) throw abortError();
+        return appendHlsInitBuffer(self, isAudio ? self.activeAudio : self, current, desired.initSegment, initData, desired.initGenerationKey || '');
+      }).then(function () {
+        self[keyField] = desired.initKey || hlsInitSegmentKey(desired.initSegment);
+        self[generationKeyField] = desired.initGenerationKey || '';
+        self[initField] = desired.initSegment;
+        return current;
+      });
+    }
+    if (current && current.changeType) {
+      return waitForVodSourceBufferQueue(current).then(function () {
+        assertCurrent();
+        if (self[field] !== current) throw abortError();
+        current.changeType(desired.mime);
+        self[mimeField] = desired.mime;
+        self[keyField] = '';
+        self[generationKeyField] = '';
+        self[initField] = null;
+        if (!desired.initSegment) return current;
+        return self._fetchRange(desired.initSegment.url, desired.initSegment.range, { phase: 'metadata' }).then(function (initData) {
+          assertCurrent();
+          if (self[field] !== current) throw abortError();
+          return appendHlsInitBuffer(self, isAudio ? self.activeAudio : self, current, desired.initSegment, initData, desired.initGenerationKey || '');
+        }).then(function () {
+          self[keyField] = desired.initKey || hlsInitSegmentKey(desired.initSegment);
+          self[generationKeyField] = desired.initGenerationKey || '';
+          self[initField] = desired.initSegment;
+          return current;
+        });
+      }).catch(function (err) {
+        if (err && err.name === 'AbortError') throw err;
+        return removeCurrent().then(addDesired);
+      });
+    }
+    return removeCurrent().then(addDesired);
+  };
+
+  NativeHlsProvider.prototype._transitionTrackSourceBuffer = function (kind, suppress, generation) {
+    var self = this;
+    var isAudio = kind === 'audio';
+    var field = isAudio ? 'audioSb' : 'sb';
+    var mimeType = isAudio ? this.audioMimeType : this.mimeType;
+    var mimeField = isAudio ? 'audioSourceBufferMime' : 'videoSourceBufferMime';
+    var keyField = isAudio ? '_appendedAudioInitKey' : '_appendedVideoInitKey';
+    var generationKeyField = isAudio ? '_appendedAudioInitGenerationKey' : '_appendedVideoInitGenerationKey';
+    var initField = isAudio ? '_sourceBufferAudioInitSegment' : '_sourceBufferVideoInitSegment';
+    generation = generation == null ? (this.trackTransitionGeneration || 0) : generation;
+    var previousState = captureHlsTrackSourceBufferState(this, kind);
+    var sourceBuffer = this[field];
+
+    function assertCurrent() {
+      assertHlsTrackTransitionCurrent(self, generation);
+    }
+
+    function rollback(err) {
+      if (self.destroyed || generation !== (self.trackTransitionGeneration || 0)) return Promise.reject(err);
+      return self._restoreTrackSourceBuffer(kind, previousState, generation).then(function () {
+        self.sourceBufferTypeRollbackCount = (self.sourceBufferTypeRollbackCount || 0) + 1;
+        throw err;
+      }, function (rollbackErr) {
+        var terminal = new Error('hls-' + kind + '-sourcebuffer-rollback-failed');
+        terminal.originalError = err;
+        terminal.rollbackError = rollbackErr;
+        throw terminal;
+      });
+    }
+
+    try {
+      assertCurrent();
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    if (suppress) {
+      if (!sourceBuffer) return Promise.resolve(false);
+      return removeHlsGapSourceBuffer(this, kind, generation).then(function () {
+        assertCurrent();
+        if (!self[field]) {
+          self[mimeField] = '';
+          self[keyField] = '';
+          self[generationKeyField] = '';
+          self[initField] = null;
+          self.trackSuppressionCount++;
+          return true;
+        }
+        return false;
+      });
+    }
+    if (!mimeType) return Promise.reject(new Error('hls-' + kind + '-mime-unavailable'));
+    if (!sourceBuffer) {
+      try {
+        assertCurrent();
+        sourceBuffer = this.mediaSource.addSourceBuffer(mimeType);
+        sourceBuffer.mode = 'segments';
+        this[field] = sourceBuffer;
+        this[mimeField] = mimeType;
+        this[keyField] = '';
+        this[generationKeyField] = '';
+        this[initField] = null;
+        this.trackActivationCount++;
+        reconcileHlsSegmentLedgers(this, kind, null, isAudio ? this.activeAudio : this, null, true);
+      } catch (err) {
+        return Promise.reject(err);
+      }
+      return this._appendTrackInitIfNeeded(kind, true, generation).then(function () { return true; }).catch(rollback);
+    }
+    var previousMime = this[mimeField] || mimeType;
+    if (previousMime === mimeType) return this._appendTrackInitIfNeeded(kind, false, generation);
+    return waitForVodSourceBufferQueue(sourceBuffer).then(function () {
+      assertCurrent();
+      return waitForSourceBufferIdle(sourceBuffer);
+    }).then(function () {
+      assertCurrent();
+      if (self[field] !== sourceBuffer) throw abortError();
+      if (sourceBuffer.changeType) {
+        try {
+          sourceBuffer.changeType(mimeType);
+          self[mimeField] = mimeType;
+          self[keyField] = '';
+          self[generationKeyField] = '';
+          self[initField] = null;
+          self.sourceBufferTypeChangeCount++;
+          return self._appendTrackInitIfNeeded(kind, true, generation);
+        } catch (err) {
+          // Browsers can expose changeType while rejecting a particular codec
+          // transition. Rebuild the buffer through the same controlled path
+          // used when changeType is absent.
+        }
+      }
+      try {
+        self.mediaSource.removeSourceBuffer(sourceBuffer);
+        self[field] = null;
+        self[mimeField] = '';
+        self[keyField] = '';
+        self[generationKeyField] = '';
+        self[initField] = null;
+      } catch (err) {
+        throw new Error('hls-' + kind + '-sourcebuffer-rebuild-failed');
+      }
+      var replacement;
+      try {
+        replacement = self.mediaSource.addSourceBuffer(mimeType);
+        replacement.mode = 'segments';
+      } catch (err) {
+        throw new Error('hls-' + kind + '-sourcebuffer-rebuild-failed');
+      }
+      self[field] = replacement;
+      self[mimeField] = mimeType;
+      self[keyField] = '';
+      self[generationKeyField] = '';
+      self[initField] = null;
+      self.sourceBufferTypeRebuildCount++;
+      reconcileHlsSegmentLedgers(self, kind, null, isAudio ? self.activeAudio : self, null, true);
+      return self._appendTrackInitIfNeeded(kind, true, generation);
+    }).catch(function (err) {
+      if (err && err.name === 'AbortError') throw err;
+      return rollback(err);
+    });
+  };
+
+  NativeHlsProvider.prototype._applyTrackLifecycle = function (generation) {
+    if (this.destroyed || !this.mediaSource || this.mediaSource.readyState !== 'open') return Promise.resolve();
+    var self = this;
+    generation = generation == null ? (this.trackTransitionGeneration || 0) : generation;
+    try {
+      assertHlsTrackTransitionCurrent(this, generation);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    var videoOnlyGaps = allSegmentsDeclaredGap(this.segments);
+    var audioOnlyGaps = !!(this.activeAudio && allSegmentsDeclaredGap(this.audioSegments));
+    var suppressVideo = !!(videoOnlyGaps && this.activeAudio && !audioOnlyGaps);
+    var suppressAudio = audioOnlyGaps;
+    var lifecycleChanged = suppressVideo !== !!this.suppressedVideoGapTrack
+      || suppressAudio !== !!this.suppressedAudioGapTrack
+      || (!suppressVideo && !this.sb)
+      || (!suppressAudio && (this.activeAudio || this.muxedTsAudio) && !this.audioSb)
+      || (!suppressVideo && this.sb && this.videoSourceBufferMime && this.videoSourceBufferMime !== this.mimeType)
+      || (!suppressAudio && this.audioSb && this.audioSourceBufferMime && this.audioSourceBufferMime !== this.audioMimeType);
+    if (lifecycleChanged) this._abortRequests();
+    return this._transitionTrackSourceBuffer('video', suppressVideo, generation).then(function () {
+      assertHlsTrackTransitionCurrent(self, generation);
+      if (!self.activeAudio && !self.muxedTsAudio) return false;
+      return self._transitionTrackSourceBuffer('audio', suppressAudio, generation);
+    }).then(function () {
+      assertHlsTrackTransitionCurrent(self, generation);
+      self.suppressedVideoGapTrack = !!(suppressVideo && !self.sb);
+      self.suppressedAudioGapTrack = !!(suppressAudio && !self.audioSb);
+      self.suppressedGapTrackCount = (self.suppressedVideoGapTrack ? 1 : 0) + (self.suppressedAudioGapTrack ? 1 : 0);
+    });
+  };
+
+  NativeHlsProvider.prototype._reconcileTrackLifecycle = function (generation) {
+    var self = this;
+    generation = generation == null ? (this.trackTransitionGeneration || 0) : generation;
+    var previous = this.trackLifecyclePromise || Promise.resolve();
+    var lifecycle = previous.catch(function () {}).then(function () {
+      assertHlsTrackTransitionCurrent(self, generation);
+      return self._applyTrackLifecycle(generation);
+    });
+    var tracked = lifecycle.then(function (value) {
+      if (self.trackLifecyclePromise === tracked) self.trackLifecyclePromise = null;
+      return value;
+    }, function (err) {
+      if (self.trackLifecyclePromise === tracked) self.trackLifecyclePromise = null;
+      throw err;
+    });
+    this.trackLifecyclePromise = tracked;
+    return tracked;
+  };
+
+  NativeHlsProvider.prototype._beginTrackTransition = function (reason) {
+    if (this.destroyed || this.trackTransitionInFlight) return null;
+    invalidateHlsAppendTransactions(this, reason || 'track-transition');
+    var transaction = {
+      generation: (this.trackTransitionGeneration || 0) + 1,
+      reason: reason || 'track-transition',
+      controller: new AbortController(),
+      cancelled: false,
+      snapshot: captureHlsTrackTransitionState(this)
+    };
+    this.trackTransitionGeneration = transaction.generation;
+    this.trackTransitionInFlight = transaction;
+    return transaction;
+  };
+
+  NativeHlsProvider.prototype._isTrackTransitionCurrent = function (transaction) {
+    return this._ownsTrackTransition(transaction) && !transaction.cancelled;
+  };
+
+  NativeHlsProvider.prototype._ownsTrackTransition = function (transaction) {
+    return !!(
+      transaction
+      && !this.destroyed
+      && this.trackTransitionInFlight === transaction
+      && this.trackTransitionGeneration === transaction.generation
+    );
+  };
+
+  NativeHlsProvider.prototype._finishTrackTransition = function (transaction, committed) {
+    if (!transaction || this.trackTransitionInFlight !== transaction) return false;
+    if (committed) this.trackTransitionCommitCount = (this.trackTransitionCommitCount || 0) + 1;
+    this.trackTransitionInFlight = null;
+    return true;
+  };
+
+  NativeHlsProvider.prototype._cancelTrackTransitionForViewerIntent = function () {
+    var transaction = this.trackTransitionInFlight;
+    if (!transaction || transaction.cancelled) return false;
+    transaction.cancelled = true;
+    this.playlistRefreshGeneration = (this.playlistRefreshGeneration || 0) + 1;
+    if (transaction.controller) {
+      try { transaction.controller.abort(); } catch (e) {}
+    }
+    this._abortRequests();
+    return true;
+  };
+
+  NativeHlsProvider.prototype._rollbackTrackTransition = function (transaction) {
+    var self = this;
+    if (!this._ownsTrackTransition(transaction)) return Promise.resolve(false);
+    this._abortRequests();
+    restoreHlsTrackTransitionState(this, transaction.snapshot);
+    return this._restoreTrackSourceBuffer('video', transaction.snapshot.videoSourceBuffer, transaction.generation).then(function () {
+      return self._restoreTrackSourceBuffer('audio', transaction.snapshot.audioSourceBuffer, transaction.generation);
+    }).then(function () {
+      if (!self._ownsTrackTransition(transaction)) throw abortError();
+      markSegmentsUnappended(self);
+      markSegmentsCoveredByBuffer(self, self.video);
+      if (self.activeAudio) {
+        markSegmentsUnappended(self.activeAudio);
+        markSegmentsCoveredByBuffer(self.activeAudio, self.video);
+      }
+      self.trackTransitionRollbackCount = (self.trackTransitionRollbackCount || 0) + 1;
+      return true;
+    }).catch(function (err) {
+      if (self.destroyed || (err && err.name === 'AbortError')) return false;
+      self.trackTransitionRollbackFailureCount = (self.trackTransitionRollbackFailureCount || 0) + 1;
+      self._completeNativeRuntimeTerminal('hls-track-transition-rollback-failed');
+      throw err;
+    });
+  };
+
+  NativeHlsProvider.prototype._flushPendingTrackSwitch = function () {
+    if (this.destroyed || this.trackTransitionInFlight) return false;
+    if (this._flushPendingVariantSwitch()) return true;
+    var pendingAudio = this.pendingAudioTrackSwitch;
+    if (!pendingAudio) return false;
+    this.pendingAudioTrackSwitch = null;
+    var rendition = this.audioRenditions.find(function (item) {
+      return item.id === pendingAudio.id || item.language === pendingAudio.language;
+    });
+    if (!rendition || rendition === this.activeAudio) return false;
+    this.selectAudioTrack(pendingAudio);
+    return !!this.trackTransitionInFlight;
+  };
+
   NativeHlsProvider.prototype._tick = function (force) {
-    if (this.destroyed || !this.sb || !this.segments.length) return;
+    if (this.destroyed || (!this.sb && !this.audioSb) || !this.segments.length) return;
+    if (this.playlistManifestCommitInProgress) return;
+    if (this._jumpManifestGap && this._jumpManifestGap()) return;
+    if (this._maybeEndVodStream && this._maybeEndVodStream()) return;
+    if (endedVodSchedulerIsIdle(this)) return;
     this._updateLivePositionStats();
     this._jumpSmallGap();
     var ahead = getBufferAhead(this.video);
     this._maybeRefreshLiveLowBuffer(ahead);
     if (this._recoverLiveWindowDrift(ahead)) return;
-    if (this.variantSwitchInFlight) return;
+    if (this.variantSwitchInFlight || this.trackTransitionInFlight) return;
     if (!this.manualTrackId) this._maybeSwitchAuto();
-    if (this.variantSwitchInFlight) return;
+    if (this.variantSwitchInFlight || this.trackTransitionInFlight) return;
     if (!force && ahead >= this._bufferAheadGoal()) return;
-    this._scheduleMediaRequests(!this.startupBufferComplete ? this._startupBufferGoal() : this._bufferAheadGoal());
+    var schedulingGoal = this.seekBufferPending
+      ? this._seekBufferGoal()
+      : (!this.startupBufferComplete ? this._startupBufferGoal() : this._bufferAheadGoal());
+    this._scheduleMediaRequests(schedulingGoal);
     this._trim();
     this._checkBufferMilestones();
   };
 
   NativeHlsProvider.prototype._scheduleMediaRequests = function (windowGoal) {
-    if (this.destroyed) return;
+    if (this.destroyed || this.playlistManifestCommitInProgress) return;
     var tracks = this._mediaTracks();
     for (var t = 0; t < tracks.length; t++) this._drainAppendQueue(tracks[t]);
     var capacity = this._maxConcurrentMediaRequests() - countKeys(this.activeRanges);
@@ -1993,7 +3025,7 @@
     this._videoTrack = this._videoTrack || { id: 'video', kind: 'video', segments: [], sb: null };
     this._videoTrack.segments = hlsPlayableSegments(this, this, this.segments);
     this._videoTrack.sb = this.sb;
-    var tracks = [this._videoTrack];
+    var tracks = this.sb ? [this._videoTrack] : [];
     if (this.activeAudio && this.audioSb && this.audioSegments.length) {
       this.activeAudio.kind = 'audio';
       this.activeAudio.segments = hlsPlayableSegments(this, this.activeAudio, this.audioSegments);
@@ -2045,7 +3077,7 @@
 
   NativeHlsProvider.prototype._startSegmentFetch = function (track, seg) {
     var self = this;
-    if (!track || !seg || isSegmentBusyOrDone(seg)) return false;
+    if (this.playlistManifestCommitInProgress || !track || !seg || isSegmentBusyOrDone(seg)) return false;
     var rangeKey = track.id + ':' + segmentKey(seg);
     if (this.activeRanges[rangeKey]) return false;
     this.activeRanges[rangeKey] = true;
@@ -2102,7 +3134,7 @@
       if (!seg._nativeRecovered && isRefreshableRequestError(err)) {
         seg._nativeRecovered = true;
         seg.state = 'recovering';
-        self._recoverMediaRequest(err).then(function () {
+        self._recoverMediaRequest(err, track).then(function () {
           if (self.destroyed) return;
           seg.state = '';
           seg.appended = false;
@@ -2120,21 +3152,32 @@
   };
 
   NativeHlsProvider.prototype._decryptSegmentIfNeeded = function (seg, data) {
-    if (!seg || !seg.key || seg.key.method !== 'AES-128') return Promise.resolve(data);
+    return this._decryptHlsResourceIfNeeded(seg, data, false);
+  };
+
+  NativeHlsProvider.prototype._decryptHlsInitIfNeeded = function (initSegment, data) {
+    return this._decryptHlsResourceIfNeeded(initSegment, data, true);
+  };
+
+  NativeHlsProvider.prototype._decryptHlsResourceIfNeeded = function (resource, data, isInit) {
+    if (!resource || !resource.key || resource.key.method !== 'AES-128') return Promise.resolve(data);
     var self = this;
-    return this._fetchHlsKey(seg.key).then(function (rawKey) {
-      var iv = seg.key.iv || hlsDefaultIv(seg.mediaSequence || 0);
+    return this._fetchHlsKey(resource.key).then(function (rawKey) {
+      var iv = resource.key.iv || (!isInit ? hlsDefaultIv(resource.mediaSequence || 0) : null);
+      if (!iv) throw new Error('hls-map-iv-required');
       return crypto.subtle.importKey('raw', rawKey, { name: 'AES-CBC' }, false, ['decrypt']).then(function (key) {
         return crypto.subtle.decrypt({ name: 'AES-CBC', iv: iv }, key, data);
       });
     }).then(function (plain) {
-      self.encryptedSegmentCount++;
+      if (isInit) self.encryptedInitSegmentCount = (self.encryptedInitSegmentCount || 0) + 1;
+      else self.encryptedSegmentCount++;
       self.lastDecryptionError = '';
       return plain;
     }).catch(function (err) {
-      self.lastDecryptionError = err && err.message ? err.message : 'hls-decrypt-failed';
+      var fallbackReason = isInit ? 'hls-init-decrypt-failed' : 'hls-decrypt-failed';
+      self.lastDecryptionError = err && err.message ? err.message : fallbackReason;
       self.lastError = self.lastDecryptionError;
-      throw new Error('hls-decrypt-failed');
+      throw new Error(fallbackReason);
     });
   };
 
@@ -2176,8 +3219,9 @@
 
   NativeHlsProvider.prototype._drainAppendQueue = function (track) {
     var self = this;
+    if (this.playlistManifestCommitInProgress) return false;
     track = track || this._mediaTracks()[0];
-    if (!track || !track.sb || track._appending) return false;
+    if (!track || !track.sb || track._appending || track._appendOwner) return false;
     if (track.sb.updating && !recoverStuckSourceBuffer(this, track)) return false;
     var next = nextFetchedSegmentForAppend(track, this.video.currentTime || 0);
     if (!next) return false;
@@ -2186,26 +3230,47 @@
     next._appendStartedAt = performance.now();
     var data = next._data;
     delete next._data;
-    hlsAppendSegmentWithWatchdog(self, track, next, data).then(function () {
+    var appendTransaction = createHlsAppendTransaction(self, track, next);
+    track._appendOwner = appendTransaction;
+    next._appendOwner = appendTransaction;
+    hlsAppendSegmentWithWatchdog(self, track, next, data, appendTransaction).then(function () {
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
+      if (track._appendOwner !== appendTransaction || next._appendOwner !== appendTransaction) throw abortError();
       next.state = 'appended';
       next.appended = true;
       if (next._hlsPart || next._hlsPreloadHint) self.partialSegmentAppendCount++;
       if (next._parentSegment) markCompletedHlsParent(next._parentSegment, null);
       delete next._appendStartedAt;
       delete next._fetchStartedAt;
+      delete next._appendOwner;
+      track._appendOwner = null;
       track._appending = false;
       self.appendFailures = 0;
       self.stallReports = 0;
       self.stallRecoveryStage = 0;
       self.schedulerDrainCount++;
       self._alignHlsBufferedTarget();
+      if (self._checkBufferMilestones) self._checkBufferMilestones();
       self.engine._player.emit('adaptation');
       self._drainAppendQueue(track);
       if (self._maybeEndVodStream) self._maybeEndVodStream();
       self._tick();
     }).catch(function (err) {
-      track._appending = false;
-      if (err.name !== 'AbortError') {
+      var ownsTrack = track._appendOwner === appendTransaction;
+      var ownsSegment = next._appendOwner === appendTransaction;
+      if (ownsTrack) {
+        track._appendOwner = null;
+        track._appending = false;
+      }
+      if (!ownsSegment) return;
+      delete next._appendOwner;
+      if (err.name === 'AbortError') {
+        if (!self.destroyed && next.state === 'appending') {
+          next.state = 'pending';
+          next.appended = false;
+          delete next._appendStartedAt;
+        }
+      } else {
         next.state = 'failed';
         next.appended = false;
         delete next._appendStartedAt;
@@ -2219,19 +3284,50 @@
     return true;
   };
 
-  NativeHlsProvider.prototype._appendSegmentData = function (track, seg, data) {
+  NativeHlsProvider.prototype._appendSegmentData = function (track, seg, data, appendTransaction) {
     var self = this;
-    var isTsAudioTrack = track.kind === 'audio' && track.isTsPlaylist;
+    appendTransaction = appendTransaction || createHlsAppendTransaction(this, track, seg);
+    var container;
+    try {
+      assertHlsAppendTransactionCurrent(this, appendTransaction);
+      container = bindHlsGenerationContainer(this, seg, detectHlsMediaContainer(data, seg));
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    if (!container) return Promise.reject(new Error('hls-segment-container-unsupported'));
+    var isTsMedia = container === 'mpegts';
     var prepareDiscontinuity = this._prepareDiscontinuityAppend || function () { return Promise.resolve(); };
-    var appendPromise = prepareDiscontinuity.call(this, track, seg).then(function () {
-      if (self.isTsPlaylist && track.kind === 'video') {
+    var ensureContainer = Promise.resolve();
+    if (isTsMedia && this._ensureTsTransmuxer) {
+      if (track.kind === 'audio') {
+        ensureContainer = this._ensureTsTransmuxer('audio', track.codecs || 'mp4a.40.2');
+      } else {
+        var videoCodecs = videoCodecsOnly((this.activeVariant && (this.activeVariant.rawCodecs || this.activeVariant.codecs)) || '') || 'avc1.42c01f';
+        ensureContainer = this._ensureTsTransmuxer('video', videoCodecs).then(function () {
+          if (!self.muxedTsAudio || !self.audioSb) return;
+          var audioCodecs = (self.activeVariant && self.activeVariant.audioCodecs) || audioCodecsOnly((self.activeVariant && self.activeVariant.rawCodecs) || '') || 'mp4a.40.2';
+          return self._ensureTsTransmuxer('audio', audioCodecs);
+        });
+      }
+    }
+    var appendPromise = ensureContainer.then(function () {
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
+      return prepareDiscontinuity.call(self, track, seg);
+    }).then(function () {
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
+      if (isTsMedia && track.kind === 'video') {
         if (self.muxedTsAudio && self.audioSb) {
           self._muxedAudioTrack = self._muxedAudioTrack || { id: 'muxed-audio', kind: 'audio', sb: self.audioSb };
           self._muxedAudioTrack.sb = self.audioSb;
+          // A muxed transport stream has one clock. Demux it once and give
+          // both remuxers the same generation-scoped timestamp origin so the
+          // original audio/video lead or lag survives the fMP4 conversion.
+          var sharedTsContext = prepareHlsTsTransmuxContext(self, track, seg, data);
+          self.hlsTsSharedDemuxCount = (self.hlsTsSharedDemuxCount || 0) + 1;
           return Promise.all([
-            self._transmuxTsSegment(track, seg, data, 'video'),
+            self._transmuxTsSegment(track, seg, data, 'video', sharedTsContext),
             self._prepareDiscontinuityAppend(self._muxedAudioTrack, seg).then(function () {
-              return self._transmuxTsSegment(track, seg, data, 'audio');
+              return self._transmuxTsSegment(track, seg, data, 'audio', sharedTsContext);
             })
           ]).then(function (outputs) {
             // Keep the first displayed video frame from racing ahead of muxed
@@ -2240,87 +3336,488 @@
             // audio SourceBuffer catches up. Prepare both outputs together,
             // append audio first, and expose video only when both tracks can
             // advance continuously.
-            return self._appendTransmuxedOutput(
-              self.audioSb,
-              outputs[1],
-              self._muxedAudioTrack,
-              seg
-            ).then(function () {
-              return self._appendTransmuxedOutput(track.sb, outputs[0], track, seg);
-            });
+            return appendHlsMuxedTsOutputs(self, track, seg, outputs, null, appendTransaction);
           });
         }
         return self._transmuxTsSegment(track, seg, data, 'video').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output, track, seg);
+          return self._appendTransmuxedOutput(track.sb, output, track, seg, appendTransaction);
         });
       }
-      if (isTsAudioTrack) {
+      if (isTsMedia && track.kind === 'audio') {
         return self._transmuxTsSegment(track, seg, data, 'audio').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output, track, seg);
+          return self._appendTransmuxedOutput(track.sb, output, track, seg, appendTransaction);
         });
       }
-      return appendBuffer(track.sb, data, null, hlsFmp4TimestampOffset());
+      function appendFmp4() {
+        var offset;
+        try {
+          offset = hlsFmp4TimestampOffset(self, track, seg, data);
+        } catch (err) {
+          return Promise.reject(err);
+        }
+        return appendBuffer(
+          track.sb,
+          data,
+          null,
+          offset,
+          hlsAppendTransactionGuard(self, appendTransaction)
+        );
+      }
+      return appendFmp4().catch(function (err) {
+        if (
+          !err
+          || err.code !== 'HLS_TIMESTAMP_UNRESOLVED'
+          || seg._hlsTimestampResolutionRetried
+          || !self._refreshHlsGenerationInit
+        ) throw err;
+        seg._hlsTimestampResolutionRetried = true;
+        return self._refreshHlsGenerationInit(track, seg).then(appendFmp4);
+      });
     });
     return appendPromise.catch(function (err) {
       if (!isQuotaExceeded(err)) throw err;
       self.quotaRecoveries++;
       self.lastError = 'quota-exceeded';
       if (self.engine && self.engine._telemetry) self.engine._telemetry.record('recovery', { lastError: 'quota-exceeded' });
-      return self._recoverQuota(track, data, seg).catch(function (retryErr) {
-        seg.state = 'failed';
+      return self._recoverQuota(track, data, seg, err, appendTransaction).catch(function (retryErr) {
+        if (!retryErr || retryErr.name !== 'AbortError') seg.state = 'failed';
         throw retryErr;
       });
     });
   };
 
   NativeHlsProvider.prototype._maybeEndVodStream = function () {
-    if (this.live || !this.mediaSource || this.mediaSource.readyState !== 'open') return false;
-    if ((this.sb && this.sb.updating) || (this.audioSb && this.audioSb.updating)) return false;
-    if (!segmentsAppendedThroughEnd(this.segments, this.duration)) return false;
-    if (this.activeAudio && this.audioSegments.length && !segmentsAppendedThroughEnd(this.audioSegments, this.duration)) return false;
-    try {
-      this.mediaSource.endOfStream();
-      this.vodEndOfStreamCount++;
-      return true;
-    } catch (e) {
+    if (this.live || !this.mediaSource) return false;
+    if (this.mediaSource.readyState === 'ended') {
+      this.vodEndOfStreamPending = false;
       return false;
     }
+    if (this.mediaSource.readyState !== 'open') return false;
+    if (!this.vodEndOfStreamPending) {
+      if (!segmentsAppendedThroughEnd(this.segments, this.duration)) return false;
+      if (!sourceBufferCoversPlayableEnd(this.sb, playableSegmentEnd(this.segments))) return false;
+      if (
+        this.activeAudio
+        && this.audioSegments.length
+        && !segmentsAppendedThroughEnd(this.audioSegments, this.activeAudio.duration || this.duration)
+      ) return false;
+      if (
+        this.activeAudio
+        && this.audioSegments.length
+        && !sourceBufferCoversPlayableEnd(this.audioSb, playableSegmentEnd(this.audioSegments))
+      ) return false;
+      if (
+        this.muxedTsAudio
+        && this.audioSb
+        && !sourceBufferCoversPlayableEnd(this.audioSb, playableSegmentEnd(this.segments))
+      ) return false;
+      this.vodEndOfStreamPending = true;
+    }
+    return finalizeVodEndOfStream(this, [this.sb, this.audioSb]);
   };
 
   NativeHlsProvider.prototype._prepareDiscontinuityAppend = function (track, seg) {
     if (!track || !track.sb || !seg) return Promise.resolve();
+    var self = this;
+    var isAudio = track !== this && track.kind === 'audio';
+    var keyField = isAudio ? '_appendedAudioInitKey' : '_appendedVideoInitKey';
+    var generationKeyField = isAudio ? '_appendedAudioInitGenerationKey' : '_appendedVideoInitGenerationKey';
+    var initField = isAudio ? '_sourceBufferAudioInitSegment' : '_sourceBufferVideoInitSegment';
+    var container = seg._hlsContainer || hlsSegmentContainerHint(seg);
+    var generationKey = seg._hlsTimestampGenerationKey || (seg._parentSegment && seg._parentSegment._hlsTimestampGenerationKey) || '';
+    var desiredInit = container === 'mpegts' ? null : hlsSegmentInitSegment(this, track, seg);
+    var desiredInitKey = hlsInitSegmentKey(desiredInit);
+    var appendedInitKey = this[keyField] || track._lastAppendInitKey || '';
+    var mapChanged = !!(desiredInitKey && desiredInitKey !== appendedInitKey);
+    var generationChanged = !!(desiredInit && generationKey && generationKey !== (this[generationKeyField] || track._lastAppendInitGenerationKey || ''));
+    var needsInit = !!(desiredInit && (mapChanged || generationChanged));
     var sequence = seg.discontinuitySequence || 0;
     var previous = track._lastAppendDiscontinuitySequence;
     var boundary = previous != null && previous !== sequence;
-    if (!boundary && !seg.discontinuity) {
+    if (!boundary && !seg.discontinuity && !needsInit) {
       if (previous == null) track._lastAppendDiscontinuitySequence = sequence;
       return Promise.resolve();
     }
     track._lastAppendDiscontinuitySequence = sequence;
-    if (track.sb.updating) return waitForSourceBufferIdle(track.sb);
-    try {
-      if (track.sb.abort) track.sb.abort();
-    } catch (e) {}
-    return Promise.resolve();
+    var sourceBuffer = track.sb;
+    var prepare = sourceBuffer.updating ? waitForSourceBufferIdle(sourceBuffer) : Promise.resolve();
+    return prepare.then(function () {
+      if (track.sb !== sourceBuffer) throw abortError();
+      try {
+        if (sourceBuffer.abort) sourceBuffer.abort();
+      } catch (e) {}
+      if (!needsInit || !desiredInit) {
+        self[generationKeyField] = generationKey;
+        track._lastAppendInitGenerationKey = generationKey;
+        return false;
+      }
+      return self._fetchRange(desiredInit.url, desiredInit.range, {
+        phase: 'metadata',
+        revalidate: generationChanged && !mapChanged
+      }).then(function (initData) {
+        if (track.sb !== sourceBuffer) throw abortError();
+        return appendHlsInitBuffer(self, track, sourceBuffer, desiredInit, initData, generationKey);
+      }).then(function () {
+        if (track.sb !== sourceBuffer) throw abortError();
+        if (appendedInitKey && appendedInitKey !== desiredInitKey) {
+          self.hlsInitMapSwitchCount = (self.hlsInitMapSwitchCount || 0) + 1;
+        }
+        if (generationChanged) self.hlsInitGenerationRefreshCount = (self.hlsInitGenerationRefreshCount || 0) + 1;
+        self[keyField] = desiredInitKey;
+        self[generationKeyField] = generationKey;
+        self[initField] = desiredInit;
+        track._lastAppendInitKey = desiredInitKey;
+        track._lastAppendInitGenerationKey = generationKey;
+        return true;
+      });
+    });
   };
 
-  NativeHlsProvider.prototype._appendTransmuxedOutput = function (sb, output, track, seg) {
+  NativeHlsProvider.prototype._refreshHlsGenerationInit = function (track, seg) {
+    if (!track || !track.sb || !seg) return Promise.reject(new Error('hls-generation-init-unavailable'));
     var self = this;
+    var sourceBuffer = track.sb;
+    var isAudio = track !== this && track.kind === 'audio';
+    var keyField = isAudio ? '_appendedAudioInitKey' : '_appendedVideoInitKey';
+    var generationKeyField = isAudio ? '_appendedAudioInitGenerationKey' : '_appendedVideoInitGenerationKey';
+    var initField = isAudio ? '_sourceBufferAudioInitSegment' : '_sourceBufferVideoInitSegment';
+    var initSegment = hlsSegmentInitSegment(this, track, seg);
+    var generationKey = seg._hlsTimestampGenerationKey || (seg._parentSegment && seg._parentSegment._hlsTimestampGenerationKey) || '';
+    if (!initSegment || !generationKey) return Promise.reject(new Error('hls-generation-init-unavailable'));
+    var kind = hlsTrackKind(this, track);
+    if (this.hlsInitTimescaleByKey) delete this.hlsInitTimescaleByKey[hlsInitTimescaleKey(kind, initSegment, generationKey)];
+    if (this.hlsInitTrackInfoByKey) delete this.hlsInitTrackInfoByKey[hlsInitTimescaleKey(kind, initSegment, generationKey)];
+    return waitForSourceBufferIdle(sourceBuffer).then(function () {
+      if (track.sb !== sourceBuffer) throw abortError();
+      try { if (sourceBuffer.abort) sourceBuffer.abort(); } catch (e) {}
+      return self._fetchRange(initSegment.url, initSegment.range, { phase: 'metadata', revalidate: true });
+    }).then(function (initData) {
+      if (track.sb !== sourceBuffer) throw abortError();
+      return appendHlsInitBuffer(self, track, sourceBuffer, initSegment, initData, generationKey);
+    }).then(function () {
+      if (track.sb !== sourceBuffer) throw abortError();
+      self[keyField] = hlsInitSegmentKey(initSegment);
+      self[generationKeyField] = generationKey;
+      self[initField] = initSegment;
+      track._lastAppendInitKey = self[keyField];
+      track._lastAppendInitGenerationKey = generationKey;
+      self.hlsTimestampResolutionRetryCount = (self.hlsTimestampResolutionRetryCount || 0) + 1;
+      return true;
+    });
+  };
+
+  NativeHlsProvider.prototype._appendTransmuxedOutput = function (sb, output, track, seg, appendTransaction) {
+    var self = this;
+    if (appendTransaction) assertHlsAppendTransactionCurrent(this, appendTransaction);
+    var wantedHandler = track && track.kind === 'audio' ? 'soun' : 'vide';
+    if (output.init && output.init.byteLength) {
+      var initTracks = parseMp4InitTrackInfo(output.init);
+      var selectedTrack = initTracks.find(function (item) { return item.handlerType === wantedHandler; }) || initTracks[0] || null;
+      if (selectedTrack) track._hlsTransmuxTimestampInfo = selectedTrack;
+    }
+    var timestampOffset = hlsFiniteTimestamp(output.timestampOffset)
+      ? output.timestampOffset
+      : hlsLiveTimestampOffset(this, track, seg);
+    var timestampInfo = track && track._hlsTransmuxTimestampInfo;
+    var fragmentTiming = timestampInfo && output.data
+      ? parseMp4FragmentTimestamp(output.data, timestampInfo.trackId)
+      : null;
+    if (hlsFiniteTimestamp(output.timestampOffset)) {
+      this.hlsTransmuxedTimestampResolutionCount = (this.hlsTransmuxedTimestampResolutionCount || 0) + 1;
+    } else if (timestampInfo && fragmentTiming && isFinite(seg && seg.start)) {
+      timestampOffset = seg.start - fragmentTiming.presentationTime / timestampInfo.timescale;
+      this.hlsTransmuxedTimestampResolutionCount = (this.hlsTransmuxedTimestampResolutionCount || 0) + 1;
+    } else if (seg && seg._hlsTimestampGenerationKey && !isFinite(timestampOffset)) {
+      return Promise.reject(new Error('hls-transmux-timestamp-unresolved'));
+    }
+    var appendInit = !!(output.init && output.init.byteLength);
+    if (
+      appendInit
+      && track
+      && track._hlsTransmuxInitSourceBuffer === sb
+      && hlsMediaBytesEqual(track._hlsTransmuxInitData, output.init)
+    ) {
+      appendInit = false;
+      this.hlsTsInitSkipCount = (this.hlsTsInitSkipCount || 0) + 1;
+    }
     var chain = Promise.resolve();
-    if (output.init && output.init.byteLength) chain = chain.then(function () { return appendBuffer(sb, output.init); });
+    if (appendInit) chain = chain.then(function () {
+      return appendBuffer(
+        sb,
+        output.init,
+        null,
+        undefined,
+        appendTransaction ? hlsAppendTransactionGuard(self, appendTransaction) : null
+      ).then(function () {
+        if (track) {
+          track._hlsTransmuxInitSourceBuffer = sb;
+          track._hlsTransmuxInitData = copyHlsMediaBytes(output.init);
+        }
+        self.hlsTsInitAppendCount = (self.hlsTsInitAppendCount || 0) + 1;
+      });
+    });
     if (output.data && output.data.byteLength) chain = chain.then(function () {
-      return appendBuffer(sb, output.data, null, hlsLiveTimestampOffset(self, track, seg));
+      return appendBuffer(
+        sb,
+        output.data,
+        null,
+        timestampOffset,
+        appendTransaction ? hlsAppendTransactionGuard(self, appendTransaction) : null
+      );
     });
     return chain.then(function () {
+      if (appendTransaction) assertHlsAppendTransactionCurrent(self, appendTransaction);
       self._alignTsStartupTime();
     });
   };
 
+  function invalidateHlsAppendTransactions(provider, reason) {
+    if (!provider) return 0;
+    provider.hlsAppendEpoch = (provider.hlsAppendEpoch || 0) + 1;
+    provider.hlsAppendInvalidationCount = (provider.hlsAppendInvalidationCount || 0) + 1;
+    provider.lastHlsAppendInvalidationReason = reason || 'lifecycle-change';
+    var ledger = provider.hlsMuxedAppendLedger || {};
+    for (var key in ledger) {
+      if (!Object.prototype.hasOwnProperty.call(ledger, key)) continue;
+      var entry = ledger[key];
+      if (entry.audioAppended !== entry.videoAppended && !entry.partialCarryRecorded) {
+        entry.partialCarryRecorded = true;
+        provider.hlsMuxedPartialCarryCount = (provider.hlsMuxedPartialCarryCount || 0) + 1;
+      }
+      delete entry.outputs;
+      entry.transaction = null;
+    }
+    return provider.hlsAppendEpoch;
+  }
+
+  function createHlsRecoveryTransaction(provider, epoch, reason) {
+    return {
+      epoch: epoch,
+      reason: reason || 'native-recovery',
+      videoSourceBuffer: provider && provider.sb || null,
+      audioSourceBuffer: provider && provider.audioSb || null,
+      videoTrack: provider || null,
+      audioTrack: provider && provider.activeAudio || null,
+      videoInitSegment: provider && provider.initSegment || null,
+      audioInitSegment: provider && provider.audioInitSegment || null,
+      staleAbortRecorded: false
+    };
+  }
+
+  function hlsRecoveryTransactionIsCurrent(provider, transaction) {
+    return !!(
+      provider
+      && transaction
+      && !provider.destroyed
+      && (provider.hlsAppendEpoch || 0) === transaction.epoch
+      && provider.sb === transaction.videoSourceBuffer
+      && provider.audioSb === transaction.audioSourceBuffer
+      && provider.activeAudio === transaction.audioTrack
+      && provider.initSegment === transaction.videoInitSegment
+      && provider.audioInitSegment === transaction.audioInitSegment
+    );
+  }
+
+  function assertHlsRecoveryTransactionCurrent(provider, transaction) {
+    if (hlsRecoveryTransactionIsCurrent(provider, transaction)) return;
+    if (provider && transaction && !transaction.staleAbortRecorded) {
+      transaction.staleAbortRecorded = true;
+      provider.hlsStaleRecoveryAbortCount = (provider.hlsStaleRecoveryAbortCount || 0) + 1;
+    }
+    throw abortError();
+  }
+
+  function hlsRecoveryTransactionGuard(provider, transaction) {
+    return function () {
+      assertHlsRecoveryTransactionCurrent(provider, transaction);
+    };
+  }
+
+  function hlsMuxedAppendLedgerKey(seg) {
+    return (seg && seg._hlsTimestampGenerationKey || '') + '|' + segmentKey(seg || {});
+  }
+
+  function hlsMuxedAppendLedgerEntry(provider, transaction) {
+    provider.hlsMuxedAppendLedger = provider.hlsMuxedAppendLedger || {};
+    var key = hlsMuxedAppendLedgerKey(transaction.segment);
+    var entry = provider.hlsMuxedAppendLedger[key];
+    if (
+      !entry
+      || entry.videoSourceBuffer !== transaction.primarySourceBuffer
+      || entry.audioSourceBuffer !== transaction.audioSourceBuffer
+    ) {
+      entry = {
+        key: key,
+        segment: transaction.segment,
+        videoSourceBuffer: transaction.primarySourceBuffer,
+        audioSourceBuffer: transaction.audioSourceBuffer,
+        audioAppended: false,
+        videoAppended: false,
+        transaction: null,
+        partialCarryRecorded: false,
+        lastResumeEpoch: -1
+      };
+      provider.hlsMuxedAppendLedger[key] = entry;
+    } else {
+      entry.segment = transaction.segment;
+      if (entry.audioAppended && !sourceBufferCoversSegment(entry.audioSourceBuffer, transaction.segment)) {
+        entry.audioAppended = false;
+      }
+      if (entry.videoAppended && !sourceBufferCoversSegment(entry.videoSourceBuffer, transaction.segment)) {
+        entry.videoAppended = false;
+      }
+      if (
+        entry.audioAppended !== entry.videoAppended
+        && entry.lastResumeEpoch !== transaction.epoch
+      ) {
+        entry.lastResumeEpoch = transaction.epoch;
+        provider.hlsMuxedLedgerResumeCount = (provider.hlsMuxedLedgerResumeCount || 0) + 1;
+      }
+    }
+    entry.transaction = transaction;
+    transaction.ledgerKey = key;
+    return entry;
+  }
+
+  function createHlsAppendTransaction(provider, track, seg) {
+    var kind = track && track.kind === 'audio' ? 'audio' : 'video';
+    var sourceBufferField = kind === 'audio' ? 'audioSb' : 'sb';
+    var primarySourceBuffer = track && track.sb
+      ? track.sb
+      : (provider ? provider[sourceBufferField] : null);
+    var muxed = !!(
+      provider
+      && kind === 'video'
+      && provider.muxedTsAudio
+      && provider.audioSb
+    );
+    var transaction = {
+      epoch: provider && provider.hlsAppendEpoch || 0,
+      kind: kind,
+      track: track || null,
+      segment: seg || null,
+      sourceBufferField: sourceBufferField,
+      primarySourceBuffer: primarySourceBuffer || null,
+      audioSourceBuffer: muxed ? provider.audioSb : null,
+      muxed: muxed,
+      muxedAppendState: null,
+      staleAbortRecorded: false
+    };
+    if (muxed) transaction.muxedAppendState = hlsMuxedAppendLedgerEntry(provider, transaction);
+    return transaction;
+  }
+
+  function hlsAppendTransactionIsCurrent(provider, transaction) {
+    if (!provider || !transaction || provider.destroyed) return false;
+    if ((provider.hlsAppendEpoch || 0) !== transaction.epoch) return false;
+    var currentSourceBuffer = Object.prototype.hasOwnProperty.call(provider, transaction.sourceBufferField)
+      ? provider[transaction.sourceBufferField]
+      : transaction.track && transaction.track.sb;
+    if (currentSourceBuffer !== transaction.primarySourceBuffer) return false;
+    if (transaction.track && transaction.track.sb !== transaction.primarySourceBuffer) return false;
+    if (transaction.muxed && provider.audioSb !== transaction.audioSourceBuffer) return false;
+    return true;
+  }
+
+  function assertHlsAppendTransactionCurrent(provider, transaction) {
+    if (hlsAppendTransactionIsCurrent(provider, transaction)) return;
+    if (provider && transaction && !transaction.staleAbortRecorded) {
+      transaction.staleAbortRecorded = true;
+      provider.hlsStaleAppendAbortCount = (provider.hlsStaleAppendAbortCount || 0) + 1;
+    }
+    throw abortError();
+  }
+
+  function hlsAppendTransactionGuard(provider, transaction) {
+    return function () {
+      assertHlsAppendTransactionCurrent(provider, transaction);
+    };
+  }
+
+  function appendHlsMuxedTsOutputs(provider, videoTrack, seg, outputs, appendState, appendTransaction) {
+    appendTransaction = appendTransaction || appendState && appendState.transaction || null;
+    appendState = appendState || appendTransaction && appendTransaction.muxedAppendState || {
+      audioAppended: false,
+      videoAppended: false
+    };
+    appendState.outputs = outputs;
+    appendState.transaction = appendTransaction || appendState.transaction || null;
+    appendTransaction = appendState.transaction;
+    if (appendTransaction) {
+      assertHlsAppendTransactionCurrent(provider, appendTransaction);
+      appendTransaction.muxedAppendState = appendState;
+    }
+    var chain = Promise.resolve();
+    if (!appendState.audioAppended) {
+      chain = chain.then(function () {
+        if (appendTransaction) assertHlsAppendTransactionCurrent(provider, appendTransaction);
+        return provider._appendTransmuxedOutput(
+          appendTransaction ? appendTransaction.audioSourceBuffer : provider.audioSb,
+          outputs[1],
+          provider._muxedAudioTrack,
+          seg,
+          appendTransaction
+        );
+      }).then(function () {
+        appendState.audioAppended = true;
+        appendState.partialCarryRecorded = false;
+      });
+    }
+    if (!appendState.videoAppended) {
+      chain = chain.then(function () {
+        if (appendTransaction) assertHlsAppendTransactionCurrent(provider, appendTransaction);
+        return provider._appendTransmuxedOutput(
+          appendTransaction ? appendTransaction.primarySourceBuffer : videoTrack.sb,
+          outputs[0],
+          videoTrack,
+          seg,
+          appendTransaction
+        );
+      }).then(function () {
+        appendState.videoAppended = true;
+        appendState.partialCarryRecorded = false;
+      });
+    }
+    return chain.then(function () {
+      if (appendState.audioAppended && appendState.videoAppended) {
+        delete appendState.outputs;
+        appendState.transaction = null;
+        if (
+          appendState.key
+          && provider.hlsMuxedAppendLedger
+          && provider.hlsMuxedAppendLedger[appendState.key] === appendState
+        ) {
+          delete provider.hlsMuxedAppendLedger[appendState.key];
+        }
+        provider.hlsMuxedLedgerCompletionCount = (provider.hlsMuxedLedgerCompletionCount || 0) + 1;
+      }
+    }).catch(function (err) {
+      // Quota recovery resumes this exact transaction. Retaining the already
+      // generated fragments avoids a second demux/remux and, more importantly,
+      // prevents a completed audio append from being duplicated when only the
+      // video SourceBuffer ran out of space.
+      if (err && err.name === 'AbortError' && appendState.transaction === appendTransaction) {
+        delete appendState.outputs;
+        appendState.transaction = null;
+      }
+      try { err._hlsMuxedTsAppendState = appendState; } catch (e) {}
+      throw err;
+    });
+  }
+
   NativeHlsProvider.prototype._alignTsStartupTime = function () {
     if (!this.isTsPlaylist || this.startupBufferComplete || !this.video || !this.video.buffered.length) return;
     var start = this.video.buffered.start(0);
-    if (start > 0 && (this.video.currentTime || 0) < start - 0.05) {
-      assignInternalMediaTime(this, start);
+    if (start > 0 && (this.video.currentTime || 0) < start - TS_STARTUP_ALIGNMENT_MIN_GAP) {
+      // Seeking to the exact intersection boundary can leave Chromium at
+      // HAVE_METADATA even though MSE reports the range as buffered. This is
+      // especially reproducible when muxed TS audio starts after a B-frame
+      // video track. Land slightly inside the range so both decoders have a
+      // sample available and startup does not emit a false rebuffer.
+      var end = this.video.buffered.end(0);
+      var padding = Math.min(BUFFERED_SEEK_PADDING, Math.max(0, (end - start) / 4));
+      var target = Math.min(start + padding, Math.max(start, end - 0.001));
+      assignInternalMediaTime(this, target);
     }
   };
 
@@ -2335,8 +3832,9 @@
   };
 
   NativeHlsProvider.prototype._alignHlsBufferedTarget = function () {
-    if (!this.live || !this.video || !this.video.buffered || !this.video.buffered.length) return;
+    if (!this.video || !this.video.buffered || !this.video.buffered.length) return;
     var pendingSeek = this.seekBufferPending && isFinite(this.lastSeekTarget);
+    if (!this.live && !pendingSeek) return;
     var target = pendingSeek
       ? this._clampSeekTarget(this.lastSeekTarget)
       : (!this.startupBufferComplete && isFinite(this.startupLiveTarget) ? this._clampSeekTarget(this.startupLiveTarget) : NaN);
@@ -2392,46 +3890,182 @@
     });
   };
 
-  NativeHlsProvider.prototype._transmuxTsSegment = function (track, seg, data, contentType) {
+  NativeHlsProvider.prototype._transmuxTsSegment = function (track, seg, data, contentType, tsContext) {
     var adapter = contentType === 'audio' ? this.tsAudioTransmuxer : this.tsVideoTransmuxer;
     if (!adapter) return Promise.reject(new Error('hls-ts-transmuxer-unavailable'));
     var self = this;
+    tsContext = tsContext || prepareHlsTsTransmuxContext(this, track, seg, data);
     return adapter.transmux(data, {
       activeVariant: this.activeVariant,
       contentType: contentType,
+      demux: tsContext.demux,
       segment: seg,
+      timeline: tsContext.timeline,
       track: track
     }).then(function (output) {
       self.transmuxedSegmentCount++;
       if (contentType === 'audio') self.transmuxedAudioSegmentCount++;
       else self.transmuxedVideoSegmentCount++;
-      return normalizeTransmuxOutput(output);
+      output = normalizeTransmuxOutput(output);
+      self.hlsTsCompositionOffsetSampleCount = (self.hlsTsCompositionOffsetSampleCount || 0)
+        + (output.compositionOffsetSampleCount || 0);
+      self.hlsTsMaxCompositionOffsetMs = Math.max(
+        self.hlsTsMaxCompositionOffsetMs || 0,
+        output.maxCompositionOffsetMs || 0
+      );
+      return output;
     });
   };
 
-  NativeHlsProvider.prototype._recoverQuota = function (track, data, seg) {
+  NativeHlsProvider.prototype._recoverQuota = function (track, data, seg, appendError, appendTransaction) {
     var self = this;
+    var muxedAppendState = appendError && appendError._hlsMuxedTsAppendState;
+    appendTransaction = appendTransaction
+      || muxedAppendState && muxedAppendState.transaction
+      || createHlsAppendTransaction(this, track, seg);
     var removeEnd = Math.max(0, (this.video.currentTime || 0) - 5);
-    return Promise.all([
-      this.sb ? removeBufferBefore(this.sb, removeEnd) : Promise.resolve(),
-      this.audioSb ? removeBufferBefore(this.audioSb, removeEnd) : Promise.resolve()
-    ]).then(function () {
-      if (self.isTsPlaylist && track.kind === 'video') {
+    var transactionStart = seg && isFinite(seg.start) ? seg.start : (this.video.currentTime || 0);
+    var transactionEnd = seg && isFinite(seg.end) ? seg.end : (this.video.currentTime || 0);
+    var forwardWindowStart = (this.video.currentTime || 0) + 5;
+    var removeStart = Math.max(forwardWindowStart, transactionEnd + 0.05);
+
+    function transactionBuffers() {
+      var buffers = [appendTransaction.primarySourceBuffer];
+      if (appendTransaction.muxed && appendTransaction.audioSourceBuffer) {
+        buffers.push(appendTransaction.audioSourceBuffer);
+      } else if (self.audioSb && buffers.indexOf(self.audioSb) === -1) {
+        buffers.push(self.audioSb);
+      }
+      return buffers.filter(Boolean);
+    }
+
+    function reconcileEviction(sourceBuffer, removedRange) {
+      if (!removedRange) return;
+      var isPrimary = sourceBuffer === appendTransaction.primarySourceBuffer;
+      var kind = isPrimary ? appendTransaction.kind : 'audio';
+      var primaryRep = kind === 'audio' ? (isPrimary ? track : self.activeAudio) : self;
+      reconcileHlsSegmentLedgers(self, kind, removedRange, primaryRep, appendTransaction.segment, false);
+    }
+
+    function evictBehind() {
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
+      var guard = hlsAppendTransactionGuard(self, appendTransaction);
+      return Promise.all(transactionBuffers().map(function (sourceBuffer) {
+        return removeBufferBefore(sourceBuffer, removeEnd, guard).then(function (removedRange) {
+          reconcileEviction(sourceBuffer, removedRange);
+        });
+      })).then(function () {
+        assertHlsAppendTransactionCurrent(self, appendTransaction);
+      });
+    }
+
+    function evictForward() {
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
+      var guard = hlsAppendTransactionGuard(self, appendTransaction);
+      self.hlsQuotaForwardEvictionCount = (self.hlsQuotaForwardEvictionCount || 0) + 1;
+      return Promise.all(transactionBuffers().map(function (sourceBuffer) {
+        var removeBeforeTransaction = transactionStart > forwardWindowStart + 0.1
+          ? removeBufferRange(sourceBuffer, forwardWindowStart, transactionStart - 0.05, guard)
+          : Promise.resolve();
+        return removeBeforeTransaction.then(function (removedRange) {
+          reconcileEviction(sourceBuffer, removedRange);
+          return removeBufferAfter(sourceBuffer, removeStart, guard);
+        }).then(function (removedRange) {
+          reconcileEviction(sourceBuffer, removedRange);
+        });
+      })).then(function () {
+        assertHlsAppendTransactionCurrent(self, appendTransaction);
+      });
+    }
+
+    function resumeMuxedOutputs(outputs, state) {
+      state = state || {
+        audioAppended: false,
+        videoAppended: false,
+        transaction: appendTransaction
+      };
+      if (
+        state.audioAppended
+        && !sourceBufferCoversSegment(appendTransaction.audioSourceBuffer, seg || {})
+      ) state.audioAppended = false;
+      if (
+        state.videoAppended
+        && !sourceBufferCoversSegment(appendTransaction.primarySourceBuffer, seg || {})
+      ) state.videoAppended = false;
+      if (!state.audioAppended) {
+        self.hlsTsMuxedQuotaAudioResumeCount = (self.hlsTsMuxedQuotaAudioResumeCount || 0) + 1;
+      }
+      if (!state.videoAppended) {
+        self.hlsTsMuxedQuotaVideoResumeCount = (self.hlsTsMuxedQuotaVideoResumeCount || 0) + 1;
+      }
+      return appendHlsMuxedTsOutputs(self, track, seg || {}, outputs, state, appendTransaction);
+    }
+
+    function retryAppend(state) {
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
+      var container = seg && seg._hlsContainer ? seg._hlsContainer : detectHlsMediaContainer(data, seg);
+      if (container === 'mpegts' && track.kind === 'video' && self.muxedTsAudio && self.audioSb) {
+        self._muxedAudioTrack = self._muxedAudioTrack || { id: 'muxed-audio', kind: 'audio', sb: self.audioSb };
+        self._muxedAudioTrack.sb = self.audioSb;
+        self.hlsTsMuxedQuotaRetryCount = (self.hlsTsMuxedQuotaRetryCount || 0) + 1;
+        if (state && state.outputs) return resumeMuxedOutputs(state.outputs, state);
+        var sharedTsContext = prepareHlsTsTransmuxContext(self, track, seg || {}, data);
+        self.hlsTsSharedDemuxCount = (self.hlsTsSharedDemuxCount || 0) + 1;
+        return Promise.all([
+          self._transmuxTsSegment(track, seg || {}, data, 'video', sharedTsContext),
+          self._prepareDiscontinuityAppend(self._muxedAudioTrack, seg || {}).then(function () {
+            return self._transmuxTsSegment(track, seg || {}, data, 'audio', sharedTsContext);
+          })
+        ]).then(function (outputs) {
+          assertHlsAppendTransactionCurrent(self, appendTransaction);
+          return resumeMuxedOutputs(outputs, null);
+        });
+      }
+      if (container === 'mpegts' && track.kind === 'video') {
         return self._transmuxTsSegment(track, seg || {}, data, 'video').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output, track, seg || {});
+          return self._appendTransmuxedOutput(
+            appendTransaction.primarySourceBuffer,
+            output,
+            track,
+            seg || {},
+            appendTransaction
+          );
         });
       }
-      if (track.kind === 'audio' && track.isTsPlaylist) {
+      if (container === 'mpegts' && track.kind === 'audio') {
         return self._transmuxTsSegment(track, seg || {}, data, 'audio').then(function (output) {
-          return self._appendTransmuxedOutput(track.sb, output, track, seg || {});
+          return self._appendTransmuxedOutput(
+            appendTransaction.primarySourceBuffer,
+            output,
+            track,
+            seg || {},
+            appendTransaction
+          );
         });
       }
-      return appendBuffer(track.sb, data);
+      return appendBuffer(
+        appendTransaction.primarySourceBuffer,
+        data,
+        null,
+        hlsFmp4TimestampOffset(self, track, seg || {}, data),
+        hlsAppendTransactionGuard(self, appendTransaction)
+      );
+    }
+
+    return evictBehind().then(function () {
+      return retryAppend(muxedAppendState);
+    }).catch(function (err) {
+      if (!isQuotaExceeded(err)) throw err;
+      muxedAppendState = err && err._hlsMuxedTsAppendState || muxedAppendState;
+      return evictForward().then(function () {
+        return retryAppend(muxedAppendState);
+      });
     }).catch(function (err) {
       if (!isQuotaExceeded(err) || track.kind !== 'video') throw err;
+      assertHlsAppendTransactionCurrent(self, appendTransaction);
       var lower = self._lowerVariant();
       if (!lower) throw err;
-      if (self.activeVariant) self.blacklisted[self.activeVariant.id] = true;
+      self.hlsQuotaDownswitchCount = (self.hlsQuotaDownswitchCount || 0) + 1;
       self._switchVariant(lower, true, 'quota-recovery');
       throw abortError();
     });
@@ -2469,7 +4103,11 @@
   };
 
   NativeHlsProvider.prototype._tryNativeRecovery = function (reason) {
-    if (this.destroyed || this.nativeRecoveryInProgress) return Promise.resolve(false);
+    if (this.destroyed || this.nativeRecoveryInProgress || this.trackTransitionInFlight) return Promise.resolve(false);
+    reason = reason || 'native-recovery';
+    var recoveryEpoch = invalidateHlsAppendTransactions(this, reason);
+    var transaction = createHlsRecoveryTransaction(this, recoveryEpoch, reason);
+    var guard = hlsRecoveryTransactionGuard(this, transaction);
     this.nativeRecoveryInProgress = true;
     this.nativeRecoveryAttemptCount++;
     this.recoveryCount++;
@@ -2481,33 +4119,66 @@
     var self = this;
     var currentTime = this.video.currentTime || 0;
     try { this._abortRequests(); } catch (e) {}
-    markSegmentsForTime(this, currentTime, Math.max(2, this._bufferAheadGoal()));
-    if (this.activeAudio) markSegmentsForTime(this.activeAudio, currentTime, Math.max(2, this._bufferAheadGoal()));
+    guard();
     var chain = Promise.all([
-      this.sb ? resetSourceBuffer(this.sb, currentTime) : Promise.resolve(),
-      this.audioSb ? resetSourceBuffer(this.audioSb, currentTime) : Promise.resolve()
-    ]).then(function () {
+      transaction.videoSourceBuffer ? resetSourceBuffer(transaction.videoSourceBuffer, currentTime, guard) : Promise.resolve(),
+      transaction.audioSourceBuffer ? resetSourceBuffer(transaction.audioSourceBuffer, currentTime, guard) : Promise.resolve()
+    ]).then(function (removedRanges) {
+      guard();
+      reconcileHlsSegmentLedgers(self, 'video', removedRanges[0], transaction.videoTrack, null, false);
+      reconcileHlsSegmentLedgers(self, 'audio', removedRanges[1], transaction.audioTrack, null, false);
+      markSegmentsForTime(transaction.videoTrack, currentTime, Math.max(2, self._bufferAheadGoal()));
+      if (transaction.audioTrack) markSegmentsForTime(transaction.audioTrack, currentTime, Math.max(2, self._bufferAheadGoal()));
       var initChain = Promise.resolve();
-      if (self.initSegment && self.sb) {
+      if (transaction.videoInitSegment && transaction.videoSourceBuffer) {
         initChain = initChain.then(function () {
-          return self._fetchRange(self.initSegment.url, self.initSegment.range, { phase: 'metadata' }).then(function (initData) {
-            return appendBuffer(self.sb, initData).then(function () {
-              self._appendedVideoInitKey = hlsInitSegmentKey(self.initSegment);
+          guard();
+          return self._fetchRange(transaction.videoInitSegment.url, transaction.videoInitSegment.range, { phase: 'metadata' }).then(function (initData) {
+            guard();
+            var generationKey = hlsTrackInitialTimestampGenerationKey(self, transaction.videoTrack);
+            return appendHlsInitBuffer(
+              self,
+              transaction.videoTrack,
+              transaction.videoSourceBuffer,
+              transaction.videoInitSegment,
+              initData,
+              generationKey,
+              guard
+            ).then(function () {
+              guard();
+              self._appendedVideoInitKey = hlsInitSegmentKey(transaction.videoInitSegment);
+              self._appendedVideoInitGenerationKey = generationKey;
+              self._sourceBufferVideoInitSegment = transaction.videoInitSegment;
             });
           });
         });
       }
-      if (self.audioInitSegment && self.audioSb) {
+      if (transaction.audioInitSegment && transaction.audioSourceBuffer) {
         initChain = initChain.then(function () {
-          return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
-            return appendBuffer(self.audioSb, initData).then(function () {
-              self._appendedAudioInitKey = hlsInitSegmentKey(self.audioInitSegment);
+          guard();
+          return self._fetchRange(transaction.audioInitSegment.url, transaction.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
+            guard();
+            var generationKey = hlsTrackInitialTimestampGenerationKey(self, transaction.audioTrack);
+            return appendHlsInitBuffer(
+              self,
+              transaction.audioTrack,
+              transaction.audioSourceBuffer,
+              transaction.audioInitSegment,
+              initData,
+              generationKey,
+              guard
+            ).then(function () {
+              guard();
+              self._appendedAudioInitKey = hlsInitSegmentKey(transaction.audioInitSegment);
+              self._appendedAudioInitGenerationKey = generationKey;
+              self._sourceBufferAudioInitSegment = transaction.audioInitSegment;
             });
           });
         });
       }
       return initChain;
     }).then(function () {
+      guard();
       self.nativeRecoverySuccessCount++;
       self.appendFailures = 0;
       self.stallReports = 0;
@@ -2516,69 +4187,337 @@
       return true;
     }).catch(function (err) {
       self.nativeRecoveryInProgress = false;
+      if (!hlsRecoveryTransactionIsCurrent(self, transaction) || err && err.name === 'AbortError') {
+        if (!transaction.staleAbortRecorded) {
+          transaction.staleAbortRecorded = true;
+          self.hlsStaleRecoveryAbortCount = (self.hlsStaleRecoveryAbortCount || 0) + 1;
+        }
+        if (self.nativeRecoveryReasons) delete self.nativeRecoveryReasons[reason];
+        return false;
+      }
       self.lastError = err && err.message ? err.message : reason + '-failed';
       return false;
     });
     return chain;
   };
 
-  NativeHlsProvider.prototype._recoverMediaRequest = function (err) {
+  NativeHlsProvider.prototype._recoverMediaRequest = function (err, track) {
     var reason = err && err.message ? err.message : 'hls-media-request-failed';
+    var trackKind = track && track.kind === 'audio' ? 'audio' : 'video';
     this.mediaUrlRefreshCount++;
     this.recoveryCount++;
     this.lastError = reason;
     if (err && err.status) this.lastHttpStatus = err.status;
-    return this._refreshMediaPlaylist('media-error');
+    var self = this;
+    function refresh(retriedStale) {
+      return self._refreshMediaPlaylist('media-error', trackKind).then(function (outcome) {
+        var trackOutcome = outcome && outcome[trackKind];
+        if (trackOutcome && trackOutcome.stale) {
+          if (!retriedStale) return refresh(true);
+          throw new Error('hls-' + trackKind + '-media-refresh-stale');
+        }
+        return outcome;
+      });
+    }
+    return refresh(false);
   };
 
-  NativeHlsProvider.prototype._fetchReloadPlaylist = function (url, track, useDeliveryDirectives) {
+  NativeHlsProvider.prototype._fetchReloadPlaylist = function (url, track, useDeliveryDirectives, timeoutMs, signal) {
     var self = this;
     var requestUrl = useDeliveryDirectives ? hlsBlockingReloadUrl(url, track) : url;
-    if (requestUrl === url) return this._fetchPlaylistText(url);
+    var requestOptions = timeoutMs || signal ? { timeoutMs: timeoutMs, signal: signal } : undefined;
+    if (requestUrl === url) return this._fetchPlaylistText(url, requestOptions);
     this.blockingReloadRequestCount++;
-    return this._fetchPlaylistText(requestUrl).then(function (text) {
+    return this._fetchPlaylistText(requestUrl, requestOptions).then(function (text) {
       self.blockingReloadResponseCount++;
       return text;
     }).catch(function (err) {
-      if (self.destroyed || (err && err.name === 'AbortError')) throw err;
+      if (self.destroyed || (err && (err.name === 'AbortError' || err.name === 'TimeoutError'))) throw err;
       // A CDN can strip or reject delivery directives even when the origin
       // advertised them. Recover with an ordinary reload in the same cycle.
       self.blockingReloadFallbackCount++;
-      return self._fetchPlaylistText(url);
+      return self._fetchPlaylistText(url, requestOptions);
     });
   };
 
-  NativeHlsProvider.prototype._refreshMediaPlaylist = function (reason) {
+  NativeHlsProvider.prototype._refreshMediaPlaylist = function (reason, recoveryTrackKind) {
     var self = this;
     if (!this.activeVariant || !this.activeVariant.url) return Promise.reject(new Error('hls-refresh-unavailable'));
-    return this._refreshContentSteering('refresh').then(function () {
-      self._applyContentSteeringToActiveVariant();
+    var refreshKey = this.activeVariant.url + '|' + (this.activeAudio && this.activeAudio.url ? this.activeAudio.url : '');
+    if (this.playlistRefreshPromise && this.playlistRefreshKey === refreshKey) {
+      // A refresh that began before a media failure cannot prove that it
+      // contains replacement URLs for that failure. Let it settle, then issue
+      // a causally newer media-error refresh. Concurrent media failures may
+      // still share the same media-error refresh.
+      if (reason === 'media-error' && this.playlistRefreshReasonInFlight !== 'media-error') {
+        return this.playlistRefreshPromise.catch(function () {}).then(function () {
+          return NativeHlsProvider.prototype._refreshMediaPlaylist.call(self, reason, recoveryTrackKind);
+        });
+      }
+      return this.playlistRefreshPromise;
+    }
+    var refreshGeneration = (this.playlistRefreshGeneration || 0) + 1;
+    this.playlistRefreshGeneration = refreshGeneration;
+    var steeringTransaction = null;
+    var owningTransition = this.trackTransitionInFlight;
+    var transitionSignal = owningTransition && owningTransition.controller ? owningTransition.controller.signal : undefined;
+    var refreshPromise = this._refreshContentSteering('refresh', transitionSignal).then(function () {
+      steeringTransaction = self._applyContentSteeringToActiveVariant();
       var selectedVariant = self.activeVariant;
       var selectedAudio = self.activeAudio;
+      var selectedTrackGeneration = self.trackTransitionGeneration || 0;
+      var refreshSnapshot = captureHlsTrackTransitionState(self);
+      refreshKey = selectedVariant.url + '|' + (selectedAudio && selectedAudio.url ? selectedAudio.url : '');
+      self.playlistRefreshKey = refreshKey;
       var beforeVideo = hlsDeliveryCursor(self);
       var beforeAudio = hlsDeliveryCursor(selectedAudio);
       var blockingRefresh = self.live && (reason === 'live' || reason === 'live-low-buffer');
-      var videoPlaylist = self._fetchReloadPlaylist(selectedVariant.url, self, blockingRefresh);
+      var refreshTimeoutMs = Math.max(1500, Math.min(10000, (self.targetDuration || 2) * 2000));
+      var videoPlaylist = self._fetchReloadPlaylist(selectedVariant.url, self, blockingRefresh, refreshTimeoutMs, transitionSignal);
       var audioPlaylist = selectedAudio && selectedAudio.url
-        ? self._fetchReloadPlaylist(selectedAudio.url, selectedAudio, blockingRefresh)
+        ? self._fetchReloadPlaylist(selectedAudio.url, selectedAudio, blockingRefresh, refreshTimeoutMs, transitionSignal)
         : Promise.resolve(null);
-      return Promise.all([videoPlaylist, audioPlaylist]).then(function (playlists) {
-        return Promise.resolve(self._loadMediaPlaylist(playlists[0], selectedVariant.url)).then(function () {
-          if (playlists[1] == null) return;
-          return self._loadAudioPlaylist(playlists[1], selectedAudio.url);
-        }).then(function () {
-          self.lastPlaylistRefreshAdvanced = hlsCursorAdvanced(beforeVideo, hlsDeliveryCursor(self));
-          self.lastAudioPlaylistRefreshAdvanced = hlsCursorAdvanced(beforeAudio, hlsDeliveryCursor(selectedAudio));
+      var videoFetch = settleHlsPlaylistFetch(videoPlaylist, 'video', refreshTimeoutMs);
+      var audioFetch = selectedAudio && selectedAudio.url
+        ? settleHlsPlaylistFetch(audioPlaylist, 'audio', refreshTimeoutMs)
+        : Promise.resolve(null);
+      return Promise.all([videoFetch, audioFetch]).then(function (fetches) {
+        if (
+          refreshGeneration !== self.playlistRefreshGeneration
+          || selectedVariant !== self.activeVariant
+          || selectedAudio !== self.activeAudio
+        ) {
+          self.staleManifestResponseCount = (self.staleManifestResponseCount || 0) + (selectedAudio ? 2 : 1);
+          return {
+            stale: true,
+            outcomes: [
+              hlsTrackRefreshOutcome('video', false, true, false, false),
+              selectedAudio ? hlsTrackRefreshOutcome('audio', false, true, false, false) : null
+            ]
+          };
+        }
+        var draftInfo = createHlsPlaylistRefreshDraft(self, selectedVariant, selectedAudio);
+        var draft = draftInfo.provider;
+        var preparedPlaylists = { video: null, audio: null };
+        self.playlistManifestStageCount = (self.playlistManifestStageCount || 0) + 1;
+        var stagedVideo = fetches[0] && fetches[0].failed
+          ? Promise.resolve(fetches[0])
+          : settleHlsPlaylistApplication('video', function () {
+            preparedPlaylists.video = parseHlsPlaylist(fetches[0].text, selectedVariant.url);
+            return draft._loadMediaPlaylist(
+              fetches[0].text,
+              selectedVariant.url,
+              selectedVariant,
+              cloneHlsRefreshValue(preparedPlaylists.video, [], [])
+            );
+          });
+        var stagedAudio = !selectedAudio
+          ? Promise.resolve(null)
+          : fetches[1] && fetches[1].failed
+            ? Promise.resolve(fetches[1])
+            : settleHlsPlaylistApplication('audio', function () {
+              preparedPlaylists.audio = parseHlsPlaylist(fetches[1].text, selectedAudio.url);
+              return draft._loadAudioPlaylist(
+                fetches[1].text,
+                selectedAudio.url,
+                draftInfo.audio,
+                cloneHlsRefreshValue(preparedPlaylists.audio, [], [])
+              );
+            });
+        return Promise.all([stagedVideo, stagedAudio]).then(function (outcomes) {
+          return {
+            draftInfo: draftInfo,
+            fetches: fetches,
+            preparedPlaylists: preparedPlaylists,
+            outcomes: outcomes
+          };
+        });
+      }).then(function (staged) {
+        var videoOutcome = staged.outcomes[0] || hlsTrackRefreshOutcome('video', false, false, false, false);
+        var audioOutcome = staged.outcomes[1];
+        if (staged.stale) {
+          return {
+            applied: false,
+            stale: true,
+            partial: false,
+            reason: reason || 'manual',
+            video: videoOutcome,
+            audio: audioOutcome
+          };
+        }
+        var draft = staged.draftInfo.provider;
+        var requiredAudio = !!(selectedAudio && selectedAudio.url);
+        var anyEpochReset = !!(videoOutcome.epochReset || audioOutcome && audioOutcome.epochReset);
+        var bothTracksReady = !!(
+          videoOutcome.applied && !videoOutcome.stale && !videoOutcome.failed
+          && (!requiredAudio || audioOutcome && audioOutcome.applied && !audioOutcome.stale && !audioOutcome.failed)
+        );
+        var alignedEpochTracks = !requiredAudio || hlsEpochTrackWindowsCompatible(draft, draft.activeAudio);
+        if (anyEpochReset && requiredAudio && (!bothTracksReady || !alignedEpochTracks)) {
+          var attemptedCursors = clonePlain(draft.playlistCursorByUrl || {});
+          var attemptedCandidates = clonePlain(draft.playlistResetCandidateByUrl || {});
+          var retainedCandidates = clonePlain(self.playlistResetCandidateByUrl || {});
+          for (var candidateUrl in attemptedCandidates) {
+            if (Object.prototype.hasOwnProperty.call(attemptedCandidates, candidateUrl)) {
+              retainedCandidates[candidateUrl] = attemptedCandidates[candidateUrl];
+            }
+          }
+          if (videoOutcome.epochReset && attemptedCursors[selectedVariant.url]) {
+            retainedCandidates[selectedVariant.url] = { cursor: attemptedCursors[selectedVariant.url] };
+          }
+          if (audioOutcome && audioOutcome.epochReset && attemptedCursors[selectedAudio.url]) {
+            retainedCandidates[selectedAudio.url] = { cursor: attemptedCursors[selectedAudio.url] };
+          }
+          self.playlistResetCandidateByUrl = retainedCandidates;
+          self.playlistManifestDiscardCount = (self.playlistManifestDiscardCount || 0) + 1;
+          self.playlistEpochHoldCount = (self.playlistEpochHoldCount || 0) + 1;
+          self.lastPlaylistEpochHoldReason = !bothTracksReady
+            ? 'required-track-not-ready'
+            : 'required-track-timeline-mismatch';
+          videoOutcome.applied = false;
+          videoOutcome.stale = true;
+          videoOutcome.advanced = false;
+          videoOutcome.epochHeld = true;
+          if (audioOutcome) {
+            audioOutcome.applied = false;
+            audioOutcome.stale = true;
+            audioOutcome.advanced = false;
+            audioOutcome.epochHeld = true;
+          }
+          self.lastPlaylistRefreshAdvanced = false;
+          self.lastAudioPlaylistRefreshAdvanced = false;
+          var heldOutcome = {
+            applied: false,
+            stale: true,
+            partial: false,
+            epochHeld: true,
+            reason: reason || 'manual',
+            video: videoOutcome,
+            audio: audioOutcome
+          };
+          if (self.trackTransitionInFlight) {
+            var heldError = new Error('hls-epoch-refresh-held');
+            heldError.hlsEpochHeldOutcome = heldOutcome;
+            throw heldError;
+          }
+          return heldOutcome;
+        }
+        var requiredAudioFailed = !!(audioOutcome && audioOutcome.failed && (
+          reason === 'variant-switch'
+          || reason === 'audio-switch'
+          || (reason === 'media-error' && recoveryTrackKind === 'audio')
+        ));
+        if (videoOutcome.failed || requiredAudioFailed) {
+          throw (videoOutcome.failed ? videoOutcome.error : audioOutcome.error);
+        }
+        self.playlistManifestCommitInProgress = true;
+        var committedVideo = settleHlsPlaylistApplication('video', function () {
+          return self._loadMediaPlaylist(
+            staged.fetches[0].text,
+            selectedVariant.url,
+            selectedVariant,
+            staged.preparedPlaylists.video
+          );
+        });
+        var committedAudio = !selectedAudio || staged.fetches[1] && staged.fetches[1].failed
+          ? Promise.resolve(audioOutcome)
+          : settleHlsPlaylistApplication('audio', function () {
+            return self._loadAudioPlaylist(
+              staged.fetches[1].text,
+              selectedAudio.url,
+              selectedAudio,
+              staged.preparedPlaylists.audio
+            );
+          });
+        return Promise.all([committedVideo, committedAudio]).then(function (committedOutcomes) {
+          videoOutcome = committedOutcomes[0] || videoOutcome;
+          audioOutcome = committedOutcomes[1];
+          var committedRequiredAudioFailed = !!(audioOutcome && audioOutcome.failed && (
+            reason === 'variant-switch'
+            || reason === 'audio-switch'
+            || (reason === 'media-error' && recoveryTrackKind === 'audio')
+          ));
+          if (videoOutcome.failed || committedRequiredAudioFailed) {
+            restoreHlsTrackTransitionState(self, refreshSnapshot);
+            throw (videoOutcome.failed ? videoOutcome.error : audioOutcome.error);
+          }
+          self.lastPlaylistEpochHoldReason = '';
+          self.lastPlaylistRefreshAdvanced = videoOutcome.advanced || hlsCursorAdvanced(beforeVideo, hlsDeliveryCursor(self));
+          self.lastAudioPlaylistRefreshAdvanced = !!(audioOutcome && (audioOutcome.advanced || hlsCursorAdvanced(beforeAudio, hlsDeliveryCursor(selectedAudio))));
+          var outcome = {
+            applied: !!(videoOutcome.applied || audioOutcome && audioOutcome.applied),
+            stale: !!(videoOutcome.stale || audioOutcome && audioOutcome.stale),
+            partial: !!(audioOutcome && audioOutcome.failed),
+            reason: reason || 'manual',
+            video: videoOutcome,
+            audio: audioOutcome
+          };
+          var reconcile = self._reconcileTrackLifecycle
+            ? self._reconcileTrackLifecycle(selectedTrackGeneration)
+            : Promise.resolve();
+          return reconcile.then(function () {
+            self.playlistManifestCommitGeneration = (self.playlistManifestCommitGeneration || 0) + 1;
+            self.playlistManifestCommitCount = (self.playlistManifestCommitCount || 0) + 1;
+            self.playlistManifestCommitInProgress = false;
+            if (self._tick) self._tick(true);
+            if (steeringTransaction && self._isTrackTransitionCurrent(steeringTransaction)) {
+              self._finishTrackTransition(steeringTransaction, true);
+              self.contentSteeringSwitchCount++;
+              self.engine._player.emit('variantchanged');
+            }
+            return outcome;
+          }, function (err) {
+            self.playlistManifestCommitInProgress = false;
+            throw err;
+          });
         });
       });
     });
+    refreshPromise = refreshPromise.catch(function (err) {
+      self.playlistManifestCommitInProgress = false;
+      if (!steeringTransaction || !self._ownsTrackTransition(steeringTransaction)) throw err;
+      return self._rollbackTrackTransition(steeringTransaction).then(function () {
+        self._finishTrackTransition(steeringTransaction, false);
+        if (err && err.hlsEpochHeldOutcome) return err.hlsEpochHeldOutcome;
+        throw err;
+      }, function (rollbackErr) {
+        self._finishTrackTransition(steeringTransaction, false);
+        throw rollbackErr;
+      });
+    });
+    var trackedPromise = refreshPromise.then(function (value) {
+      if (self.playlistRefreshPromise === trackedPromise) {
+        self.playlistRefreshPromise = null;
+        self.playlistRefreshKey = '';
+        self.playlistRefreshReasonInFlight = '';
+      }
+      return value;
+    }, function (err) {
+      if (self.playlistRefreshPromise === trackedPromise) {
+        self.playlistRefreshPromise = null;
+        self.playlistRefreshKey = '';
+        self.playlistRefreshReasonInFlight = '';
+      }
+      throw err;
+    });
+    this.playlistRefreshKey = refreshKey;
+    this.playlistRefreshReasonInFlight = reason || 'manual';
+    this.playlistRefreshPromise = trackedPromise;
+    return trackedPromise;
   };
 
   NativeHlsProvider.prototype._maybeRefreshLiveLowBuffer = function (ahead) {
     // The scheduled refresh owns manifest updates until startup buffering is ready.
     // Refreshing here during the initial tick can immediately consume TTL=0 content
     // steering responses and replace the selected startup pathway before it is used.
-    if (!this.startupBufferComplete || !this.live || !this.liveWindow || this.destroyed || this.liveRefreshInFlight) return;
+    if (
+      !this.startupBufferComplete
+      || !this.live
+      || !this.liveWindow
+      || this.destroyed
+      || this.liveRefreshInFlight
+      || this.playlistRefreshPromise
+    ) return;
     var currentTime = this.video.currentTime || 0;
     var nearEdge = this.liveWindow.end - currentTime <= Math.max(MIN_BUFFER_AHEAD, this._targetLiveLatency() + 2);
     if (!nearEdge || ahead >= MIN_BUFFER_AHEAD) return;
@@ -2589,9 +4528,12 @@
     this.lastLiveRefreshStartedAt = now;
     this.liveLowBufferRefreshCount++;
     var self = this;
-    this._refreshMediaPlaylist('live-low-buffer').then(function () {
+    this._refreshMediaPlaylist('live-low-buffer').then(function (outcome) {
       self._evictExpiredLiveSegmentState();
-      self.playlistRefreshFailed = false;
+      self.playlistRefreshFailed = !!(outcome && outcome.partial);
+      if (outcome && outcome.partial && outcome.audio && outcome.audio.error) {
+        self.lastError = outcome.audio.error.message || 'hls-audio-playlist-refresh-failed';
+      }
       self.liveRefreshInFlight = false;
       self._tick(true);
     }).catch(function (err) {
@@ -2616,9 +4558,12 @@
       }
       self.liveRefreshInFlight = true;
       self.lastLiveRefreshStartedAt = performance.now();
-      self._refreshMediaPlaylist('live').then(function () {
+      self._refreshMediaPlaylist('live').then(function (outcome) {
         self._evictExpiredLiveSegmentState();
-        self.playlistRefreshFailed = false;
+        self.playlistRefreshFailed = !!(outcome && outcome.partial);
+        if (outcome && outcome.partial && outcome.audio && outcome.audio.error) {
+          self.lastError = outcome.audio.error.message || 'hls-audio-playlist-refresh-failed';
+        }
         self.liveRefreshInFlight = false;
         self._tick(true);
         self._schedulePlaylistRefresh();
@@ -2665,8 +4610,8 @@
   };
 
   NativeHlsProvider.prototype._trim = function () {
-    if (!this.sb) return;
-    trimBuffer(this.sb, Math.max(0, (this.video.currentTime || 0) - this._bufferBehindGoal()));
+    if (!this.sb && !this.audioSb) return;
+    if (this.sb) trimBuffer(this.sb, Math.max(0, (this.video.currentTime || 0) - this._bufferBehindGoal()));
     if (this.audioSb) trimBuffer(this.audioSb, Math.max(0, (this.video.currentTime || 0) - this._bufferBehindGoal()));
   };
 
@@ -2675,22 +4620,23 @@
     // Encoded segment boundaries commonly land a few microseconds before their
     // declared EXTINF duration. Treat a 50ms margin as satisfying the goal so
     // startup does not remain pinned to the first live segment forever.
-    var ready = getBufferAhead(this.video) + 0.05 >= Math.min(goal, this._bufferAheadGoal());
+    var bufferedAhead = this.seekBufferPending
+      ? getBufferAheadAt(this.video, this.lastSeekTarget, 0.05)
+      : getBufferAhead(this.video);
+    var ready = bufferedAhead + 0.05 >= startupBufferRequirement(this, goal);
     if (ready && !this.startupBufferComplete) {
-      this.startupBufferComplete = true;
-      this.startupBufferMs = this.startupBufferStartedAt ? performance.now() - this.startupBufferStartedAt : 0;
-      if (this.engine && this.engine._telemetry) this.engine._telemetry.record('startup-buffer-ready', { startupBufferMs: this.startupBufferMs });
+      markStartupBufferReady(this);
     }
     if (ready && this.seekBufferPending) {
-      this.seekBufferPending = false;
-      this.seekBufferReadyCount++;
-      if (this.engine && this.engine._telemetry) this.engine._telemetry.record('seek-buffer-ready');
+      completeSeekBuffer(this, this.activeSeekGeneration, false);
     }
   };
 
   NativeHlsProvider.prototype._abortRequests = function () {
-    var cancelled = this.controllers.length + countKeys(this.activeRanges);
+    var cancelled = this.controllers.length + countKeys(this.activeRanges)
+      + (this._videoTrack && (this._videoTrack._appendOwner || this._videoTrack._appending) ? 1 : 0);
     resetActiveSegmentRequests(this);
+    if (this._videoTrack) resetActiveSegmentRequests(this._videoTrack);
     if (this.activeAudio) resetActiveSegmentRequests(this.activeAudio);
     this.activeRanges = {};
     this._appending = false;
@@ -2764,7 +4710,7 @@
   };
 
   NativeHlsProvider.prototype.getLiveRange = function () {
-    return this.liveWindow ? { start: this.liveWindow.start, end: this.liveWindow.end } : null;
+    return this.live && this.liveWindow ? { start: this.liveWindow.start, end: this.liveWindow.end } : null;
   };
 
   NativeHlsProvider.prototype.seekRange = function () {
@@ -2791,79 +4737,75 @@
 
   NativeHlsProvider.prototype.beginSeek = function (targetTime) {
     var target = this._clampSeekTarget(targetTime);
-    this.lastSeekTarget = target;
-    this.lastSeekStartedAt = performance.now();
-    this.seekBufferPending = true;
-    if (this.engine && this.engine._setState) this.engine._setState('seeking');
-    return target;
+    return beginSeekOperation(this, target).target;
   };
 
   NativeHlsProvider.prototype.commitSeek = function (targetTime) {
     var target = this._clampSeekTarget(targetTime);
-    if (!this.seekBufferPending
-      || !this.lastSeekStartedAt
-      || Math.abs(target - this.lastSeekTarget) > 0.05) {
-      this.beginSeek(target);
-    }
+    if (!seekOperationMatches(this, target)) this.beginSeek(target);
+    var generation = this.activeSeekGeneration;
     this.seekCount++;
     try { this.video.currentTime = target; } catch (e) {}
-    this._onSeek(target);
+    this._onSeek(target, generation);
     return target;
   };
 
   NativeHlsProvider.prototype.cancelSeek = function () {
     this.seekCancelCount++;
-    this.seekBufferPending = false;
-    this.lastSeekStartedAt = 0;
-    if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
+    cancelSeekOperation(this);
   };
 
-  NativeHlsProvider.prototype.endSeek = function () {
-    if (this.lastSeekStartedAt) this.lastSeekMs = performance.now() - this.lastSeekStartedAt;
-    this.lastSeekStartedAt = 0;
-    this.seekBufferPending = false;
-    if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
+  NativeHlsProvider.prototype.endSeek = function (generation) {
+    return finishSeekInteraction(this, generation);
+  };
+
+  NativeHlsProvider.prototype._completeSeekBuffer = function (generation, buffered) {
+    return completeSeekBuffer(this, generation, buffered);
   };
 
   NativeHlsProvider.prototype.seekDuringRecovery = function (targetTime) {
     this.commitSeek(targetTime);
   };
 
-  NativeHlsProvider.prototype._onSeek = function (targetTime) {
+  NativeHlsProvider.prototype._onSeek = function (targetTime, generation) {
     if (this.destroyed) return;
     var target = this._clampSeekTarget(targetTime == null ? this.video.currentTime : targetTime);
+    if (
+      !(generation > 0)
+      || generation !== this.activeSeekGeneration
+      || Math.abs(target - this.lastSeekTarget) > 0.05
+    ) {
+      generation = beginSeekOperation(this, target).generation;
+    }
     var now = performance.now();
-    if (this._lastSeekHandledTarget !== null && Math.abs(target - this._lastSeekHandledTarget) <= 0.05 && now - this._lastSeekHandledAt < 100) return;
+    if (
+      this._lastSeekHandledGeneration === generation
+      && this._lastSeekHandledTarget !== null
+      && Math.abs(target - this._lastSeekHandledTarget) <= 0.05
+      && now - this._lastSeekHandledAt < 100
+    ) return;
     this._lastSeekHandledTarget = target;
     this._lastSeekHandledAt = now;
+    this._lastSeekHandledGeneration = generation;
     if (Math.abs(target - (this.video.currentTime || 0)) > 0.05) {
       try { this.video.currentTime = target; } catch (e) {}
     }
     this.lastSeekTarget = target;
-    this.seekBufferPending = true;
-    if (this.engine && this.engine._setState) this.engine._setState('seeking');
     if (bufferedContains(this.video.buffered, target)) {
-      this.seekBufferPending = false;
-      this.seekBufferReadyCount++;
-      this.bufferedSeekCount++;
-      if (this.engine && this.engine._telemetry) {
-        this.engine._telemetry.record('seek-buffer-ready', { buffered: true });
-      }
+      completeSeekBuffer(this, generation, true);
       return;
     }
+    invalidateHlsAppendTransactions(this, 'seek');
     // A seek may arrive immediately after the first frame while an automatic
     // rendition switch is fetching its playlist/init segment. Let that
     // metadata transition finish; the post-switch scheduler will use
     // lastSeekTarget and request only the sought media.
     var cancelled = this.variantSwitchInFlight ? 0 : this._abortRequests();
     if (cancelled > 0) this.seekAbortCount += cancelled;
-    markSegmentsForTime(this, target, Math.max(2, this._seekBufferGoal()));
-    if (this.activeAudio) markSegmentsForTime(this.activeAudio, target, Math.max(2, this._seekBufferGoal()));
+    prepareVodStreamRefill(this);
+    prepareSegmentsForRefill(this, this.sb || this.video, target, Math.max(2, this._seekBufferGoal()));
+    if (this.activeAudio) prepareSegmentsForRefill(this.activeAudio, this.audioSb || this.video, target, Math.max(2, this._seekBufferGoal()));
     this._tick(true);
-    var self = this;
-    setTimeout(function () {
-      if (!self.destroyed && !self.engine._serverDown) self.engine._setState('ready');
-    }, 250);
   };
 
   NativeHlsProvider.prototype._jumpSmallGap = function () {
@@ -2882,7 +4824,13 @@
     }
   };
 
+  NativeHlsProvider.prototype._jumpManifestGap = function () {
+    return jumpDeclaredManifestGap(this, 'hls');
+  };
+
   NativeHlsProvider.prototype.reportStall = function () {
+    if (this._jumpManifestGap && this._jumpManifestGap()) return;
+    var reopeningEndedVod = prepareVodStreamRefill(this);
     this._tick(true);
     if (getBufferAhead(this.video) >= 0.5) return;
     if (this._jumpSmallGap()) return;
@@ -2891,8 +4839,13 @@
     if (this.engine && this.engine._telemetry) this.engine._telemetry.record('recovery', { lastError: 'stall' });
     if (this.stallRecoveryStage === 0) {
       this.stallRecoveryStage = 1;
-      markSegmentsForTime(this, this.video.currentTime || 0, Math.max(2, this._bufferAheadGoal()));
-      if (this.activeAudio) markSegmentsForTime(this.activeAudio, this.video.currentTime || 0, Math.max(2, this._bufferAheadGoal()));
+      if (reopeningEndedVod) {
+        prepareSegmentsForRefill(this, this.sb || this.video, this.video.currentTime || 0, Math.max(2, this._bufferAheadGoal()));
+        if (this.activeAudio) prepareSegmentsForRefill(this.activeAudio, this.audioSb || this.video, this.video.currentTime || 0, Math.max(2, this._bufferAheadGoal()));
+      } else {
+        markSegmentsForTime(this, this.video.currentTime || 0, Math.max(2, this._bufferAheadGoal()));
+        if (this.activeAudio) markSegmentsForTime(this.activeAudio, this.video.currentTime || 0, Math.max(2, this._bufferAheadGoal()));
+      }
       this._tick(true);
       return;
     }
@@ -2924,6 +4877,7 @@
     this.controllers.push(controller);
     var headers = {};
     if (range) headers.Range = 'bytes=' + range.start + '-' + range.end;
+    if (opts.revalidate) headers['Cache-Control'] = 'no-cache';
     return nativeNetworkRequest(this.engine, NativeNetworkingEngine.RequestType.SEGMENT, {
       uris: [url],
       method: 'GET',
@@ -2962,6 +4916,7 @@
           return self._fetchRange(url, range, {
             phase: opts.phase,
             onTiming: opts.onTiming,
+            revalidate: opts.revalidate,
             attempts: attempts,
             attempt: attempt + 1
           });
@@ -2972,11 +4927,11 @@
     });
   };
 
-  NativeHlsProvider.prototype._fetchPlaylistText = function (url) {
+  NativeHlsProvider.prototype._fetchPlaylistText = function (url, requestOptions) {
     var self = this;
     return fetchText(this.engine, url, function (swInfo) {
       self._recordServiceWorkerFetch(swInfo, 'manifest');
-    }).catch(function (err) {
+    }, requestOptions).catch(function (err) {
       if (err && /^manifest-http-/.test(err.message || '') && self.engine && self.engine._offlinePlayback) {
         self.lastOfflineError = 'offline-' + err.message;
         self.engine._recordOfflineError(new Error(self.lastOfflineError));
@@ -2985,7 +4940,7 @@
     });
   };
 
-  NativeHlsProvider.prototype._refreshContentSteering = function (reason) {
+  NativeHlsProvider.prototype._refreshContentSteering = function (reason, signal) {
     var uri = this.contentSteeringReloadUri || this.contentSteeringUri;
     if (!uri) return Promise.resolve(false);
     var now = performance.now();
@@ -2996,7 +4951,7 @@
       uris: [uri],
       method: 'GET',
       headers: {}
-    }).then(function (resp) {
+    }, signal ? { signal: signal } : undefined).then(function (resp) {
       if (resp.status === 401 || resp.status === 403 || resp.status === 404 || resp.status === 410 || resp.status >= 500 || !networkResponseOk(resp)) {
         throw new Error('content-steering-http-' + resp.status);
       }
@@ -3009,11 +4964,10 @@
       self.contentSteeringExpiresAt = self.contentSteeringTtl ? performance.now() + self.contentSteeringTtl * 1000 : 0;
       self.contentSteeringReloadUri = reloadUri || self.contentSteeringReloadUri;
       self.lastContentSteeringError = '';
-      var previous = self.contentSteeringPathwayId || '';
       self._chooseContentSteeringPathway(priority);
-      if (previous && self.contentSteeringPathwayId && previous !== self.contentSteeringPathwayId) self.contentSteeringSwitchCount++;
       return true;
     }).catch(function (err) {
+      if (err && err.name === 'AbortError') throw err;
       self.lastContentSteeringError = err && err.message ? err.message : 'content-steering-failed';
       return false;
     });
@@ -3102,15 +5056,18 @@
   };
 
   NativeHlsProvider.prototype._applyContentSteeringToActiveVariant = function () {
-    if (!this.activeVariant || this.manualTrackId || !this.contentSteeringPathwayId) return;
-    if (this.activeVariant.pathwayId === this.contentSteeringPathwayId) return;
-    var next = this.chooseVariant();
-    if (!next || next === this.activeVariant || next.pathwayId !== this.contentSteeringPathwayId) return;
+    if (!this.activeVariant || this.manualTrackId || !this.contentSteeringPathwayId || this.trackTransitionInFlight) return null;
+    if (this.activeVariant.pathwayId === this.contentSteeringPathwayId) return null;
+    var next = this._chooseForBudget(this._candidateVariants(), 0.8);
+    if (!next || next === this.activeVariant || next.pathwayId !== this.contentSteeringPathwayId) return null;
+    var transaction = this._beginTrackTransition('content-steering');
+    if (!transaction) return null;
     this.activeVariant = next;
+    for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === next;
     this.activeAudio = this._chooseAudioRendition(next) || this.activeAudio;
-    this.contentSteeringSwitchCount++;
     this.lastSwitchReason = 'content-steering';
-    this.engine._player.emit('variantchanged');
+    this.lastSwitchAt = performance.now();
+    return transaction;
   };
 
   NativeHlsProvider.prototype._viewportMaxHeight = function () {
@@ -3197,9 +5154,19 @@
 
   NativeHlsProvider.prototype._switchVariant = function (variant, clearBuffer, reason) {
     if (!variant || this.destroyed || this.activeVariant === variant || this.variantSwitchInFlight) return;
+    if (this.trackTransitionInFlight) {
+      if (reason === 'manual') {
+        this.pendingManualVariantSwitch = { variantId: variant.id, clearBuffer: clearBuffer !== false };
+      }
+      return;
+    }
     var self = this;
-    var previousVariant = this.activeVariant;
-    var previousAudio = this.activeAudio;
+    var transaction = this._beginTrackTransition(reason || 'variant-switch');
+    if (!transaction) return;
+    if (reason === 'manual') {
+      this.manualTrackId = variant.id;
+      this.engine._player.config.abr.enabled = false;
+    }
     this._abortRequests();
     this.variantSwitchInFlight = true;
     this.activeVariant = variant;
@@ -3207,17 +5174,25 @@
     for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === variant;
     this.activeAudio = this._chooseAudioRendition(variant) || this.activeAudio;
     this.lastSwitchReason = reason || (clearBuffer ? 'manual' : 'auto');
-    this.engine._player.emit('variantchanged');
     this._refreshMediaPlaylist('variant-switch').then(function () {
+      if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
       if (clearBuffer) {
         markSegmentsUnappended(self);
         if (self.activeAudio) markSegmentsUnappended(self.activeAudio);
       }
       var videoInitKey = hlsInitSegmentKey(self.initSegment);
       var audioInitKey = hlsInitSegmentKey(self.audioInitSegment);
-      var videoReady = clearBuffer
-        ? resetSourceBuffer(self.sb, self.video.currentTime)
-        : Promise.resolve(self.sb._nativeQueue).catch(function () {}).then(function () {
+      var videoReady = !self.sb
+        ? Promise.resolve()
+        : clearBuffer
+          ? clearSourceBuffer(self.sb).then(function (removedRange) {
+            reconcileHlsSegmentLedgers(self, 'video', removedRange, self, null, false);
+            self._appendedVideoInitKey = '';
+            self._appendedVideoInitGenerationKey = '';
+            self._sourceBufferVideoInitSegment = null;
+          })
+          : Promise.resolve(self.sb._nativeQueue).catch(function () {}).then(function () {
+          if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
           return waitForSourceBufferIdle(self.sb);
         }).then(function () {
           // The old rendition may already cover one or more timeline
@@ -3225,50 +5200,83 @@
           // so the switch starts at the next boundary rather than downloading
           // overlapping media that the decoder may continue to ignore.
           markSegmentsCoveredByBuffer(self, self.video);
-        });
+          });
       var audioReady = clearBuffer && self.audioSb
-        ? resetSourceBuffer(self.audioSb, self.video.currentTime)
+        ? clearSourceBuffer(self.audioSb).then(function (removedRange) {
+          reconcileHlsSegmentLedgers(self, 'audio', removedRange, self.activeAudio, null, false);
+          self._appendedAudioInitKey = '';
+          self._appendedAudioInitGenerationKey = '';
+          self._sourceBufferAudioInitSegment = null;
+        })
         : Promise.resolve();
-      if (self.initSegment && (clearBuffer || videoInitKey !== self._appendedVideoInitKey)) {
+      if (self.initSegment && self.sb && (clearBuffer || videoInitKey !== self._appendedVideoInitKey)) {
         videoReady = videoReady.then(function () {
+          if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
           return self._fetchRange(self.initSegment.url, self.initSegment.range, { phase: 'metadata' });
         }).then(function (initData) {
-          return appendBuffer(self.sb, initData);
+          if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+          return appendHlsInitBuffer(self, self, self.sb, self.initSegment, initData, hlsTrackInitialTimestampGenerationKey(self, self));
         }).then(function () {
           self._appendedVideoInitKey = videoInitKey;
+          self._appendedVideoInitGenerationKey = hlsTrackInitialTimestampGenerationKey(self, self);
+          self._sourceBufferVideoInitSegment = self.initSegment;
         });
       }
       if (self.audioInitSegment && self.audioSb && (clearBuffer || audioInitKey !== self._appendedAudioInitKey)) {
         audioReady = audioReady.then(function () {
+          if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
           return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' });
         }).then(function (initData) {
-          return appendBuffer(self.audioSb, initData);
+          if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+          return appendHlsInitBuffer(self, self.activeAudio, self.audioSb, self.audioInitSegment, initData, hlsTrackInitialTimestampGenerationKey(self, self.activeAudio));
         }).then(function () {
           self._appendedAudioInitKey = audioInitKey;
+          self._appendedAudioInitGenerationKey = hlsTrackInitialTimestampGenerationKey(self, self.activeAudio);
+          self._sourceBufferAudioInitSegment = self.audioInitSegment;
         });
       }
       return Promise.all([videoReady, audioReady]);
     }).then(function () {
+      if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+      self._finishTrackTransition(transaction, true);
       self.variantSwitchInFlight = false;
-      if (self._flushPendingVariantSwitch()) return;
+      self.engine._player.emit('variantchanged');
+      if (self._flushPendingTrackSwitch()) return;
       self._tick(true);
     }).catch(function (err) {
-      self.variantSwitchInFlight = false;
-      self._restoreVariantState(previousVariant, previousAudio);
+      if (self.destroyed || !self._ownsTrackTransition(transaction)) {
+        self.variantSwitchInFlight = false;
+        return;
+      }
       self.lastError = err && err.message ? err.message : 'hls-variant-switch-failed';
-      if (self._flushPendingVariantSwitch()) return;
-      if (reason === 'quota-recovery' || reason === 'append-recovery' || reason === 'stall-recovery') self._handleFatal(err);
-      else self._tick(true);
+      return self._rollbackTrackTransition(transaction).then(function () {
+        self._finishTrackTransition(transaction, false);
+        self.variantSwitchInFlight = false;
+        if (self._flushPendingTrackSwitch()) return;
+        if (reason === 'quota-recovery' || reason === 'append-recovery' || reason === 'stall-recovery') self._handleFatal(err);
+        else self._tick(true);
+      }).catch(function (rollbackErr) {
+        self._finishTrackTransition(transaction, false);
+        self.variantSwitchInFlight = false;
+        self.lastError = rollbackErr && rollbackErr.message ? rollbackErr.message : 'hls-track-transition-rollback-failed';
+      });
     });
   };
 
   NativeHlsProvider.prototype._flushPendingVariantSwitch = function () {
     var pending = this.pendingManualVariantSwitch;
-    if (!pending || this.destroyed || this.variantSwitchInFlight) return false;
+    if (!pending || this.destroyed || this.variantSwitchInFlight || this.trackTransitionInFlight) return false;
     this.pendingManualVariantSwitch = null;
     var variant = this.variants.find(function (item) { return item.id === pending.variantId; });
     if (!variant || !variantSelectable(this, variant)) return false;
     if (this.activeVariant === variant) {
+      // A cancelled automatic transition restores its pre-switch ABR
+      // snapshot. If that restored rendition is also the viewer's queued
+      // choice, preserve the viewer's manual policy even though no media
+      // transition is now necessary.
+      this.manualTrackId = variant.id;
+      this.engine._player.config.abr.enabled = false;
+      this.lastSwitchAt = performance.now();
       this.lastSwitchReason = 'manual';
       for (var i = 0; i < this.variants.length; i++) this.variants[i].active = this.variants[i] === variant;
       return false;
@@ -3278,7 +5286,7 @@
   };
 
   NativeHlsProvider.prototype._maybeSwitchAuto = function () {
-    if (!this.engine._player.config.abr.enabled || this.variantSwitchInFlight || this.variants.length < 2 || !this.activeVariant) return;
+    if (this.suppressedVideoGapTrack || !this.engine._player.config.abr.enabled || this.variantSwitchInFlight || this.trackTransitionInFlight || this.variants.length < 2 || !this.activeVariant) return;
     var now = performance.now();
     if (sampleFramePressure(this, now)) {
       var smootherVariant = this._lowerVariant();
@@ -3314,13 +5322,17 @@
   };
 
   NativeHlsProvider.prototype.selectVariantTrack = function (track, clearBuffer) {
+    if (this.suppressedVideoGapTrack) return;
     var variant = this.variants.find(function (item) { return item.id === track.id || item.height === track.height; });
     if (!variant || !variantSelectable(this, variant)) return;
+    // Viewer intent takes effect immediately even when the media transition
+    // must wait behind an automatic switch. The transaction owns playback
+    // state; manual ABR policy remains the viewer's preference.
     this.manualTrackId = variant.id;
     this.engine._player.config.abr.enabled = false;
     this.lastSwitchAt = performance.now();
     this.lastSwitchReason = 'manual';
-    if (this.variantSwitchInFlight) {
+    if (this.variantSwitchInFlight || this.trackTransitionInFlight) {
       // A viewer choice must win over an automatic transition already
       // preparing another rendition. Queue only the latest manual intent and
       // apply it before the completed auto switch can schedule more media.
@@ -3328,6 +5340,7 @@
         variantId: variant.id,
         clearBuffer: clearBuffer !== false
       };
+      if (this.trackTransitionInFlight) this._cancelTrackTransitionForViewerIntent();
       return;
     }
     this._switchVariant(variant, clearBuffer !== false, 'manual');
@@ -3396,33 +5409,54 @@
 
   NativeHlsProvider.prototype.selectAudioTrack = function (track) {
     var rendition = this.audioRenditions.find(function (item) { return item.id === track.id || item.language === track.language; });
-    if (!rendition || rendition === this.activeAudio || this.destroyed) return;
+    if (!rendition || rendition === this.activeAudio || this.destroyed || !capabilityAllowed(this, rendition)) return;
+    if (this.trackTransitionInFlight) {
+      this.pendingAudioTrackSwitch = { id: rendition.id, language: rendition.language || '' };
+      this._cancelTrackTransitionForViewerIntent();
+      return;
+    }
     var self = this;
-    var previousAudio = this.activeAudio;
+    var transaction = this._beginTrackTransition('audio-switch');
+    if (!transaction) return;
     this._abortRequests();
     this.activeAudio = rendition;
+    this.audioEndList = rendition.endList === true ? true : null;
     for (var i = 0; i < this.audioRenditions.length; i++) this.audioRenditions[i].active = this.audioRenditions[i] === rendition;
-    this._fetchPlaylistText(rendition.url).then(function (audioText) {
-      return self._loadAudioPlaylist(audioText, rendition.url);
+    this._fetchPlaylistText(rendition.url, { signal: transaction.controller.signal }).then(function (audioText) {
+      if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+      return self._loadAudioPlaylist(audioText, rendition.url, rendition);
     }).then(function () {
-      if (!self.audioSb) {
-        self.audioSb = self.mediaSource.addSourceBuffer(self.audioMimeType);
-        self.audioSb.mode = 'segments';
-      }
-      return resetSourceBuffer(self.audioSb, self.video.currentTime).then(function () {
-        if (!self.audioInitSegment) return;
-        return self._fetchRange(self.audioInitSegment.url, self.audioInitSegment.range, { phase: 'metadata' }).then(function (initData) {
-          return appendBuffer(self.audioSb, initData);
-        });
+      if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+      return self._reconcileTrackLifecycle(transaction.generation);
+    }).then(function () {
+      if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+      if (!self.audioSb || allSegmentsDeclaredGap(self.audioSegments)) return;
+      markSegmentsUnappended(self.activeAudio);
+      return clearSourceBuffer(self.audioSb).then(function (removedRange) {
+        if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+        reconcileHlsSegmentLedgers(self, 'audio', removedRange, self.activeAudio, null, false);
+        self._appendedAudioInitKey = '';
+        self._appendedAudioInitGenerationKey = '';
+        self._sourceBufferAudioInitSegment = null;
+        return self._appendTrackInitIfNeeded('audio', true, transaction.generation);
       });
     }).then(function () {
+      if (!self._isTrackTransitionCurrent(transaction)) throw abortError();
+      self._finishTrackTransition(transaction, true);
       self.engine._player.emit('audiotrackchanged', self.getActiveAudioTrack());
+      if (self._flushPendingTrackSwitch()) return;
       self._tick(true);
     }).catch(function (err) {
-      self.activeAudio = previousAudio;
-      for (var i = 0; i < self.audioRenditions.length; i++) self.audioRenditions[i].active = self.audioRenditions[i] === previousAudio;
+      if (self.destroyed || !self._ownsTrackTransition(transaction)) return;
       self.lastError = err && err.message ? err.message : 'hls-audio-switch-failed';
-      self._tick(true);
+      return self._rollbackTrackTransition(transaction).then(function () {
+        self._finishTrackTransition(transaction, false);
+        if (self._flushPendingTrackSwitch()) return;
+        self._tick(true);
+      }).catch(function (rollbackErr) {
+        self._finishTrackTransition(transaction, false);
+        self.lastError = rollbackErr && rollbackErr.message ? rollbackErr.message : 'hls-track-transition-rollback-failed';
+      });
     });
   };
 
@@ -3690,6 +5724,18 @@
       stallRecoveryStage: this.stallRecoveryStage,
       gapJumpCount: this.gapJumpCount,
       lastGapSize: this.lastGapSize,
+      manifestGapJumpCount: this.manifestGapJumpCount || 0,
+      lastManifestGapSize: this.lastManifestGapSize || 0,
+      lastManifestGapTrack: this.lastManifestGapTrack || '',
+      suppressedAudioGapTrack: !!this.suppressedAudioGapTrack,
+      suppressedVideoGapTrack: !!this.suppressedVideoGapTrack,
+      suppressedGapTrackCount: this.suppressedGapTrackCount || 0,
+      trackActivationCount: this.trackActivationCount || 0,
+      trackSuppressionCount: this.trackSuppressionCount || 0,
+      sourceBufferTypeChangeCount: this.sourceBufferTypeChangeCount || 0,
+      sourceBufferTypeRebuildCount: this.sourceBufferTypeRebuildCount || 0,
+      sourceBufferTypeRollbackCount: this.sourceBufferTypeRollbackCount || 0,
+      trackLifecycleInFlight: !!this.trackLifecyclePromise,
       lastError: this.lastError,
       lastHttpStatus: this.lastHttpStatus,
       playlistRefreshCount: this.playlistRefreshCount,
@@ -3700,7 +5746,15 @@
       lastPlaylistRefreshAdvanced: !!this.lastPlaylistRefreshAdvanced,
       liveWindowDriftRecoveryCount: this.liveWindowDriftRecoveryCount || 0,
       vodEndOfStreamCount: this.vodEndOfStreamCount || 0,
+      vodEndOfStreamPending: !!this.vodEndOfStreamPending,
+      vodEndOfStreamRetryCount: this.vodEndOfStreamRetryCount || 0,
+      vodEndOfStreamRefillPending: !!this.vodEndOfStreamRefillPending,
+      vodEndOfStreamReopenCount: this.vodEndOfStreamReopenCount || 0,
+      vodFinalDuration: this.vodFinalDuration || 0,
+      liveToVodTransitionCount: this.liveToVodTransitionCount || 0,
       liveRefreshInFlight: !!this.liveRefreshInFlight,
+      playlistRefreshInFlight: !!this.playlistRefreshPromise,
+      playlistRefreshReasonInFlight: this.playlistRefreshReasonInFlight || '',
       mediaFetchCompletedCount: this.mediaFetchCompletedCount,
       mediaFetchRetryCount: this.mediaFetchRetryCount,
       mediaFetchTotalMs: this.mediaFetchTotalMs,
@@ -3722,24 +5776,92 @@
       discontinuitySequence: this.discontinuitySequence || 0,
       discontinuityCount: this.discontinuityCount || 0,
       playlistRefreshFailed: !!this.playlistRefreshFailed,
+      staleManifestResponseCount: this.staleManifestResponseCount || 0,
+      playlistEpochResetCount: this.playlistEpochResetCount || 0,
+      lastPlaylistEpochResetTrack: this.lastPlaylistEpochResetTrack || '',
+      lastPlaylistEpochResetOffset: this.lastPlaylistEpochResetOffset || 0,
+      playlistEpochHoldCount: this.playlistEpochHoldCount || 0,
+      lastPlaylistEpochHoldReason: this.lastPlaylistEpochHoldReason || '',
+      playlistManifestCommitGeneration: this.playlistManifestCommitGeneration || 0,
+      playlistManifestStageCount: this.playlistManifestStageCount || 0,
+      playlistManifestCommitCount: this.playlistManifestCommitCount || 0,
+      playlistManifestDiscardCount: this.playlistManifestDiscardCount || 0,
+      playlistManifestCommitInProgress: !!this.playlistManifestCommitInProgress,
+      hlsInitTimescaleParseFailureCount: this.hlsInitTimescaleParseFailureCount || 0,
+      hlsFragmentTimestampParseCount: this.hlsFragmentTimestampParseCount || 0,
+      hlsFragmentTimestampFallbackCount: this.hlsFragmentTimestampFallbackCount || 0,
+      hlsTimestampGenerationResolutionCount: this.hlsTimestampGenerationResolutionCount || 0,
+      hlsTimestampGenerationCount: countKeys(this.hlsTimestampGenerationByKey),
+      hlsDiscontinuityTimestampResolutionCount: this.hlsDiscontinuityTimestampResolutionCount || 0,
+      hlsDiscontinuityTimestampFallbackCount: this.hlsDiscontinuityTimestampFallbackCount || 0,
+      hlsInitMapSwitchCount: this.hlsInitMapSwitchCount || 0,
+      hlsInitGenerationRefreshCount: this.hlsInitGenerationRefreshCount || 0,
+      hlsTimestampResolutionRetryCount: this.hlsTimestampResolutionRetryCount || 0,
+      hlsTimestampResolutionFailureCount: this.hlsTimestampResolutionFailureCount || 0,
+      hlsContainerDetectionCount: this.hlsContainerDetectionCount || 0,
+      hlsContainerMismatchCount: this.hlsContainerMismatchCount || 0,
+      hlsTransmuxedTimestampResolutionCount: this.hlsTransmuxedTimestampResolutionCount || 0,
+      hlsTimestampGenerationPruneCount: this.hlsTimestampGenerationPruneCount || 0,
+      hlsTsTimelineGenerationCount: countKeys(this.hlsTsTimelineByGeneration),
+      hlsTsSharedDemuxCount: this.hlsTsSharedDemuxCount || 0,
+      hlsTsTimestampRolloverCount: this.hlsTsTimestampRolloverCount || 0,
+      hlsTsOutOfOrderSegmentCount: this.hlsTsOutOfOrderSegmentCount || 0,
+      hlsTsCompositionOffsetSampleCount: this.hlsTsCompositionOffsetSampleCount || 0,
+      hlsTsMaxCompositionOffsetMs: this.hlsTsMaxCompositionOffsetMs || 0,
+      hlsTsMuxedAvStartOffsetMs: this.hlsTsMuxedAvStartOffsetMs || 0,
+      hlsTsInitAppendCount: this.hlsTsInitAppendCount || 0,
+      hlsTsInitSkipCount: this.hlsTsInitSkipCount || 0,
+      hlsTsMuxedQuotaRetryCount: this.hlsTsMuxedQuotaRetryCount || 0,
+      hlsTsMuxedQuotaAudioResumeCount: this.hlsTsMuxedQuotaAudioResumeCount || 0,
+      hlsTsMuxedQuotaVideoResumeCount: this.hlsTsMuxedQuotaVideoResumeCount || 0,
+      hlsAppendEpoch: this.hlsAppendEpoch || 0,
+      hlsAppendInvalidationCount: this.hlsAppendInvalidationCount || 0,
+      hlsStaleAppendAbortCount: this.hlsStaleAppendAbortCount || 0,
+      hlsStaleRecoveryAbortCount: this.hlsStaleRecoveryAbortCount || 0,
+      lastHlsAppendInvalidationReason: this.lastHlsAppendInvalidationReason || '',
+      hlsQuotaForwardEvictionCount: this.hlsQuotaForwardEvictionCount || 0,
+      hlsQuotaDownswitchCount: this.hlsQuotaDownswitchCount || 0,
+      hlsMuxedWatchdogCompletionCount: this.hlsMuxedWatchdogCompletionCount || 0,
+      hlsMuxedAppendLedgerSize: countKeys(this.hlsMuxedAppendLedger),
+      hlsMuxedPartialCarryCount: this.hlsMuxedPartialCarryCount || 0,
+      hlsMuxedLedgerResumeCount: this.hlsMuxedLedgerResumeCount || 0,
+      hlsMuxedLedgerCompletionCount: this.hlsMuxedLedgerCompletionCount || 0,
+      lastHlsTimestampGenerationKey: this.lastHlsTimestampGenerationKey || '',
+      lastHlsFragmentDecodeTime: this.lastHlsFragmentDecodeTime || 0,
+      lastHlsFragmentTimestampOffset: this.lastHlsFragmentTimestampOffset || 0,
       schedulerQueueDepth: appendQueueDepth(this.sb),
       schedulerBackpressureCount: this.schedulerBackpressureCount,
       schedulerDrainCount: this.schedulerDrainCount,
       sourceBufferAbortCount: this.sourceBufferAbortCount || 0,
+      hlsSegmentLedgerReconcileCount: this.hlsSegmentLedgerReconcileCount || 0,
+      hlsSegmentLedgerInvalidationCount: this.hlsSegmentLedgerInvalidationCount || 0,
+      sourceBufferMutationTimeoutCount: sourceBufferMutationStat(this, '_nativeMutationTimeoutCount'),
+      sourceBufferMutationAbortCount: sourceBufferMutationStat(this, '_nativeMutationAbortCount'),
+      sourceBufferMissedUpdateEndCount: sourceBufferMutationStat(this, '_nativeMutationMissedUpdateEndCount'),
       startupBufferComplete: this.startupBufferComplete,
       startupBufferMs: this.startupBufferMs,
       seekBufferPending: !!this.seekBufferPending,
+      seekInteractionPending: !!this.seekInteractionPending,
       seekBufferReadyCount: this.seekBufferReadyCount || 0,
       bufferedSeekCount: this.bufferedSeekCount || 0,
       seekCount: this.seekCount || 0,
       seekCancelCount: this.seekCancelCount || 0,
       seekAbortCount: this.seekAbortCount || 0,
+      seekGeneration: this.seekGeneration || 0,
+      activeSeekGeneration: this.activeSeekGeneration || 0,
+      completedSeekGeneration: this.completedSeekGeneration || 0,
       lastSeekTarget: this.lastSeekTarget || 0,
       lastSeekMs: this.lastSeekMs || 0,
       effectiveSeekBufferGoal: this._seekBufferGoal ? this._seekBufferGoal() : STARTUP_BUFFER_GOAL,
       lastSwitchReason: this.lastSwitchReason,
       variantSwitchInFlight: !!this.variantSwitchInFlight,
       pendingManualVariantId: this.pendingManualVariantSwitch ? this.pendingManualVariantSwitch.variantId : '',
+      pendingAudioTrackId: this.pendingAudioTrackSwitch ? this.pendingAudioTrackSwitch.id : '',
+      trackTransitionInFlight: !!this.trackTransitionInFlight,
+      trackTransitionReason: this.trackTransitionInFlight ? this.trackTransitionInFlight.reason : '',
+      trackTransitionCommitCount: this.trackTransitionCommitCount || 0,
+      trackTransitionRollbackCount: this.trackTransitionRollbackCount || 0,
+      trackTransitionRollbackFailureCount: this.trackTransitionRollbackFailureCount || 0,
       transmuxedSegmentCount: this.transmuxedSegmentCount,
       transmuxedVideoSegmentCount: this.transmuxedVideoSegmentCount,
       transmuxedAudioSegmentCount: this.transmuxedAudioSegmentCount,
@@ -3747,6 +5869,7 @@
       transmuxerLoadMs: this.tsTransmuxerLoadMs,
       muxedTsAudio: !!this.muxedTsAudio,
       encryptedSegmentCount: this.encryptedSegmentCount,
+      encryptedInitSegmentCount: this.encryptedInitSegmentCount || 0,
       hlsKeyFetchCount: this.keyFetchCount,
       hlsKeyCacheHitCount: this.keyCacheHitCount,
       lastDecryptionError: this.lastDecryptionError,
@@ -3800,6 +5923,9 @@
   };
 
   NativeHlsProvider.prototype._onWaiting = function () {
+    if (this._jumpManifestGap && this._jumpManifestGap()) return;
+    if (this._maybeEndVodStream && this._maybeEndVodStream()) return;
+    if (endedVodSchedulerIsIdle(this)) return;
     if (this.rebufferStartedAt || this.video.paused || this.video.seeking) return;
     this.rebufferStartedAt = performance.now();
     this.rebufferCount++;
@@ -3817,9 +5943,30 @@
     addTimelineRegions(this, regions);
   };
 
-  NativeHlsProvider.prototype.destroy = function () {
+  NativeHlsProvider.prototype.quiesce = function (reason) {
+    if (this._terminalQuiesced) return false;
+    this._terminalQuiesced = true;
     this.destroyed = true;
+    invalidateSeekOperation(this);
+    if (this.trackTransitionInFlight && this.trackTransitionInFlight.controller) {
+      try { this.trackTransitionInFlight.controller.abort(); } catch (e) {}
+    }
+    invalidateHlsAppendTransactions(this, reason || 'terminal');
+    try { this._abortRequests(); } catch (e) {}
+    this.trackTransitionGeneration = (this.trackTransitionGeneration || 0) + 1;
+    this.trackTransitionInFlight = null;
+    this.variantSwitchInFlight = false;
+    this.nativeRecoveryInProgress = false;
+    this.pendingManualVariantSwitch = null;
+    this.pendingAudioTrackSwitch = null;
+    this.playlistRefreshGeneration++;
+    this.playlistRefreshPromise = null;
+    this.playlistRefreshKey = '';
+    this.playlistRefreshReasonInFlight = '';
+    this.trackLifecyclePromise = null;
+    clearVodEndOfStreamState(this);
     clearTimeout(this.playlistRefreshTimer);
+    this.playlistRefreshTimer = 0;
     if (this._boundWaiting) this.video.removeEventListener('waiting', this._boundWaiting);
     if (this._boundPlaying) this.video.removeEventListener('playing', this._boundPlaying);
     if (this._boundTick) this.video.removeEventListener('timeupdate', this._boundTick);
@@ -3831,6 +5978,12 @@
     if (this._boundSeeked) this.video.removeEventListener('seeked', this._boundSeeked);
     this.controllers.forEach(function (controller) { try { controller.abort(); } catch (e) {} });
     this.controllers = [];
+    this.activeRanges = {};
+    return true;
+  };
+
+  NativeHlsProvider.prototype.destroy = function () {
+    this.quiesce('destroy');
     try { if (this.mediaSource && this.mediaSource.readyState === 'open') this.mediaSource.endOfStream(); } catch (e) {}
     if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
   };
@@ -3842,6 +5995,7 @@
     this.manifestText = manifestText;
     this.name = 'native-dash';
     this.isAdaptive = true;
+    this._usesStartupReadiness = true;
     this.mediaSource = null;
     this.objectUrl = '';
     this.audio = null;
@@ -3851,8 +6005,8 @@
     this.blacklisted = {};
     this.abortController = null;
     this.destroyed = false;
+    this._terminalQuiesced = false;
     this.fillTimer = null;
-    this.pendingSeek = 0;
     this.bandwidth = engine._player.config.abr.defaultBandwidthEstimate || DEFAULT_BANDWIDTH_ESTIMATE;
     this.manualTrackId = null;
     this.controllers = [];
@@ -3896,10 +6050,17 @@
     this.atLiveEdge = false;
     this.manifestRefreshCount = 0;
     this.manifestRefreshFailed = false;
+    this.staleManifestResponseCount = 0;
+    this.presentationEnded = false;
     this.minimumUpdatePeriod = 0;
     this.manifestRefreshTimer = null;
+    this.manifestRefreshPromise = null;
+    this.manifestRefreshReasonInFlight = '';
+    this.lastManifestPublishTime = NaN;
     this.gapJumpCount = 0;
     this.lastGapSize = 0;
+    this.manifestGapJumpCount = 0;
+    this.lastManifestGapSize = 0;
     this.capabilityProbeCount = 0;
     this.unsupportedCapabilityCount = 0;
     this.startupBufferComplete = false;
@@ -3907,17 +6068,46 @@
     this.startupBufferMs = 0;
     this.firstPlayableRange = null;
     this.seekBufferPending = false;
+    this.seekInteractionPending = false;
     this.seekBufferReadyCount = 0;
     this.bufferedSeekCount = 0;
     this.seekCount = 0;
     this.seekCancelCount = 0;
     this.seekAbortCount = 0;
+    this.seekGeneration = 0;
+    this.activeSeekGeneration = 0;
+    this.completedSeekGeneration = 0;
     this.lastSeekTarget = 0;
     this.lastSeekStartedAt = 0;
     this.lastSeekMs = 0;
     this._lastSeekHandledTarget = null;
     this._lastSeekHandledAt = 0;
+    this._lastSeekHandledGeneration = 0;
     this.requestCancellationCount = 0;
+    this.dashAppendTransactionCount = 0;
+    this.dashStaleAppendAbortCount = 0;
+    this.dashSourceBufferQueueDrainCount = 0;
+    this.dashControlTransitionGeneration = 0;
+    this.dashControlTransitionInFlight = null;
+    this.dashControlTransitionCount = 0;
+    this.dashControlTransitionCommitCount = 0;
+    this.dashControlTransitionInvalidationCount = 0;
+    this.dashStaleControlTransitionAbortCount = 0;
+    this.dashStaleControlTransitionReleaseCount = 0;
+    this.dashControlTransitionRollbackCount = 0;
+    this.dashControlTransitionRollbackFailureCount = 0;
+    this.dashSourceBufferConfigEpoch = 0;
+    this.dashSourceBufferCommittedConfigEpoch = 0;
+    this.dashSourceBufferConfigUncertain = false;
+    this.dashSourceBufferReconcilePending = null;
+    this.dashSourceBufferReconcileQueuedCount = 0;
+    this.dashSourceBufferReconcileAttemptCount = 0;
+    this.dashSourceBufferReconcileSuccessCount = 0;
+    this.dashSourceBufferReconcileFailureCount = 0;
+    this.dashSegmentLedgerReconcileCount = 0;
+    this.dashSegmentLedgerInvalidationCount = 0;
+    this.audioSwitchInFlight = false;
+    this.pendingAudioSwitch = null;
     this.mediaFetchCompletedCount = 0;
     this.mediaFetchTotalMs = 0;
     this.mediaFetchRetryCount = 0;
@@ -3964,14 +6154,24 @@
     this.lastTimelineRegion = null;
     this.manifestStartTime = null;
     this.imageSegmentCount = 0;
+    this.liveToVodTransitionCount = 0;
     this.vodEndOfStreamCount = 0;
+    this.vodEndOfStreamPending = false;
+    this.vodEndOfStreamRetryCount = 0;
+    this.vodEndOfStreamRefillPending = false;
+    this.vodEndOfStreamReopenCount = 0;
+    this.vodFinalDuration = 0;
+    this._vodEndOfStreamRetryAttempt = 0;
+    this._vodEndOfStreamScheduled = false;
+    this._vodEndOfStreamRetryTimer = 0;
   }
 
   NativeDashProvider.prototype.load = function () {
     var self = this;
     var parsed = parseMPD(this.manifestText, this.manifestUrl);
-    this.duration = parsed.duration;
-    this.live = parsed.type === 'dynamic';
+    this.presentationEnded = parsed.type !== 'dynamic';
+    this.lastManifestPublishTime = parsed.publishTime;
+    applyProviderPresentationState(this, parsed.type === 'dynamic', parsed.duration);
     this.minimumUpdatePeriod = parsed.minimumUpdatePeriod || 0;
     this.liveWindow = parsed.liveWindow || null;
     this.periodCount = parsed.periodCount || 0;
@@ -4013,7 +6213,6 @@
         self._open().then(function () {
           self.engine._player.emit('loaded');
           self.engine._player.emit('trackschanged');
-          self.engine._setState('ready');
           resolve();
         }).catch(reject);
       }, { once: true });
@@ -4049,15 +6248,28 @@
       // The SourceBuffers are independent. Append both init segments together
       // so slower devices do not pay two updateend waits before media can start.
       return Promise.all([
-        appendBuffer(self.videoSb, self.activeVideo.initData).then(function () {
+        appendBuffer(
+          self.videoSb,
+          self.activeVideo.initData,
+          null,
+          undefined,
+          sourceBufferIdentityGuard(self, 'videoSb', self.videoSb)
+        ).then(function () {
           self.activeVideo._appendedInitKey = self.activeVideo.generationKey || generationKeyForRep(self.activeVideo);
         }),
-        appendBuffer(self.audioSb, self.audio.initData).then(function () {
+        appendBuffer(
+          self.audioSb,
+          self.audio.initData,
+          null,
+          undefined,
+          sourceBufferIdentityGuard(self, 'audioSb', self.audioSb)
+        ).then(function () {
           self.audio._appendedInitKey = self.audio.generationKey || generationKeyForRep(self.audio);
         })
       ]);
     }).then(function () {
       if (self.live) self._startNearLiveEdge();
+      if (self.engine && self.engine._markStartupAttached) self.engine._markStartupAttached(self);
       self._tick(true);
       return applyPendingLoadStartTime(self).then(function () {
         self.fillTimer = setInterval(function () { self._tick(); }, 1000);
@@ -4347,12 +6559,19 @@
 
   NativeDashProvider.prototype._tick = function (force) {
     if (this.destroyed || !this.activeVideo || !this.audio) return;
+    if (this._jumpManifestGap && this._jumpManifestGap()) return;
+    if (this._maybeEndVodStream && this._maybeEndVodStream()) return;
+    if (endedVodSchedulerIsIdle(this)) return;
     if (this.live) this._updateLivePositionStats();
     this._jumpSmallGap();
-    if (this.videoSwitchInFlight) return;
+    if (this.dashSourceBufferConfigUncertain) {
+      if (!this.dashControlTransitionInFlight) flushPendingDashControlTransition(this);
+      return;
+    }
+    if (this.dashControlTransitionInFlight || this.videoSwitchInFlight || this.audioSwitchInFlight) return;
     var ahead = getBufferAhead(this.video);
     this._maybeSwitchAuto();
-    if (this.videoSwitchInFlight) return;
+    if (this.dashControlTransitionInFlight || this.videoSwitchInFlight || this.audioSwitchInFlight) return;
     if (!force && ahead >= this._bufferAheadGoal()) return;
     if (!this.startupBufferComplete || this.seekBufferPending) {
       this._scheduleMediaRequests(this.seekBufferPending ? this._seekBufferGoal() : this._startupBufferGoal());
@@ -4369,7 +6588,7 @@
   };
 
   NativeDashProvider.prototype._scheduleMediaRequests = function (windowGoal, tracks) {
-    if (this.destroyed) return;
+    if (this.destroyed || this.dashSourceBufferConfigUncertain || this.dashControlTransitionInFlight) return;
     tracks = tracks || [
       { rep: this.activeVideo, sb: this.videoSb },
       { rep: this.audio, sb: this.audioSb }
@@ -4395,6 +6614,7 @@
   };
 
   NativeDashProvider.prototype._buildSegmentCandidates = function (windowGoal, tracks) {
+    if (this.dashSourceBufferConfigUncertain || this.dashControlTransitionInFlight) return [];
     var pendingStart = pendingLoadStartTime(this);
     var ct = !this.startupBufferComplete && pendingStart != null ? pendingStart : (this.video.currentTime || 0);
     if (this.live && this.liveWindow && ct < this.liveWindow.start) ct = this.liveWindow.start;
@@ -4511,22 +6731,481 @@
       });
     }
     console.warn('[native-dash] refreshing manifest after media error rep=' + (rep && rep.id ? rep.id : '') + ' reason=' + reason);
-    return this._refreshPlaybackManifest('media-error');
+    var self = this;
+    function refresh(retriedStale) {
+      return self._refreshPlaybackManifest('media-error').then(function (outcome) {
+        if (outcome && outcome.stale) {
+          if (!retriedStale) return refresh(true);
+          throw new Error('dash-media-refresh-stale');
+        }
+        return outcome;
+      });
+    }
+    return refresh(false);
+  };
+
+  function createDashAppendTransaction(provider, rep, seg, sb, enforceOwnership) {
+    var kind = rep && rep.kind === 'audio' ? 'audio' : 'video';
+    var sourceBufferField = kind === 'audio' ? 'audioSb' : 'videoSb';
+    var sourceBuffer = provider && provider[sourceBufferField] || sb || null;
+    var transaction = {
+      generation: provider && provider.requestGeneration || 0,
+      kind: kind,
+      rep: rep || null,
+      segment: seg || null,
+      sourceBufferField: sourceBufferField,
+      sourceBuffer: sourceBuffer,
+      videoSourceBuffer: provider && provider.videoSb || (kind === 'video' ? sourceBuffer : null),
+      audioSourceBuffer: provider && provider.audioSb || (kind === 'audio' ? sourceBuffer : null),
+      activeRep: provider && (kind === 'audio' ? provider.audio : provider.activeVideo) || rep || null,
+      generationKey: seg && seg.generationKey || rep && rep.generationKey || '',
+      enforceOwnership: !!enforceOwnership,
+      staleAbortRecorded: false
+    };
+    if (provider) {
+      provider.dashAppendTransactionCount = (provider.dashAppendTransactionCount || 0) + 1;
+    }
+    return transaction;
+  }
+
+  function dashAppendTransactionIsCurrent(provider, transaction) {
+    if (!provider || !transaction || provider.destroyed) return false;
+    if ((provider.requestGeneration || 0) !== transaction.generation) return false;
+    if (
+      transaction.videoSourceBuffer
+      && Object.prototype.hasOwnProperty.call(provider, 'videoSb')
+      && provider.videoSb !== transaction.videoSourceBuffer
+    ) return false;
+    if (
+      transaction.audioSourceBuffer
+      && Object.prototype.hasOwnProperty.call(provider, 'audioSb')
+      && provider.audioSb !== transaction.audioSourceBuffer
+    ) return false;
+    var activeSourceBuffer = Object.prototype.hasOwnProperty.call(provider, transaction.sourceBufferField)
+      ? provider[transaction.sourceBufferField]
+      : transaction.sourceBuffer;
+    if (activeSourceBuffer !== transaction.sourceBuffer) return false;
+    if (transaction.enforceOwnership) {
+      if (!transaction.rep || transaction.rep._appendOwner !== transaction) return false;
+      if (!transaction.segment || transaction.segment._appendOwner !== transaction) return false;
+      var activeRep = transaction.kind === 'audio' ? provider.audio : provider.activeVideo;
+      if (activeRep && activeRep !== transaction.rep) return false;
+      var generationKey = transaction.segment && transaction.segment.generationKey
+        || transaction.rep && transaction.rep.generationKey
+        || '';
+      if (transaction.generationKey && generationKey !== transaction.generationKey) return false;
+    }
+    return true;
+  }
+
+  function assertDashAppendTransactionCurrent(provider, transaction) {
+    if (dashAppendTransactionIsCurrent(provider, transaction)) return;
+    if (provider && transaction && !transaction.staleAbortRecorded) {
+      transaction.staleAbortRecorded = true;
+      provider.dashStaleAppendAbortCount = (provider.dashStaleAppendAbortCount || 0) + 1;
+    }
+    throw abortError();
+  }
+
+  function dashAppendTransactionGuard(provider, transaction) {
+    return function () {
+      assertDashAppendTransactionCurrent(provider, transaction);
+    };
+  }
+
+  function updateDashAppendTransactionSourceBuffer(transaction, replacement) {
+    if (!transaction) return;
+    transaction.sourceBuffer = replacement;
+    if (transaction.kind === 'audio') transaction.audioSourceBuffer = replacement;
+    else transaction.videoSourceBuffer = replacement;
+  }
+
+  function dashAppendWorkInFlight(provider, exceptTransaction) {
+    if (!provider) return false;
+    var reps = [provider.activeVideo, provider.audio];
+    for (var i = 0; i < reps.length; i++) {
+      if (!reps[i]) continue;
+      if (reps[i]._appendOwner && reps[i]._appendOwner !== exceptTransaction) return true;
+      if (reps[i]._appending && (!exceptTransaction || reps[i]._appendOwner !== exceptTransaction)) return true;
+    }
+    return false;
+  }
+
+  function waitForDashAppendTopologyPeers(provider, transaction) {
+    if (!dashAppendWorkInFlight(provider, transaction)) return Promise.resolve();
+    var startedAt = performance.now();
+    return new Promise(function (resolve, reject) {
+      function poll() {
+        try {
+          assertDashAppendTransactionCurrent(provider, transaction);
+        } catch (err) {
+          reject(err);
+          return;
+        }
+        if (!dashAppendWorkInFlight(provider, transaction)) {
+          resolve();
+          return;
+        }
+        if (performance.now() - startedAt >= SEGMENT_BUSY_WATCHDOG_MS) {
+          reject(new Error('dash-sourcebuffer-topology-peer-timeout'));
+          return;
+        }
+        setTimeout(poll, 10);
+      }
+      poll();
+    });
+  }
+
+  function beginDashControlTransition(provider, kind, target, clearBuffer, reason) {
+    if (!provider || provider.destroyed || provider.dashControlTransitionInFlight || dashAppendWorkInFlight(provider)) return null;
+    provider.dashControlTransitionGeneration = (provider.dashControlTransitionGeneration || 0) + 1;
+    var transaction = {
+      generation: provider.dashControlTransitionGeneration,
+      requestGeneration: provider.requestGeneration || 0,
+      kind: kind,
+      target: target || null,
+      previousVideo: provider.activeVideo || null,
+      previousAudio: provider.audio || null,
+      videoSourceBuffer: provider.videoSb || null,
+      audioSourceBuffer: provider.audioSb || null,
+      clearBuffer: !!clearBuffer,
+      reason: reason || kind,
+      staleAbortRecorded: false
+    };
+    provider.dashControlTransitionInFlight = transaction;
+    provider.dashControlTransitionCount = (provider.dashControlTransitionCount || 0) + 1;
+    if (kind === 'video') provider.videoSwitchInFlight = true;
+    if (kind === 'audio') provider.audioSwitchInFlight = true;
+    if (kind === 'recovery') provider.nativeRecoveryInProgress = true;
+    return transaction;
+  }
+
+  function dashControlTransitionIsCurrent(provider, transaction) {
+    return !!(
+      provider
+      && transaction
+      && !provider.destroyed
+      && provider.dashControlTransitionInFlight === transaction
+      && (provider.dashControlTransitionGeneration || 0) === transaction.generation
+      && (provider.requestGeneration || 0) === transaction.requestGeneration
+      && (provider.videoSb || null) === transaction.videoSourceBuffer
+      && (provider.audioSb || null) === transaction.audioSourceBuffer
+    );
+  }
+
+  function assertDashControlTransitionCurrent(provider, transaction) {
+    if (dashControlTransitionIsCurrent(provider, transaction)) return;
+    if (provider && transaction && !transaction.staleAbortRecorded) {
+      transaction.staleAbortRecorded = true;
+      provider.dashStaleControlTransitionAbortCount = (provider.dashStaleControlTransitionAbortCount || 0) + 1;
+    }
+    throw abortError();
+  }
+
+  function dashControlTransitionGuard(provider, transaction) {
+    return function () {
+      assertDashControlTransitionCurrent(provider, transaction);
+    };
+  }
+
+  function finishDashControlTransition(provider, transaction, committed) {
+    if (!dashControlTransitionIsCurrent(provider, transaction)) return false;
+    provider.dashControlTransitionInFlight = null;
+    if (transaction.kind === 'video') provider.videoSwitchInFlight = false;
+    if (transaction.kind === 'audio') provider.audioSwitchInFlight = false;
+    if (transaction.kind === 'recovery') provider.nativeRecoveryInProgress = false;
+    if (committed) {
+      provider.dashControlTransitionCommitCount = (provider.dashControlTransitionCommitCount || 0) + 1;
+    }
+    return true;
+  }
+
+  function releaseStaleDashControlTransition(provider, transaction, reason) {
+    if (!provider || !transaction || provider.dashControlTransitionInFlight !== transaction) return false;
+    queueDashSourceBufferConfigurationReconciliation(provider, transaction, reason || 'stale-control-transition');
+    provider.dashControlTransitionInFlight = null;
+    if (transaction.kind === 'video') provider.videoSwitchInFlight = false;
+    if (transaction.kind === 'audio') provider.audioSwitchInFlight = false;
+    if (transaction.kind === 'recovery') provider.nativeRecoveryInProgress = false;
+    provider.dashStaleControlTransitionReleaseCount = (provider.dashStaleControlTransitionReleaseCount || 0) + 1;
+    return true;
+  }
+
+  function handleStaleDashControlTransition(provider, transaction, reason) {
+    if (provider && transaction && !transaction.staleAbortRecorded) {
+      transaction.staleAbortRecorded = true;
+      provider.dashStaleControlTransitionAbortCount = (provider.dashStaleControlTransitionAbortCount || 0) + 1;
+    }
+    var released = releaseStaleDashControlTransition(provider, transaction, reason);
+    if (released && !provider.destroyed) {
+      if (!flushPendingDashControlTransition(provider) && provider._tick) provider._tick(true);
+    }
+    return false;
+  }
+
+  function recordDashSourceBufferConfigurationMutation(provider, transaction, kind) {
+    if (!transaction.configurationEpoch) {
+      provider.dashSourceBufferConfigEpoch = (provider.dashSourceBufferConfigEpoch || 0) + 1;
+      transaction.configurationEpoch = provider.dashSourceBufferConfigEpoch;
+      transaction.configurationMutations = {};
+    }
+    transaction.configurationMutations[kind] = true;
+    return transaction.configurationEpoch;
+  }
+
+  function markDashSourceBufferConfigurationMutation(provider, transaction, kind) {
+    assertDashControlTransitionCurrent(provider, transaction);
+    return recordDashSourceBufferConfigurationMutation(provider, transaction, kind);
+  }
+
+  function markDashAppendSourceBufferConfigurationMutation(provider, transaction, kind, generationKey) {
+    assertDashAppendTransactionCurrent(provider, transaction);
+    var epoch = recordDashSourceBufferConfigurationMutation(provider, transaction, kind);
+    transaction.configurationGenerationKeys = transaction.configurationGenerationKeys || {};
+    transaction.configurationGenerationKeys[kind] = generationKey || '';
+    if (transaction.rep) transaction.rep._appendedInitKey = '';
+    return epoch;
+  }
+
+  function dashSourceBufferReconcilePendingHasEntries(pending) {
+    return !!(pending && (pending.video || pending.audio));
+  }
+
+  function queueDashSourceBufferConfigurationReconciliation(provider, transaction, reason) {
+    if (
+      !provider
+      || provider.destroyed
+      || !transaction
+      || !transaction.configurationEpoch
+      || !transaction.configurationMutations
+    ) return false;
+    var pending = provider.dashSourceBufferReconcilePending || {};
+    if (transaction.configurationMutations.video && provider.activeVideo && provider.videoSb) {
+      pending.video = {
+        epoch: transaction.configurationEpoch,
+        reason: reason || transaction.reason || 'control-transition-invalidated'
+      };
+    }
+    if (transaction.configurationMutations.audio && provider.audio && provider.audioSb) {
+      pending.audio = {
+        epoch: transaction.configurationEpoch,
+        reason: reason || transaction.reason || 'control-transition-invalidated'
+      };
+    }
+    if (!dashSourceBufferReconcilePendingHasEntries(pending)) return false;
+    provider.dashSourceBufferReconcilePending = pending;
+    provider.dashSourceBufferConfigUncertain = true;
+    provider.dashSourceBufferReconcileQueuedCount = (provider.dashSourceBufferReconcileQueuedCount || 0) + 1;
+    return true;
+  }
+
+  function queueDashAppendSourceBufferConfigurationReconciliation(provider, reason) {
+    if (!provider || provider.destroyed) return false;
+    var queued = false;
+    var seen = [];
+    var reps = [provider.activeVideo, provider.audio];
+    for (var i = 0; i < reps.length; i++) {
+      var transaction = reps[i] && reps[i]._appendOwner;
+      if (!transaction || seen.indexOf(transaction) !== -1) continue;
+      seen.push(transaction);
+      queued = queueDashSourceBufferConfigurationReconciliation(provider, transaction, reason) || queued;
+    }
+    return queued;
+  }
+
+  function commitDashSourceBufferConfiguration(provider, transaction) {
+    if (!provider || !transaction || !transaction.configurationEpoch) return;
+    provider.dashSourceBufferCommittedConfigEpoch = Math.max(
+      provider.dashSourceBufferCommittedConfigEpoch || 0,
+      transaction.configurationEpoch
+    );
+    var pending = provider.dashSourceBufferReconcilePending;
+    var mutations = transaction.configurationMutations || {};
+    if (pending && mutations.video) delete pending.video;
+    if (pending && mutations.audio) delete pending.audio;
+    if (!dashSourceBufferReconcilePendingHasEntries(pending)) pending = null;
+    provider.dashSourceBufferReconcilePending = pending;
+    provider.dashSourceBufferConfigUncertain = !!pending;
+  }
+
+  function invalidateDashControlTransition(provider, reason) {
+    if (!provider) return 0;
+    provider.dashControlTransitionGeneration = (provider.dashControlTransitionGeneration || 0) + 1;
+    var transaction = provider.dashControlTransitionInFlight;
+    if (!transaction) return provider.dashControlTransitionGeneration;
+    provider.dashControlTransitionInvalidationCount = (provider.dashControlTransitionInvalidationCount || 0) + 1;
+    provider.lastDashControlTransitionInvalidationReason = reason || 'request-cancel';
+    queueDashSourceBufferConfigurationReconciliation(provider, transaction, reason);
+    if (!provider.destroyed && transaction.kind === 'video' && transaction.reason === 'manual' && transaction.target) {
+      if (!provider.pendingManualVideoSwitch) {
+        provider.pendingManualVideoSwitch = {
+          repId: transaction.target.id,
+          clearBuffer: transaction.clearBuffer
+        };
+      }
+    }
+    if (!provider.destroyed && transaction.kind === 'audio' && transaction.target) {
+      if (!provider.pendingAudioSwitch) provider.pendingAudioSwitch = { repId: transaction.target.id };
+    }
+    provider.dashControlTransitionInFlight = null;
+    if (transaction.kind === 'video') provider.videoSwitchInFlight = false;
+    if (transaction.kind === 'audio') provider.audioSwitchInFlight = false;
+    if (transaction.kind === 'recovery') provider.nativeRecoveryInProgress = false;
+    return provider.dashControlTransitionGeneration;
+  }
+
+  function flushPendingDashControlTransition(provider) {
+    if (!provider || provider.destroyed || provider.dashControlTransitionInFlight) return false;
+    if (NativeDashProvider.prototype._flushPendingVideoSwitch.call(provider)) return true;
+    var pendingAudio = provider.pendingAudioSwitch;
+    if (pendingAudio) {
+      provider.pendingAudioSwitch = null;
+      var audioRep = (provider.audioReps || []).find(function (item) { return item.id === pendingAudio.repId; });
+      if (audioRep && (!provider.audio || audioRep.id !== provider.audio.id)) {
+        var switchAudio = provider._switchAudio || NativeDashProvider.prototype._switchAudio;
+        switchAudio.call(provider, audioRep);
+        if (provider.dashControlTransitionInFlight || provider.audioSwitchInFlight) return true;
+      }
+    }
+    if (provider.dashSourceBufferConfigUncertain && dashSourceBufferReconcilePendingHasEntries(provider.dashSourceBufferReconcilePending)) {
+      var reconcile = provider._reconcileSourceBufferConfiguration
+        || NativeDashProvider.prototype._reconcileSourceBufferConfiguration;
+      reconcile.call(provider);
+      return !!provider.dashControlTransitionInFlight;
+    }
+    return false;
+  }
+
+  function dashConfigurationSegmentAtTime(rep, currentTime) {
+    var segments = rep && rep.segments || [];
+    var fallback = null;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (seg.state === 'expired') continue;
+      if (seg.start <= currentTime + 0.05 && seg.end > currentTime - 0.05) return seg;
+      if (!fallback && seg.end > currentTime - 0.05) fallback = seg;
+    }
+    return fallback || segments[segments.length - 1] || null;
+  }
+
+  function appendDashControlSourceBufferConfiguration(provider, transaction, kind, rep, sourceBuffer, currentTime, guard) {
+    if (!rep || !sourceBuffer) return Promise.resolve();
+    var seg = dashConfigurationSegmentAtTime(rep, currentTime);
+    var key = seg && seg.generationKey || rep.generationKey || generationKeyForRep(rep);
+    var typeRep = {
+      mimeType: seg && seg.mimeType || rep.mimeType,
+      codecs: seg && seg.codecs || rep.codecs
+    };
+    var initData = seg && provider._initDataForSegment
+      ? provider._initDataForSegment(rep, seg)
+      : Promise.resolve(rep.initData);
+    return initData.then(function (data) {
+      guard();
+      if (!data) throw new Error('dash-sourcebuffer-config-init-missing');
+      markDashSourceBufferConfigurationMutation(provider, transaction, kind);
+      rep._appendedInitKey = '';
+      var change = kind === 'audio'
+        ? provider._changeAudioTypeIfNeeded(typeRep, sourceBuffer, guard)
+        : provider._changeVideoTypeIfNeeded(typeRep, sourceBuffer, guard);
+      return change.then(function () {
+        guard();
+        return appendBuffer(sourceBuffer, data, seg && seg.appendWindow, undefined, guard);
+      }).then(function () {
+        guard();
+        rep._appendedInitKey = key;
+      });
+    });
+  }
+
+  function reconcileDashSourceBufferKind(provider, transaction, kind, guard) {
+    var rep = kind === 'audio' ? provider.audio : provider.activeVideo;
+    var sourceBuffer = kind === 'audio' ? transaction.audioSourceBuffer : transaction.videoSourceBuffer;
+    if (!rep || !sourceBuffer) return Promise.resolve();
+    var currentTime = provider.video.currentTime || 0;
+    var prepare = provider._prepareRep ? provider._prepareRep(rep) : Promise.resolve(rep);
+    return prepare.then(function () {
+      guard();
+      return waitForVodSourceBufferQueue(sourceBuffer);
+    }).then(function () {
+      guard();
+      return appendDashControlSourceBufferConfiguration(
+        provider,
+        transaction,
+        kind,
+        rep,
+        sourceBuffer,
+        currentTime,
+        guard
+      );
+    });
+  }
+
+  NativeDashProvider.prototype._reconcileSourceBufferConfiguration = function () {
+    if (
+      this.destroyed
+      || this.dashControlTransitionInFlight
+      || !this.dashSourceBufferConfigUncertain
+      || !dashSourceBufferReconcilePendingHasEntries(this.dashSourceBufferReconcilePending)
+    ) return Promise.resolve(false);
+    try { this._abortRequests('sourcebuffer-config-reconcile-start'); } catch (e) {}
+    var transaction = beginDashControlTransition(this, 'reconcile', null, false, 'sourcebuffer-config-reconcile');
+    if (!transaction) return Promise.resolve(false);
+    var self = this;
+    var guard = dashControlTransitionGuard(this, transaction);
+    var pending = this.dashSourceBufferReconcilePending;
+    this.dashSourceBufferReconcileAttemptCount = (this.dashSourceBufferReconcileAttemptCount || 0) + 1;
+    var chain = Promise.resolve();
+    if (pending.video) chain = chain.then(function () {
+      return reconcileDashSourceBufferKind(self, transaction, 'video', guard);
+    });
+    if (pending.audio) chain = chain.then(function () {
+      return reconcileDashSourceBufferKind(self, transaction, 'audio', guard);
+    });
+    return chain.then(function () {
+      guard();
+      commitDashSourceBufferConfiguration(self, transaction);
+      self.dashSourceBufferReconcileSuccessCount = (self.dashSourceBufferReconcileSuccessCount || 0) + 1;
+      finishDashControlTransition(self, transaction, true);
+      if (!flushPendingDashControlTransition(self)) self._tick(true);
+      return true;
+    }).catch(function (err) {
+      if (!dashControlTransitionIsCurrent(self, transaction)) {
+        return handleStaleDashControlTransition(self, transaction, 'sourcebuffer-config-reconcile-stale');
+      }
+      self.dashSourceBufferReconcileFailureCount = (self.dashSourceBufferReconcileFailureCount || 0) + 1;
+      self.lastError = err && err.message ? err.message : 'dash-sourcebuffer-config-reconcile-failed';
+      queueDashSourceBufferConfigurationReconciliation(self, transaction, 'sourcebuffer-config-reconcile-failed');
+      finishDashControlTransition(self, transaction, false);
+      if (self._tryNativeRecovery) return self._tryNativeRecovery('dash-sourcebuffer-config-reconcile');
+      if (self._completeNativeRuntimeTerminal) self._completeNativeRuntimeTerminal('dash-sourcebuffer-config-reconcile-failed');
+      return false;
+    });
   };
 
   NativeDashProvider.prototype._drainAppendQueue = function (rep, sb) {
     var self = this;
-    if (!rep || !rep.segments || !sb || sb.updating || rep._appending) return false;
+    var activeSourceBuffer = rep && rep.kind === 'audio' ? this.audioSb : this.videoSb;
+    if (activeSourceBuffer) sb = activeSourceBuffer;
+    if (!rep || !rep.segments || !sb || sb.updating || rep._appending || rep._appendOwner) return false;
+    if (this.dashSourceBufferConfigUncertain || this.dashControlTransitionInFlight || (rep.kind === 'video' && this.videoSwitchInFlight)) return false;
     var next = nextFetchedSegmentForAppend(rep, this.video.currentTime || 0);
     if (!next) return false;
     rep._appending = true;
     next.state = 'appending';
+    next._appendStartedAt = performance.now();
     var data = next._data;
     delete next._data;
-    this._appendSegmentData(rep, sb, next, data).then(function () {
+    var appendTransaction = createDashAppendTransaction(this, rep, next, sb, true);
+    rep._appendOwner = appendTransaction;
+    next._appendOwner = appendTransaction;
+    this._appendSegmentData(rep, sb, next, data, appendTransaction).then(function () {
+      assertDashAppendTransactionCurrent(self, appendTransaction);
       next.state = 'appended';
       next.appended = true;
       delete next._fetchStartedAt;
+      delete next._appendStartedAt;
+      delete next._appendOwner;
+      rep._appendOwner = null;
       rep._appending = false;
       self.appendFailures = 0;
       self.stallReports = 0;
@@ -4536,12 +7215,35 @@
       if (self.engine && self.engine._telemetry) self.engine._telemetry.record('scheduler-drain', {
         schedulerQueueDepth: self._schedulerQueueDepth()
       });
-      self._drainAppendQueue(rep, sb);
+      if (self._checkBufferMilestones) self._checkBufferMilestones();
+      var transitionStarted = flushPendingDashControlTransition(self);
+      if (!transitionStarted) self._drainAppendQueue(rep, sb);
       if (self._maybeEndVodStream) self._maybeEndVodStream();
-      self._tick();
+      if (!transitionStarted) self._tick();
     }).catch(function (err) {
-      rep._appending = false;
-      if (err.name !== 'AbortError') {
+      var ownsRep = rep._appendOwner === appendTransaction;
+      var ownsSegment = next._appendOwner === appendTransaction;
+      var configurationQueued = ownsSegment
+        ? queueDashSourceBufferConfigurationReconciliation(self, appendTransaction, 'dash-append-failed')
+        : false;
+      if (ownsRep) {
+        rep._appendOwner = null;
+        rep._appending = false;
+      }
+      if (!ownsSegment) return;
+      delete next._appendOwner;
+      delete next._appendStartedAt;
+      if (err.name === 'AbortError') {
+        if (!self.destroyed && next.state === 'appending') {
+          next.state = 'pending';
+          next.appended = false;
+        }
+        if (!self.destroyed && !self.dashControlTransitionInFlight) {
+          if (configurationQueued || self.pendingManualVideoSwitch || self.pendingAudioSwitch) {
+            flushPendingDashControlTransition(self);
+          }
+        }
+      } else {
         next.state = 'failed';
         next.appended = false;
         self._handleAppendFailure(rep, err);
@@ -4551,17 +7253,26 @@
   };
 
   NativeDashProvider.prototype._maybeEndVodStream = function () {
-    if (this.live || !this.mediaSource || this.mediaSource.readyState !== 'open') return false;
-    if ((this.videoSb && this.videoSb.updating) || (this.audioSb && this.audioSb.updating)) return false;
-    if (!this.activeVideo || !segmentsAppendedThroughEnd(this.activeVideo.segments, this.duration)) return false;
-    if (this.audio && !segmentsAppendedThroughEnd(this.audio.segments, this.duration)) return false;
-    try {
-      this.mediaSource.endOfStream();
-      this.vodEndOfStreamCount++;
-      return true;
-    } catch (e) {
+    if (this.live || !this.mediaSource) return false;
+    if (this.mediaSource.readyState === 'ended') {
+      this.vodEndOfStreamPending = false;
       return false;
     }
+    if (this.mediaSource.readyState !== 'open') return false;
+    if (!this.vodEndOfStreamPending) {
+      if (
+        !this.activeVideo
+        || !segmentsAppendedThroughEnd(this.activeVideo.segments, this.activeVideo.duration || this.duration)
+      ) return false;
+      if (!sourceBufferCoversPlayableEnd(this.videoSb, playableSegmentEnd(this.activeVideo.segments))) return false;
+      if (
+        this.audio
+        && !segmentsAppendedThroughEnd(this.audio.segments, this.audio.duration || this.duration)
+      ) return false;
+      if (this.audio && !sourceBufferCoversPlayableEnd(this.audioSb, playableSegmentEnd(this.audio.segments))) return false;
+      this.vodEndOfStreamPending = true;
+    }
+    return finalizeVodEndOfStream(this, [this.videoSb, this.audioSb]);
   };
 
   NativeDashProvider.prototype._selectNextSegment = function (rep, currentTime, targetTime) {
@@ -4579,31 +7290,43 @@
     return candidates[0];
   };
 
-  NativeDashProvider.prototype._appendSegmentData = function (rep, sb, seg, data) {
+  NativeDashProvider.prototype._appendSegmentData = function (rep, sb, seg, data, appendTransaction) {
     var self = this;
-    var prepare = this._prepareSegmentGeneration ? this._prepareSegmentGeneration(rep, sb, seg) : Promise.resolve();
+    appendTransaction = appendTransaction || createDashAppendTransaction(this, rep, seg, sb, false);
+    var guard = dashAppendTransactionGuard(this, appendTransaction);
+    var prepare = this._prepareSegmentGeneration
+      ? this._prepareSegmentGeneration(rep, sb, seg, appendTransaction)
+      : Promise.resolve();
     return prepare.then(function () {
-      var activeSb = rep && rep.kind === 'audio' ? self.audioSb : self.videoSb;
-      return appendBuffer(activeSb || sb, data, seg.appendWindow);
+      assertDashAppendTransactionCurrent(self, appendTransaction);
+      return appendBuffer(appendTransaction.sourceBuffer, data, seg.appendWindow, undefined, guard);
     }).catch(function (err) {
       if (!isQuotaExceeded(err)) throw err;
+      assertDashAppendTransactionCurrent(self, appendTransaction);
       self.quotaRecoveries++;
       self.lastError = 'quota-exceeded';
       self.engine._telemetry.record('recovery', { lastError: 'quota-exceeded' });
-      return self._recoverQuota(rep, sb, data).catch(function (retryErr) {
-        seg.state = 'failed';
-        throw retryErr;
-      });
+      return self._recoverQuota(rep, appendTransaction.sourceBuffer, data, appendTransaction);
+    }).then(function (result) {
+      assertDashAppendTransactionCurrent(self, appendTransaction);
+      commitDashSourceBufferConfiguration(self, appendTransaction);
+      return result;
     });
   };
 
-  NativeDashProvider.prototype._prepareSegmentGeneration = function (rep, sb, seg) {
+  NativeDashProvider.prototype._prepareSegmentGeneration = function (rep, sb, seg, appendTransaction) {
     if (!rep || !seg) return Promise.resolve();
+    appendTransaction = appendTransaction || createDashAppendTransaction(this, rep, seg, sb, false);
     var key = seg.generationKey || rep.generationKey || generationKeyForRep(rep);
     var nextMime = segmentMime(seg, rep);
     var currentMime = rep.kind === 'audio' ? this.audioMime : this.videoMime;
     var self = this;
     var chain = Promise.resolve();
+    try {
+      assertDashAppendTransactionCurrent(this, appendTransaction);
+    } catch (err) {
+      return Promise.reject(err);
+    }
     if (nextMime && nextMime !== currentMime) {
       if (!window.MediaSource || !MediaSource.isTypeSupported(nextMime)) {
         this.lastPeriodTransitionReason = 'unsupported-codec';
@@ -4615,13 +7338,18 @@
         codecs: seg.codecs || rep.codecs
       };
       chain = chain.then(function () {
+        assertDashAppendTransactionCurrent(self, appendTransaction);
+        markDashAppendSourceBufferConfigurationMutation(self, appendTransaction, rep.kind === 'audio' ? 'audio' : 'video', key);
         var change = rep.kind === 'audio' ? self._changeAudioTypeIfNeeded(typeRep) : self._changeVideoTypeIfNeeded(typeRep);
         return change.then(function () {
+          assertDashAppendTransactionCurrent(self, appendTransaction);
           self.periodTransitionCount = (self.periodTransitionCount || 0) + 1;
           self.lastPeriodTransitionReason = 'changeType';
           self.lastPeriodTransitionError = '';
         }).catch(function (err) {
-          return self._rebuildSourceBufferForPeriod(rep, sb, seg, nextMime, err).catch(function (rebuildErr) {
+          assertDashAppendTransactionCurrent(self, appendTransaction);
+          return self._rebuildSourceBufferForPeriod(rep, appendTransaction.sourceBuffer, seg, nextMime, err, appendTransaction).catch(function (rebuildErr) {
+            if (rebuildErr && rebuildErr.name === 'AbortError') throw rebuildErr;
             self.lastPeriodTransitionError = rebuildErr && rebuildErr.message ? rebuildErr.message : 'dash-period-codec-change-unsupported';
             throw new Error('dash-period-codec-change-unsupported');
           });
@@ -4629,17 +7357,26 @@
       });
     }
     return chain.then(function () {
+      assertDashAppendTransactionCurrent(self, appendTransaction);
       if (rep._appendedInitKey === key) return;
       return self._initDataForSegment(rep, seg).then(function (initData) {
-        var activeSb = rep && rep.kind === 'audio' ? self.audioSb : self.videoSb;
-        return appendBuffer(activeSb || sb, initData, seg.appendWindow).then(function () {
+        assertDashAppendTransactionCurrent(self, appendTransaction);
+        markDashAppendSourceBufferConfigurationMutation(self, appendTransaction, rep.kind === 'audio' ? 'audio' : 'video', key);
+        return appendBuffer(
+          appendTransaction.sourceBuffer,
+          initData,
+          seg.appendWindow,
+          undefined,
+          dashAppendTransactionGuard(self, appendTransaction)
+        ).then(function () {
+          assertDashAppendTransactionCurrent(self, appendTransaction);
           rep._appendedInitKey = key;
         });
       });
     });
   };
 
-  NativeDashProvider.prototype._rebuildSourceBufferForPeriod = function (rep, sb, seg, nextMime, previousError) {
+  NativeDashProvider.prototype._rebuildSourceBufferForPeriod = function (rep, sb, seg, nextMime, previousError, appendTransaction) {
     if (!rep || !sb || !seg || !nextMime) return Promise.reject(new Error('dash-period-codec-change-unsupported'));
     if (!this.mediaSource || this.mediaSource.readyState !== 'open' || !this.mediaSource.addSourceBuffer || !this.mediaSource.removeSourceBuffer) {
       return Promise.reject(new Error('dash-period-sourcebuffer-rebuild-unavailable'));
@@ -4656,7 +7393,20 @@
         periodTransitionReason: this.lastPeriodTransitionReason
       });
     }
-    return waitForSourceBufferIdle(sb).then(function () {
+    return waitForDashAppendTopologyPeers(this, appendTransaction).then(function () {
+      if (appendTransaction) assertDashAppendTransactionCurrent(self, appendTransaction);
+      return waitForVodSourceBufferQueue(sb);
+    }).then(function () {
+      if (appendTransaction) assertDashAppendTransactionCurrent(self, appendTransaction);
+      else {
+        if (self.destroyed) throw abortError();
+        var currentSourceBuffer = kind === 'audio' ? self.audioSb : self.videoSb;
+        if (currentSourceBuffer !== sb) throw abortError();
+      }
+      if (sb.updating || appendQueueDepth(sb) > 0) {
+        throw new Error('dash-period-sourcebuffer-busy');
+      }
+      self.dashSourceBufferQueueDrainCount = (self.dashSourceBufferQueueDrainCount || 0) + 1;
       try {
         if (sb.abort && !sb.updating) sb.abort();
       } catch (e) {}
@@ -4679,7 +7429,9 @@
         self.videoSb = replacement;
         self.videoMime = nextMime;
       }
-      markSegmentsUnappended(rep);
+      updateDashAppendTransactionSourceBuffer(appendTransaction, replacement);
+      if (appendTransaction) assertDashAppendTransactionCurrent(self, appendTransaction);
+      reconcileDashSegmentLedgers(self, kind, null, rep, appendTransaction && appendTransaction.segment, true);
       rep._appendedInitKey = '';
       self.sourceBufferRebuildSuccessCount = (self.sourceBufferRebuildSuccessCount || 0) + 1;
       self.lastPeriodTransitionReason = 'sourcebuffer-rebuild';
@@ -4706,16 +7458,57 @@
     });
   };
 
-  NativeDashProvider.prototype._recoverQuota = function (rep, sb, data) {
+  NativeDashProvider.prototype._recoverQuota = function (rep, sb, data, appendTransaction) {
     var self = this;
+    appendTransaction = appendTransaction || createDashAppendTransaction(this, rep, null, sb, false);
+    var guard = dashAppendTransactionGuard(this, appendTransaction);
     var removeEnd = Math.max(0, (this.video.currentTime || 0) - 5);
-    return Promise.all([
-      removeBufferBefore(this.videoSb, removeEnd),
-      removeBufferBefore(this.audioSb, removeEnd)
-    ]).then(function () {
-      return appendBuffer(sb, data);
+    try {
+      assertDashAppendTransactionCurrent(this, appendTransaction);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    return waitForDashAppendTopologyPeers(this, appendTransaction).then(function () {
+      assertDashAppendTransactionCurrent(self, appendTransaction);
+      return Promise.all([
+        removeBufferBefore(self.videoSb, removeEnd, guard),
+        removeBufferBefore(self.audioSb, removeEnd, guard)
+      ]);
+    }).then(function (removedRanges) {
+      assertDashAppendTransactionCurrent(self, appendTransaction);
+      reconcileDashSegmentLedgers(
+        self,
+        'video',
+        removedRanges[0],
+        self.activeVideo,
+        appendTransaction.kind === 'video' ? appendTransaction.segment : null,
+        false
+      );
+      reconcileDashSegmentLedgers(
+        self,
+        'audio',
+        removedRanges[1],
+        self.audio,
+        appendTransaction.kind === 'audio' ? appendTransaction.segment : null,
+        false
+      );
+      var seg = appendTransaction.segment;
+      var retry = seg && self._prepareSegmentGeneration
+        ? self._prepareSegmentGeneration(rep, appendTransaction.sourceBuffer, seg, appendTransaction)
+        : Promise.resolve();
+      return retry.then(function () {
+        assertDashAppendTransactionCurrent(self, appendTransaction);
+        return appendBuffer(
+          appendTransaction.sourceBuffer,
+          data,
+          seg && seg.appendWindow,
+          undefined,
+          guard
+        );
+      });
     }).catch(function (err) {
       if (!isQuotaExceeded(err) || rep.kind !== 'video') throw err;
+      assertDashAppendTransactionCurrent(self, appendTransaction);
       var lower = self._lowerVideoRep();
       if (!lower) throw err;
       self.blacklisted[rep.id] = true;
@@ -4761,8 +7554,12 @@
   };
 
   NativeDashProvider.prototype._tryNativeRecovery = function (reason) {
-    if (this.destroyed || this.nativeRecoveryInProgress) return Promise.resolve(false);
-    this.nativeRecoveryInProgress = true;
+    if (this.destroyed || this.nativeRecoveryInProgress || this.dashControlTransitionInFlight) return Promise.resolve(false);
+    reason = reason || 'native-recovery';
+    try { this._abortRequests('native-recovery-start'); } catch (e) {}
+    var transaction = beginDashControlTransition(this, 'recovery', null, true, reason);
+    if (!transaction) return Promise.resolve(false);
+    var guard = dashControlTransitionGuard(this, transaction);
     this.nativeRecoveryAttemptCount++;
     this.recoveryCount++;
     this.lastNativeRecoveryReason = reason;
@@ -4772,55 +7569,81 @@
     if (this.engine && this.engine._telemetry) this.engine._telemetry.record('recovery', { lastError: reason });
     var self = this;
     var currentTime = this.video.currentTime || 0;
-    try { this._abortRequests(); } catch (e) {}
-    if (this.activeVideo) {
-      markSegmentsForTime(this.activeVideo, currentTime, Math.max(2, this._bufferAheadGoal()));
-      this.activeVideo._appendedInitKey = '';
-    }
-    if (this.audio) {
-      markSegmentsForTime(this.audio, currentTime, Math.max(2, this._bufferAheadGoal()));
-      this.audio._appendedInitKey = '';
-    }
+    if (transaction.previousVideo) transaction.previousVideo._appendedInitKey = '';
+    if (transaction.previousAudio) transaction.previousAudio._appendedInitKey = '';
     return Promise.all([
-      this.videoSb ? resetSourceBuffer(this.videoSb, currentTime) : Promise.resolve(),
-      this.audioSb ? resetSourceBuffer(this.audioSb, currentTime) : Promise.resolve()
-    ]).then(function () {
+      transaction.videoSourceBuffer ? resetSourceBuffer(transaction.videoSourceBuffer, currentTime, guard) : Promise.resolve(),
+      transaction.audioSourceBuffer ? resetSourceBuffer(transaction.audioSourceBuffer, currentTime, guard) : Promise.resolve()
+    ]).then(function (removedRanges) {
+      guard();
+      reconcileDashSegmentLedgers(self, 'video', removedRanges[0], transaction.previousVideo, null, false);
+      reconcileDashSegmentLedgers(self, 'audio', removedRanges[1], transaction.previousAudio, null, false);
+      if (transaction.previousVideo) {
+        markSegmentsForTime(transaction.previousVideo, currentTime, Math.max(2, self._bufferAheadGoal()));
+      }
+      if (transaction.previousAudio) {
+        markSegmentsForTime(transaction.previousAudio, currentTime, Math.max(2, self._bufferAheadGoal()));
+      }
       var chain = Promise.resolve();
-      if (self.videoSb && self.activeVideo && self.activeVideo.initData) {
+      if (transaction.videoSourceBuffer && transaction.previousVideo) {
         chain = chain.then(function () {
-          return self._changeVideoTypeIfNeeded(self.activeVideo).then(function () {
-            return appendBuffer(self.videoSb, self.activeVideo.initData);
-          }).then(function () {
-            self.activeVideo._appendedInitKey = self.activeVideo.generationKey || generationKeyForRep(self.activeVideo);
-          });
+          guard();
+          return appendDashControlSourceBufferConfiguration(
+            self,
+            transaction,
+            'video',
+            transaction.previousVideo,
+            transaction.videoSourceBuffer,
+            currentTime,
+            guard
+          );
         });
       }
-      if (self.audioSb && self.audio && self.audio.initData) {
+      if (transaction.audioSourceBuffer && transaction.previousAudio) {
         chain = chain.then(function () {
-          return self._changeAudioTypeIfNeeded(self.audio).then(function () {
-            return appendBuffer(self.audioSb, self.audio.initData);
-          }).then(function () {
-            self.audio._appendedInitKey = self.audio.generationKey || generationKeyForRep(self.audio);
-          });
+          guard();
+          return appendDashControlSourceBufferConfiguration(
+            self,
+            transaction,
+            'audio',
+            transaction.previousAudio,
+            transaction.audioSourceBuffer,
+            currentTime,
+            guard
+          );
         });
       }
       return chain;
     }).then(function () {
+      guard();
       self.nativeRecoverySuccessCount++;
       self.appendFailures = 0;
       self.stallReports = 0;
-      self.nativeRecoveryInProgress = false;
+      commitDashSourceBufferConfiguration(self, transaction);
+      finishDashControlTransition(self, transaction, true);
+      if (flushPendingDashControlTransition(self)) return true;
       self._tick(true);
       return true;
     }).catch(function (err) {
-      self.nativeRecoveryInProgress = false;
+      if (!dashControlTransitionIsCurrent(self, transaction)) {
+        handleStaleDashControlTransition(self, transaction, reason + '-stale');
+        if (self.nativeRecoveryReasons) delete self.nativeRecoveryReasons[reason];
+        return false;
+      }
       self.lastError = err && err.message ? err.message : reason + '-failed';
+      queueDashSourceBufferConfigurationReconciliation(self, transaction, reason + '-failed');
+      finishDashControlTransition(self, transaction, false);
+      if (reason === 'dash-sourcebuffer-config-reconcile' && self.dashSourceBufferConfigUncertain) {
+        if (self._completeNativeRuntimeTerminal) self._completeNativeRuntimeTerminal('dash-sourcebuffer-config-reconcile-failed');
+        return false;
+      }
+      if (!flushPendingDashControlTransition(self)) self._tick(true);
       return false;
     });
   };
 
   NativeDashProvider.prototype._maybeSwitchAuto = function () {
-    if (!this.engine._player.config.abr.enabled || this.manualTrackId || this.videoSwitchInFlight) return;
+    if (this.dashSourceBufferConfigUncertain || !this.engine._player.config.abr.enabled || this.manualTrackId || this.videoSwitchInFlight || this.dashControlTransitionInFlight) return;
     var ahead = getBufferAhead(this.video);
     var current = this.activeVideo;
     var candidates = this._candidateVideos();
@@ -4931,74 +7754,129 @@
   };
 
   NativeDashProvider.prototype._switchVideo = function (rep, clearBuffer, reason) {
-    if (!rep || !this.activeVideo || rep.id === this.activeVideo.id || this.destroyed || this.videoSwitchInFlight) return;
-    var self = this;
-    var previous = this.activeVideo;
+    if (!rep || !this.activeVideo || rep.id === this.activeVideo.id || this.destroyed) return Promise.resolve(false);
     var switchReason = reason || (clearBuffer ? 'manual' : 'auto');
-    this.videoSwitchInFlight = true;
-    if (clearBuffer) this._abortRequests();
-    this._prepareRep(rep).then(function () {
+    if (this.dashSourceBufferConfigUncertain && switchReason !== 'manual') {
+      flushPendingDashControlTransition(this);
+      return Promise.resolve(false);
+    }
+    if (this.videoSwitchInFlight || this.dashControlTransitionInFlight) {
+      if (switchReason === 'manual') {
+        this.pendingManualVideoSwitch = { repId: rep.id, clearBuffer: clearBuffer !== false };
+      }
+      return Promise.resolve(false);
+    }
+    if (!clearBuffer && dashAppendWorkInFlight(this)) {
+      if (switchReason === 'manual') {
+        this.pendingManualVideoSwitch = { repId: rep.id, clearBuffer: false };
+      }
+      return Promise.resolve(false);
+    }
+    var self = this;
+    if (clearBuffer) this._abortRequests('video-switch-start');
+    var transaction = beginDashControlTransition(this, 'video', rep, clearBuffer, switchReason);
+    if (!transaction) return Promise.resolve(false);
+    var guard = dashControlTransitionGuard(this, transaction);
+    var transition = this._prepareRep(rep).then(function () {
+      guard();
       var videoReady;
       if (clearBuffer) {
+        transaction.bufferMutationStarted = true;
         markSegmentsUnappended(rep);
-        videoReady = resetSourceBuffer(self.videoSb, self.video.currentTime);
+        videoReady = resetSourceBuffer(transaction.videoSourceBuffer, self.video.currentTime, guard).then(function (removedRange) {
+          guard();
+          reconcileDashSegmentLedgers(self, 'video', removedRange, rep, null, false);
+        });
       } else {
-        videoReady = Promise.resolve(self.videoSb._nativeQueue).catch(function () {}).then(function () {
-          return waitForSourceBufferIdle(self.videoSb);
-        }).then(function () {
+        videoReady = waitForVodSourceBufferQueue(transaction.videoSourceBuffer).then(function () {
+          guard();
           markSegmentsCoveredByBuffer(rep, self.video);
         });
       }
       return videoReady.then(function () {
-        return self._changeVideoTypeIfNeeded(rep);
-      }).then(function () {
-        return appendBuffer(self.videoSb, rep.initData).then(function () {
-          rep._appendedInitKey = rep.generationKey || generationKeyForRep(rep);
-        });
+        guard();
+        transaction.bufferMutationStarted = true;
+        return appendDashControlSourceBufferConfiguration(
+          self,
+          transaction,
+          'video',
+          rep,
+          transaction.videoSourceBuffer,
+          self.video.currentTime || 0,
+          guard
+        );
       });
     }).then(function () {
+      guard();
       self.activeVideo = rep;
       self.lastSwitchAt = performance.now();
       self.lastSwitchReason = switchReason;
-      self.videoSwitchInFlight = false;
+      commitDashSourceBufferConfiguration(self, transaction);
+      finishDashControlTransition(self, transaction, true);
       self.engine._player.emit('variantchanged');
       console.log('[native-dash] selected video id=' + rep.id + ' height=' + rep.height + ' codec=' + rep.codecs + ' reason=' + self.lastSwitchReason);
-      if (self._flushPendingVideoSwitch()) return;
+      if (flushPendingDashControlTransition(self)) return true;
       self._tick(true);
+      return true;
     }).catch(function (err) {
-      self.blacklisted[rep.id] = true;
-      self.lastError = err && err.message ? err.message : 'dash-variant-switch-failed';
+      if (!dashControlTransitionIsCurrent(self, transaction)) {
+        return handleStaleDashControlTransition(self, transaction, 'video-switch-stale');
+      }
+      var switchError = err && err.message ? err.message : 'dash-variant-switch-failed';
+      self.dashControlTransitionRollbackCount = (self.dashControlTransitionRollbackCount || 0) + 1;
       // A codec change can succeed before the new initialization append fails.
       // Restore the previous SourceBuffer type before allowing its scheduler to
       // continue, and never leave the failed rendition reported as active.
-      var restore = previous
-        ? self._changeVideoTypeIfNeeded(previous).then(function () {
-          if (!clearBuffer) return;
-          markSegmentsUnappended(previous);
-          return self._prepareRep(previous).then(function () {
-            return appendBuffer(self.videoSb, previous.initData);
-          }).then(function () {
-            previous._appendedInitKey = previous.generationKey || generationKeyForRep(previous);
-          });
-        }).catch(function (restoreError) {
-          self.lastError += '; rollback: ' + (restoreError && restoreError.message
-            ? restoreError.message
-            : 'dash-variant-rollback-failed');
-        })
-        : Promise.resolve();
-      restore.then(function () {
+      var previous = transaction.previousVideo;
+      var restore = Promise.resolve();
+      if (previous && transaction.bufferMutationStarted) {
+        if (clearBuffer) markSegmentsUnappended(previous);
+        restore = self._prepareRep(previous).then(function () {
+          guard();
+          return appendDashControlSourceBufferConfiguration(
+            self,
+            transaction,
+            'video',
+            previous,
+            transaction.videoSourceBuffer,
+            self.video.currentTime || 0,
+            guard
+          );
+        });
+      }
+      return restore.then(function () {
+        guard();
+        self.blacklisted[rep.id] = true;
+        self.lastError = switchError;
         self.activeVideo = previous;
-        self.videoSwitchInFlight = false;
+        commitDashSourceBufferConfiguration(self, transaction);
+        finishDashControlTransition(self, transaction, false);
         console.warn('[native-dash] switch failed id=' + rep.id + ': ' + self.lastError);
-        if (self._flushPendingVideoSwitch()) return;
-        self._tick(true);
+        if (!flushPendingDashControlTransition(self)) self._tick(true);
+        return false;
+      }).catch(function (restoreError) {
+        if (!dashControlTransitionIsCurrent(self, transaction)) {
+          return handleStaleDashControlTransition(self, transaction, 'video-switch-rollback-stale');
+        }
+        self.dashControlTransitionRollbackFailureCount = (self.dashControlTransitionRollbackFailureCount || 0) + 1;
+        self.blacklisted[rep.id] = true;
+        self.lastError = switchError + '; rollback: ' + (restoreError && restoreError.message
+          ? restoreError.message
+          : 'dash-variant-rollback-failed');
+        self.activeVideo = previous;
+        queueDashSourceBufferConfigurationReconciliation(self, transaction, 'video-switch-rollback-failed');
+        finishDashControlTransition(self, transaction, false);
+        console.warn('[native-dash] switch failed id=' + rep.id + ': ' + self.lastError);
+        if (!flushPendingDashControlTransition(self)) self._tick(true);
+        return false;
       });
     });
+    return transition;
   };
 
   NativeDashProvider.prototype._flushPendingVideoSwitch = function () {
     var pending = this.pendingManualVideoSwitch;
-    if (!pending || this.destroyed || this.videoSwitchInFlight) return false;
+    if (!pending || this.destroyed || this.videoSwitchInFlight || this.dashControlTransitionInFlight) return false;
     this.pendingManualVideoSwitch = null;
     var rep = this.videoReps.find(function (item) { return item.id === pending.repId; });
     if (!rep || !variantSelectable(this, rep)) return false;
@@ -5007,15 +7885,22 @@
       return false;
     }
     this._switchVideo(rep, pending.clearBuffer, 'manual');
-    return this.videoSwitchInFlight;
+    return !!(this.videoSwitchInFlight || this.dashControlTransitionInFlight);
   };
 
-  NativeDashProvider.prototype._changeVideoTypeIfNeeded = function (rep) {
+  NativeDashProvider.prototype._flushPendingDashControlTransition = function () {
+    return flushPendingDashControlTransition(this);
+  };
+
+  NativeDashProvider.prototype._changeVideoTypeIfNeeded = function (rep, sourceBuffer, guard) {
+    if (guard) guard();
+    sourceBuffer = sourceBuffer || this.videoSb;
     var nextMime = mime(rep);
     if (nextMime === this.videoMime) return Promise.resolve();
-    if (!this.videoSb.changeType) return Promise.reject(new Error('sourcebuffer-changeType-unavailable'));
+    if (!sourceBuffer || !sourceBuffer.changeType) return Promise.reject(new Error('sourcebuffer-changeType-unavailable'));
     try {
-      this.videoSb.changeType(nextMime);
+      sourceBuffer.changeType(nextMime);
+      if (guard) guard();
       this.videoMime = nextMime;
       return Promise.resolve();
     } catch (e) {
@@ -5076,7 +7961,7 @@
     if (!rep || !variantSelectable(this, rep)) return;
     this.manualTrackId = rep.id;
     this.engine._player.config.abr.enabled = false;
-    if (this.videoSwitchInFlight) {
+    if (this.videoSwitchInFlight || this.dashControlTransitionInFlight) {
       this.pendingManualVideoSwitch = {
         repId: rep.id,
         clearBuffer: clearBuffer !== false
@@ -5100,6 +7985,10 @@
   NativeDashProvider.prototype.selectAudioTrack = function (track) {
     var rep = this.audioReps.find(function (r) { return r.id === track.id || r.language === track.language; });
     if (!rep || this.destroyed || this.audio && rep.id === this.audio.id) return;
+    if (this.audioSwitchInFlight || this.dashControlTransitionInFlight) {
+      this.pendingAudioSwitch = { repId: rep.id };
+      return;
+    }
     this._switchAudio(rep);
   };
 
@@ -5190,34 +8079,105 @@
   };
 
   NativeDashProvider.prototype._switchAudio = function (rep) {
+    if (!rep || this.destroyed || this.audio && rep.id === this.audio.id) return Promise.resolve(false);
+    if (this.audioSwitchInFlight || this.dashControlTransitionInFlight) {
+      this.pendingAudioSwitch = { repId: rep.id };
+      return Promise.resolve(false);
+    }
     var self = this;
-    this._abortRequests();
-    this.audio = rep;
-    this.engine._player.emit('audiotrackchanged', this.getActiveAudioTrack());
-    console.log('[native-dash] selected audio id=' + rep.id + ' lang=' + (rep.language || '') + ' codec=' + rep.codecs);
-    this._prepareRep(rep).then(function () {
+    this._abortRequests('audio-switch-start');
+    var transaction = beginDashControlTransition(this, 'audio', rep, true, 'manual-audio');
+    if (!transaction) return Promise.resolve(false);
+    var guard = dashControlTransitionGuard(this, transaction);
+    var transition = this._prepareRep(rep).then(function () {
+      guard();
+      transaction.bufferMutationStarted = true;
       markSegmentsUnappended(rep);
-      return resetSourceBuffer(self.audioSb, self.video.currentTime);
-    }).then(function () {
-      return self._changeAudioTypeIfNeeded(rep);
-    }).then(function () {
-      return appendBuffer(self.audioSb, rep.initData).then(function () {
-        rep._appendedInitKey = rep.generationKey || generationKeyForRep(rep);
+      return resetSourceBuffer(transaction.audioSourceBuffer, self.video.currentTime, guard).then(function (removedRange) {
+        guard();
+        reconcileDashSegmentLedgers(self, 'audio', removedRange, rep, null, false);
       });
     }).then(function () {
+      guard();
+      return appendDashControlSourceBufferConfiguration(
+        self,
+        transaction,
+        'audio',
+        rep,
+        transaction.audioSourceBuffer,
+        self.video.currentTime || 0,
+        guard
+      );
+    }).then(function () {
+      guard();
+      self.audio = rep;
+      commitDashSourceBufferConfiguration(self, transaction);
+      finishDashControlTransition(self, transaction, true);
+      self.engine._player.emit('audiotrackchanged', self.getActiveAudioTrack());
+      console.log('[native-dash] selected audio id=' + rep.id + ' lang=' + (rep.language || '') + ' codec=' + rep.codecs);
+      if (flushPendingDashControlTransition(self)) return true;
       self._tick(true);
+      return true;
     }).catch(function (err) {
-      self.lastError = err && err.message ? err.message : 'audio-switch-failed';
-      console.warn('[native-dash] audio switch failed id=' + rep.id + ': ' + self.lastError);
+      if (!dashControlTransitionIsCurrent(self, transaction)) {
+        return handleStaleDashControlTransition(self, transaction, 'audio-switch-stale');
+      }
+      var switchError = err && err.message ? err.message : 'audio-switch-failed';
+      var previous = transaction.previousAudio;
+      var restore = Promise.resolve();
+      if (previous && transaction.bufferMutationStarted) {
+        self.dashControlTransitionRollbackCount = (self.dashControlTransitionRollbackCount || 0) + 1;
+        markSegmentsUnappended(previous);
+        restore = self._prepareRep(previous).then(function () {
+          guard();
+          return appendDashControlSourceBufferConfiguration(
+            self,
+            transaction,
+            'audio',
+            previous,
+            transaction.audioSourceBuffer,
+            self.video.currentTime || 0,
+            guard
+          );
+        });
+      }
+      return restore.then(function () {
+        guard();
+        self.audio = previous;
+        self.lastError = switchError;
+        commitDashSourceBufferConfiguration(self, transaction);
+        finishDashControlTransition(self, transaction, false);
+        console.warn('[native-dash] audio switch failed id=' + rep.id + ': ' + self.lastError);
+        if (!flushPendingDashControlTransition(self)) self._tick(true);
+        return false;
+      }).catch(function (restoreError) {
+        if (!dashControlTransitionIsCurrent(self, transaction)) {
+          return handleStaleDashControlTransition(self, transaction, 'audio-switch-rollback-stale');
+        }
+        self.dashControlTransitionRollbackFailureCount = (self.dashControlTransitionRollbackFailureCount || 0) + 1;
+        self.audio = previous;
+        self.lastError = switchError + '; rollback: ' + (restoreError && restoreError.message
+          ? restoreError.message
+          : 'dash-audio-rollback-failed');
+        queueDashSourceBufferConfigurationReconciliation(self, transaction, 'audio-switch-rollback-failed');
+        finishDashControlTransition(self, transaction, false);
+        console.warn('[native-dash] audio switch failed id=' + rep.id + ': ' + self.lastError);
+        if (!flushPendingDashControlTransition(self)) self._tick(true);
+        return false;
+      });
     });
+    return transition;
   };
 
-  NativeDashProvider.prototype._changeAudioTypeIfNeeded = function (rep) {
+  NativeDashProvider.prototype._changeAudioTypeIfNeeded = function (rep, sourceBuffer, guard) {
+    if (guard) guard();
+    sourceBuffer = sourceBuffer || this.audioSb;
     var nextMime = mime(rep);
     if (nextMime === this.audioMime) return Promise.resolve();
-    if (!this.audioSb.changeType) return Promise.reject(new Error('sourcebuffer-changeType-unavailable'));
+    if (!sourceBuffer || !sourceBuffer.changeType) return Promise.reject(new Error('sourcebuffer-changeType-unavailable'));
     try {
-      this.audioSb.changeType(nextMime);
+      sourceBuffer.changeType(nextMime);
+      if (guard) guard();
       this.audioMime = nextMime;
       return Promise.resolve();
     } catch (e) {
@@ -5231,7 +8191,7 @@
 
   NativeDashProvider.prototype.getLiveRange = function () {
     var range = this._effectiveLiveWindow ? this._effectiveLiveWindow() : this.liveWindow;
-    return range ? { start: range.start, end: range.end } : null;
+    return this.live && range ? { start: range.start, end: range.end } : null;
   };
 
   NativeDashProvider.prototype.seekRange = function () {
@@ -5324,6 +8284,8 @@
       lastHttpStatus: this.lastHttpStatus,
       gapJumpCount: this.gapJumpCount,
       lastGapSize: this.lastGapSize,
+      manifestGapJumpCount: this.manifestGapJumpCount || 0,
+      lastManifestGapSize: this.lastManifestGapSize || 0,
       activeCodecFamily: this.activeVideo ? codecFamily(this.activeVideo.codecs) : '',
       capabilityProbeCount: this.capabilityProbeCount,
       unsupportedCapabilityCount: this.unsupportedCapabilityCount,
@@ -5334,12 +8296,41 @@
       pendingSegmentCount: this._pendingSegmentCount ? this._pendingSegmentCount() : 0,
       appendQueueDepth: appendQueueDepth(this.videoSb) + appendQueueDepth(this.audioSb),
       requestCancellationCount: this.requestCancellationCount,
+      dashAppendTransactionCount: this.dashAppendTransactionCount || 0,
+      dashStaleAppendAbortCount: this.dashStaleAppendAbortCount || 0,
+      dashSourceBufferQueueDrainCount: this.dashSourceBufferQueueDrainCount || 0,
+      dashControlTransitionCount: this.dashControlTransitionCount || 0,
+      dashControlTransitionCommitCount: this.dashControlTransitionCommitCount || 0,
+      dashControlTransitionInvalidationCount: this.dashControlTransitionInvalidationCount || 0,
+      dashStaleControlTransitionAbortCount: this.dashStaleControlTransitionAbortCount || 0,
+      dashStaleControlTransitionReleaseCount: this.dashStaleControlTransitionReleaseCount || 0,
+      dashControlTransitionRollbackCount: this.dashControlTransitionRollbackCount || 0,
+      dashControlTransitionRollbackFailureCount: this.dashControlTransitionRollbackFailureCount || 0,
+      dashControlTransitionInFlight: !!this.dashControlTransitionInFlight,
+      dashControlTransitionKind: this.dashControlTransitionInFlight ? this.dashControlTransitionInFlight.kind : '',
+      dashSourceBufferConfigEpoch: this.dashSourceBufferConfigEpoch || 0,
+      dashSourceBufferCommittedConfigEpoch: this.dashSourceBufferCommittedConfigEpoch || 0,
+      dashSourceBufferConfigUncertain: !!this.dashSourceBufferConfigUncertain,
+      dashSourceBufferReconcileVideoPending: !!(this.dashSourceBufferReconcilePending && this.dashSourceBufferReconcilePending.video),
+      dashSourceBufferReconcileAudioPending: !!(this.dashSourceBufferReconcilePending && this.dashSourceBufferReconcilePending.audio),
+      dashSourceBufferReconcileQueuedCount: this.dashSourceBufferReconcileQueuedCount || 0,
+      dashSourceBufferReconcileAttemptCount: this.dashSourceBufferReconcileAttemptCount || 0,
+      dashSourceBufferReconcileSuccessCount: this.dashSourceBufferReconcileSuccessCount || 0,
+      dashSourceBufferReconcileFailureCount: this.dashSourceBufferReconcileFailureCount || 0,
+      dashSegmentLedgerReconcileCount: this.dashSegmentLedgerReconcileCount || 0,
+      dashSegmentLedgerInvalidationCount: this.dashSegmentLedgerInvalidationCount || 0,
+      pendingAudioTrackId: this.pendingAudioSwitch ? this.pendingAudioSwitch.repId : '',
+      lastDashControlTransitionInvalidationReason: this.lastDashControlTransitionInvalidationReason || '',
       seekBufferPending: !!this.seekBufferPending,
+      seekInteractionPending: !!this.seekInteractionPending,
       seekBufferReadyCount: this.seekBufferReadyCount || 0,
       bufferedSeekCount: this.bufferedSeekCount || 0,
       seekCount: this.seekCount || 0,
       seekCancelCount: this.seekCancelCount || 0,
       seekAbortCount: this.seekAbortCount || 0,
+      seekGeneration: this.seekGeneration || 0,
+      activeSeekGeneration: this.activeSeekGeneration || 0,
+      completedSeekGeneration: this.completedSeekGeneration || 0,
       lastSeekTarget: this.lastSeekTarget || 0,
       lastSeekMs: this.lastSeekMs || 0,
       effectiveSeekBufferGoal: this._seekBufferGoal ? this._seekBufferGoal() : STARTUP_BUFFER_GOAL,
@@ -5350,6 +8341,12 @@
       mediaFetchRetryCount: this.mediaFetchRetryCount || 0,
       mediaUrlRefreshCount: this.mediaUrlRefreshCount || 0,
       vodEndOfStreamCount: this.vodEndOfStreamCount || 0,
+      vodEndOfStreamPending: !!this.vodEndOfStreamPending,
+      vodEndOfStreamRetryCount: this.vodEndOfStreamRetryCount || 0,
+      vodEndOfStreamRefillPending: !!this.vodEndOfStreamRefillPending,
+      vodEndOfStreamReopenCount: this.vodEndOfStreamReopenCount || 0,
+      vodFinalDuration: this.vodFinalDuration || 0,
+      liveToVodTransitionCount: this.liveToVodTransitionCount || 0,
       mediaFetchAverageMs: this.mediaFetchCompletedCount ? this.mediaFetchTotalMs / this.mediaFetchCompletedCount : 0,
       schedulerBackpressureCount: this.schedulerBackpressureCount || 0,
       schedulerDrainCount: this.schedulerDrainCount || 0,
@@ -5372,6 +8369,10 @@
       atLiveEdge: this.atLiveEdge,
       manifestRefreshCount: this.manifestRefreshCount,
       manifestRefreshFailed: this.manifestRefreshFailed,
+      manifestRefreshInFlight: !!this.manifestRefreshPromise,
+      manifestRefreshReasonInFlight: this.manifestRefreshReasonInFlight || '',
+      lastManifestPublishTime: isFinite(this.lastManifestPublishTime) ? this.lastManifestPublishTime : 0,
+      staleManifestResponseCount: this.staleManifestResponseCount || 0,
       offlinePlayback: !!(this.engine && this.engine._offlinePlayback),
       manifestFromServiceWorker: !!(this.engine && this.engine._manifestFromServiceWorker),
       segmentCacheHitCount: this.segmentCacheHitCount || 0,
@@ -5405,79 +8406,76 @@
 
   NativeDashProvider.prototype.beginSeek = function (targetTime) {
     var target = this._clampSeekTarget(targetTime);
-    this.lastSeekTarget = target;
-    this.lastSeekStartedAt = performance.now();
-    this.seekBufferPending = true;
-    if (this.engine && this.engine._setState) this.engine._setState('seeking');
-    return target;
+    return beginSeekOperation(this, target).target;
   };
 
   NativeDashProvider.prototype.commitSeek = function (targetTime) {
     var target = this._clampSeekTarget(targetTime);
-    if (!this.seekBufferPending
-      || !this.lastSeekStartedAt
-      || Math.abs(target - this.lastSeekTarget) > 0.05) {
-      this.beginSeek(target);
-    }
+    if (!seekOperationMatches(this, target)) this.beginSeek(target);
+    var generation = this.activeSeekGeneration;
     this.seekCount++;
     try { this.video.currentTime = target; } catch (e) {}
-    this._onSeek(target);
+    this._onSeek(target, generation);
     return target;
   };
 
   NativeDashProvider.prototype.cancelSeek = function () {
     this.seekCancelCount++;
-    this.seekBufferPending = false;
-    this.lastSeekStartedAt = 0;
-    if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
+    cancelSeekOperation(this);
   };
 
-  NativeDashProvider.prototype.endSeek = function () {
-    if (this.lastSeekStartedAt) this.lastSeekMs = performance.now() - this.lastSeekStartedAt;
-    this.lastSeekStartedAt = 0;
-    this.seekBufferPending = false;
-    if (this.engine && this.engine._setState && !this.engine._serverDown) this.engine._setState('ready');
+  NativeDashProvider.prototype.endSeek = function (generation) {
+    return finishSeekInteraction(this, generation);
+  };
+
+  NativeDashProvider.prototype._completeSeekBuffer = function (generation, buffered) {
+    return completeSeekBuffer(this, generation, buffered);
   };
 
   NativeDashProvider.prototype.seekDuringRecovery = function (targetTime) {
     this.commitSeek(targetTime);
   };
 
-  NativeDashProvider.prototype._onSeek = function (targetTime) {
+  NativeDashProvider.prototype._onSeek = function (targetTime, generation) {
     if (this.destroyed) return;
     var target = this._clampSeekTarget(targetTime == null ? this.video.currentTime : targetTime);
+    if (
+      !(generation > 0)
+      || generation !== this.activeSeekGeneration
+      || Math.abs(target - this.lastSeekTarget) > 0.05
+    ) {
+      generation = beginSeekOperation(this, target).generation;
+    }
     var now = performance.now();
-    if (this._lastSeekHandledTarget !== null && Math.abs(target - this._lastSeekHandledTarget) <= 0.05 && now - this._lastSeekHandledAt < 100) return;
+    if (
+      this._lastSeekHandledGeneration === generation
+      && this._lastSeekHandledTarget !== null
+      && Math.abs(target - this._lastSeekHandledTarget) <= 0.05
+      && now - this._lastSeekHandledAt < 100
+    ) return;
     this._lastSeekHandledTarget = target;
     this._lastSeekHandledAt = now;
+    this._lastSeekHandledGeneration = generation;
     if (Math.abs(target - (this.video.currentTime || 0)) > 0.05) {
       try { this.video.currentTime = target; } catch (e) {}
     }
-    this.engine._setState('seeking');
-    this.pendingSeek++;
     this.lastSeekTarget = target;
-    this.seekBufferPending = true;
     if (bufferedContains(this.video.buffered, target)) {
-      this.seekBufferPending = false;
-      this.seekBufferReadyCount++;
-      this.bufferedSeekCount++;
-      if (this.engine && this.engine._telemetry) {
-        this.engine._telemetry.record('seek-buffer-ready', { buffered: true });
-      }
+      completeSeekBuffer(this, generation, true);
       return;
     }
-    var cancelled = this._abortRequests();
+    var cancelled = this._abortRequests('seek');
     if (cancelled > 0) this.seekAbortCount += cancelled;
-    markSegmentsForTime(this.activeVideo, target, Math.max(2, this._seekBufferGoal()));
-    markSegmentsForTime(this.audio, target, Math.max(2, this._seekBufferGoal()));
-    this._tick(true);
-    var self = this;
-    setTimeout(function () {
-      if (!self.destroyed && !self.engine._serverDown) self.engine._setState('ready');
-    }, 250);
+    prepareVodStreamRefill(this);
+    prepareSegmentsForRefill(this.activeVideo, this.videoSb || this.video, target, Math.max(2, this._seekBufferGoal()));
+    prepareSegmentsForRefill(this.audio, this.audioSb || this.video, target, Math.max(2, this._seekBufferGoal()));
+    if (!flushPendingDashControlTransition(this)) this._tick(true);
   };
 
   NativeDashProvider.prototype._onWaiting = function () {
+    if (this._jumpManifestGap && this._jumpManifestGap()) return;
+    if (this._maybeEndVodStream && this._maybeEndVodStream()) return;
+    if (endedVodSchedulerIsIdle(this)) return;
     if (this.destroyed || this.rebufferStartedAt || this.video.paused || this.video.seeking) return;
     if (this._jumpSmallGap()) return;
     this.rebufferStartedAt = performance.now();
@@ -5501,8 +8499,12 @@
     addTimelineRegions(this, regions);
   };
 
-  NativeDashProvider.prototype._abortRequests = function () {
-    var cancelled = this.controllers.length + countKeys(this.activeRanges);
+  NativeDashProvider.prototype._abortRequests = function (reason) {
+    queueDashAppendSourceBufferConfigurationReconciliation(this, reason || 'request-cancel');
+    invalidateDashControlTransition(this, reason || 'request-cancel');
+    var cancelled = this.controllers.length + countKeys(this.activeRanges)
+      + (this.activeVideo && (this.activeVideo._appendOwner || this.activeVideo._appending) ? 1 : 0)
+      + (this.audio && (this.audio._appendOwner || this.audio._appending) ? 1 : 0);
     if (cancelled > 0) {
       this.requestCancellationCount += cancelled;
       if (this.engine && this.engine._telemetry) this.engine._telemetry.record('request-cancel', { cancelledRequests: cancelled });
@@ -5582,16 +8584,15 @@
     var readyGoal = this.seekBufferPending
       ? (this._seekBufferGoal ? this._seekBufferGoal() : STARTUP_BUFFER_GOAL)
       : (this._startupBufferGoal ? this._startupBufferGoal() : STARTUP_BUFFER_GOAL);
-    var ready = getBufferAhead(this.video) + 0.05 >= Math.min(readyGoal, this._bufferAheadGoal());
+    var bufferedAhead = this.seekBufferPending
+      ? getBufferAheadAt(this.video, this.lastSeekTarget, 0.05)
+      : getBufferAhead(this.video);
+    var ready = bufferedAhead + 0.05 >= startupBufferRequirement(this, readyGoal);
     if (ready && !this.startupBufferComplete) {
-      this.startupBufferComplete = true;
-      this.startupBufferMs = this.startupBufferStartedAt ? performance.now() - this.startupBufferStartedAt : 0;
-      this.engine._telemetry.record('startup-buffer-ready', { startupBufferMs: this.startupBufferMs });
+      markStartupBufferReady(this);
     }
     if (ready && this.seekBufferPending) {
-      this.seekBufferPending = false;
-      this.seekBufferReadyCount++;
-      this.engine._telemetry.record('seek-buffer-ready');
+      completeSeekBuffer(this, this.activeSeekGeneration, false);
     }
   };
 
@@ -5623,6 +8624,10 @@
     } catch (e) {
       return false;
     }
+  };
+
+  NativeDashProvider.prototype._jumpManifestGap = function () {
+    return jumpDeclaredManifestGap(this, 'dash');
   };
 
   NativeDashProvider.prototype._startNearLiveEdge = function () {
@@ -5686,12 +8691,57 @@
   NativeDashProvider.prototype._refreshPlaybackManifest = function (reason, swallowErrors) {
     var self = this;
     if (this.destroyed) return Promise.resolve();
-    return fetchManifest(this.engine, this.manifestUrl).then(function (manifest) {
+    if (this.manifestRefreshPromise) {
+      if (reason === 'media-error' && this.manifestRefreshReasonInFlight !== 'media-error') {
+        var causalRefresh = this.manifestRefreshPromise.catch(function () {}).then(function () {
+          return NativeDashProvider.prototype._refreshPlaybackManifest.call(self, reason, false);
+        });
+        return swallowErrors ? causalRefresh.catch(function () {}) : causalRefresh;
+      }
+      return swallowErrors ? this.manifestRefreshPromise.catch(function () {}) : this.manifestRefreshPromise;
+    }
+    var refreshPromise = fetchManifest(this.engine, this.manifestUrl).then(function (manifest) {
+      if (self.destroyed) return;
       var parsed = parseMPD(manifest.text || self.manifestText, manifest.url || self.manifestUrl);
+      if (self.presentationEnded && parsed.type === 'dynamic') {
+        self.staleManifestResponseCount = (self.staleManifestResponseCount || 0) + 1;
+        self.engine._telemetry.record('manifest-refresh', {
+          manifestRefreshReason: 'stale-dynamic-after-static'
+        });
+        return { applied: false, stale: true, advanced: false, reason: 'stale-dynamic-after-static' };
+      }
+      var stalePublishTime = parsed.type === 'dynamic'
+        && isFinite(parsed.publishTime)
+        && isFinite(self.lastManifestPublishTime)
+        && parsed.publishTime < self.lastManifestPublishTime;
+      var staleLiveWindow = parsed.type === 'dynamic'
+        && self.live
+        && parsed.liveWindow
+        && self.liveWindow
+        && parsed.liveWindow.end < self.liveWindow.end - 0.001;
+      if (stalePublishTime || staleLiveWindow) {
+        self.staleManifestResponseCount = (self.staleManifestResponseCount || 0) + 1;
+        self.engine._telemetry.record('manifest-refresh', {
+          manifestRefreshReason: stalePublishTime ? 'stale-publish-time' : 'stale-live-window'
+        });
+        return {
+          applied: false,
+          stale: true,
+          advanced: false,
+          reason: stalePublishTime ? 'stale-publish-time' : 'stale-live-window'
+        };
+      }
+      if (parsed.type !== 'dynamic') self.presentationEnded = true;
+      if (isFinite(parsed.publishTime)) {
+        self.lastManifestPublishTime = isFinite(self.lastManifestPublishTime)
+          ? Math.max(self.lastManifestPublishTime, parsed.publishTime)
+          : parsed.publishTime;
+      }
       self.manifestText = manifest.text || self.manifestText;
       self.manifestRefreshReason = reason || (parsed.type === 'dynamic' ? 'live' : 'manual');
-      self.minimumUpdatePeriod = parsed.minimumUpdatePeriod || self.minimumUpdatePeriod;
-      self.liveWindow = parsed.liveWindow || self.liveWindow;
+      var nextLive = parsed.type === 'dynamic';
+      self.minimumUpdatePeriod = nextLive ? (parsed.minimumUpdatePeriod || self.minimumUpdatePeriod) : 0;
+      self.liveWindow = nextLive ? (parsed.liveWindow || self.liveWindow) : null;
       self.manifestCompatibilityWarnings = mergeUnique(self.manifestCompatibilityWarnings || [], parsed.warnings || []);
       addTimelineRegions(self, parsed.timelineRegions || []);
       if (parsed.type === 'dynamic') {
@@ -5701,6 +8751,7 @@
         mergeStaticReps(self.videoReps, parsed.video);
         mergeStaticReps(self.audioReps, parsed.audio);
       }
+      applyProviderPresentationState(self, nextLive, parsed.duration);
       if (self.live) {
         self._updateLiveWindowFromReps();
         self._evictExpiredLiveSegmentState();
@@ -5714,14 +8765,36 @@
         liveWindowEnd: self.liveWindow ? self.liveWindow.end : 0
       });
       self._tick(true);
+      return {
+        applied: true,
+        stale: false,
+        advanced: parsed.type === 'dynamic',
+        reason: self.manifestRefreshReason
+      };
     }).catch(function (err) {
       self.manifestRefreshFailed = true;
       self.recoveryCount++;
       self.lastError = err && err.message ? err.message : 'manifest-refresh-failed';
       self.engine._telemetry.record('recovery', { lastError: self.lastError });
       console.warn('[native-dash] manifest refresh failed: ' + self.lastError);
-      if (!swallowErrors) throw err;
+      throw err;
     });
+    var trackedPromise = refreshPromise.then(function (value) {
+      if (self.manifestRefreshPromise === trackedPromise) {
+        self.manifestRefreshPromise = null;
+        self.manifestRefreshReasonInFlight = '';
+      }
+      return value;
+    }, function (err) {
+      if (self.manifestRefreshPromise === trackedPromise) {
+        self.manifestRefreshPromise = null;
+        self.manifestRefreshReasonInFlight = '';
+      }
+      throw err;
+    });
+    this.manifestRefreshReasonInFlight = reason || 'manual';
+    this.manifestRefreshPromise = trackedPromise;
+    return swallowErrors ? trackedPromise.catch(function () {}) : trackedPromise;
   };
 
   NativeDashProvider.prototype._refreshManifest = function () {
@@ -5736,6 +8809,8 @@
   };
 
   NativeDashProvider.prototype.reportStall = function () {
+    if (this._jumpManifestGap && this._jumpManifestGap()) return;
+    var reopeningEndedVod = prepareVodStreamRefill(this);
     this._tick(true);
     if (getBufferAhead(this.video) < 0.5) {
       if (this._jumpSmallGap && this._jumpSmallGap()) return;
@@ -5744,8 +8819,13 @@
       this.engine._telemetry.record('recovery', { lastError: 'stall' });
       if (this.stallRecoveryStage === 0) {
         this.stallRecoveryStage = 1;
-        markSegmentsForTime(this.activeVideo, this.video.currentTime, Math.max(2, this._bufferAheadGoal()));
-        markSegmentsForTime(this.audio, this.video.currentTime, Math.max(2, this._bufferAheadGoal()));
+        if (reopeningEndedVod) {
+          prepareSegmentsForRefill(this.activeVideo, this.videoSb || this.video, this.video.currentTime, Math.max(2, this._bufferAheadGoal()));
+          prepareSegmentsForRefill(this.audio, this.audioSb || this.video, this.video.currentTime, Math.max(2, this._bufferAheadGoal()));
+        } else {
+          markSegmentsForTime(this.activeVideo, this.video.currentTime, Math.max(2, this._bufferAheadGoal()));
+          markSegmentsForTime(this.audio, this.video.currentTime, Math.max(2, this._bufferAheadGoal()));
+        }
         this._tick(true);
         return;
       }
@@ -5770,11 +8850,26 @@
     }
   };
 
-  NativeDashProvider.prototype.destroy = function () {
+  NativeDashProvider.prototype.quiesce = function (reason) {
+    if (this._terminalQuiesced) return false;
+    this._terminalQuiesced = true;
     this.destroyed = true;
+    invalidateSeekOperation(this);
+    this.manifestRefreshPromise = null;
+    this.manifestRefreshReasonInFlight = '';
+    clearVodEndOfStreamState(this);
     if (this.fillTimer) clearInterval(this.fillTimer);
+    this.fillTimer = null;
     if (this.manifestRefreshTimer) clearTimeout(this.manifestRefreshTimer);
-    this._abortRequests();
+    this.manifestRefreshTimer = null;
+    try { this._abortRequests(reason || 'terminal'); } catch (e) {}
+    this.dashControlTransitionInFlight = null;
+    this.videoSwitchInFlight = false;
+    this.audioSwitchInFlight = false;
+    this.nativeRecoveryInProgress = false;
+    this.pendingManualVideoSwitch = null;
+    this.pendingAudioSwitch = null;
+    this.activeRanges = {};
     if (this._boundTick) this.video.removeEventListener('timeupdate', this._boundTick);
     if (this._boundSeek) this.video.removeEventListener('seeking', this._boundSeek);
     if (this._boundSeeked) this.video.removeEventListener('seeked', this._boundSeeked);
@@ -5789,6 +8884,11 @@
     this.drmSessions = [];
     if (this._boundWaiting) this.video.removeEventListener('waiting', this._boundWaiting);
     if (this._boundPlaying) this.video.removeEventListener('playing', this._boundPlaying);
+    return true;
+  };
+
+  NativeDashProvider.prototype.destroy = function () {
+    this.quiesce('destroy');
     try {
       if (this.mediaSource && this.mediaSource.readyState === 'open') this.mediaSource.endOfStream();
     } catch (e) {}
@@ -5820,12 +8920,12 @@
     });
   }
 
-  function fetchText(engine, url, onSource) {
+  function fetchText(engine, url, onSource, requestOptions) {
     return nativeNetworkRequest(engine, NativeNetworkingEngine.RequestType.MANIFEST, {
       uris: [url],
       method: 'GET',
       headers: {}
-    }).then(function (resp) {
+    }, requestOptions).then(function (resp) {
       var swInfo = readServiceWorkerSource(resp);
       if (onSource) onSource(swInfo);
       if (resp.status === 401 || resp.status === 403 || resp.status === 404 || resp.status === 410 || resp.status >= 500) {
@@ -5858,6 +8958,7 @@
     var contentSteeringPathwayId = '';
     var warnings = [];
     var map = null;
+    var maps = [];
     var encrypted = false;
     var unsupportedEncryption = false;
     var unsupportedEncryptionReason = '';
@@ -5994,6 +9095,14 @@
           url: resolveUrl(unquote(mapAttrs.URI || ''), playlistUrl),
           range: hlsByteRange(unquote(mapAttrs.BYTERANGE || ''), -1)
         };
+        if (currentKey) {
+          map.key = currentKey;
+          if (currentKey.method === 'AES-128' && !currentKey.iv) {
+            unsupportedEncryption = true;
+            unsupportedEncryptionReason = 'hls-map-iv-required';
+          }
+        }
+        maps.push(map);
       } else if (line.indexOf('#EXT-X-KEY') === 0) {
         var keyAttrs = hlsAttrs(line);
         var method = String(keyAttrs.METHOD || '').toUpperCase();
@@ -6062,7 +9171,8 @@
             duration: parseFloat(unquote(partAttrs.DURATION || '')) || 0,
             independent: String(unquote(partAttrs.INDEPENDENT || '')).toUpperCase() === 'YES',
             gap: String(unquote(partAttrs.GAP || '')).toUpperCase() === 'YES',
-            range: partRange
+            range: partRange,
+            _hlsInitSegment: map
           });
           lastPartRangeEnd = partRange ? partRange.end : -1;
           lastPartRangeUri = partRange ? resolvedPartUri : '';
@@ -6074,7 +9184,8 @@
           type: unquote(hintAttrs.TYPE || ''),
           url: hintUri ? resolveUrl(hintUri, playlistUrl) : '',
           byteRangeStart: parseInt(unquote(hintAttrs['BYTERANGE-START'] || ''), 10),
-          byteRangeLength: parseInt(unquote(hintAttrs['BYTERANGE-LENGTH'] || ''), 10)
+          byteRangeLength: parseInt(unquote(hintAttrs['BYTERANGE-LENGTH'] || ''), 10),
+          _hlsInitSegment: map
         });
       } else if (line.indexOf('#EXT-X-RENDITION-REPORT') === 0) {
         var reportAttrs = hlsAttrs(line);
@@ -6140,7 +9251,8 @@
           url: resolveUrl(line, playlistUrl),
           range: range,
           _hlsPartialOnly: false,
-          _hlsPlaylistUrl: playlistUrl
+          _hlsPlaylistUrl: playlistUrl,
+          _hlsInitSegment: map
         };
         if (imageTiles) segment.tiles = imageTiles;
         if (pendingParts.length) {
@@ -6179,7 +9291,8 @@
         url: '',
         range: null,
         _hlsPartialOnly: true,
-        _hlsPlaylistUrl: playlistUrl
+        _hlsPlaylistUrl: playlistUrl,
+        _hlsInitSegment: map
       };
       if (currentKey) partialParent.key = currentKey;
       if (isFinite(pendingProgramDateTimeMs)) partialParent.programDateTimeMs = pendingProgramDateTimeMs;
@@ -6212,7 +9325,8 @@
       contentSteeringUri: contentSteeringUri,
       contentSteeringPathwayId: contentSteeringPathwayId,
       warnings: warnings,
-      map: map,
+      map: segments.length && segments[0]._hlsInitSegment ? segments[0]._hlsInitSegment : map,
+      maps: maps,
       encrypted: encrypted,
       unsupportedEncryption: unsupportedEncryption,
       unsupportedEncryptionReason: unsupportedEncryptionReason,
@@ -6392,6 +9506,64 @@
     return (segments || []).some(function (seg) { return /\.ts(\?|$)/i.test(seg.url || ''); });
   }
 
+  function hlsSegmentContainerHint(seg) {
+    if (!seg) return '';
+    if (/\.ts(\?|$)/i.test(seg.url || '')) return 'mpegts';
+    if (seg._hlsInitSegment) return 'fmp4';
+    return '';
+  }
+
+  function hlsMpegTsBytes(data) {
+    var bytes = data instanceof Uint8Array
+      ? data
+      : (data instanceof ArrayBuffer ? new Uint8Array(data) : (ArrayBuffer.isView(data) ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength) : null));
+    if (!bytes || bytes.length < 188) return false;
+    var scanEnd = Math.min(188, bytes.length);
+    for (var offset = 0; offset < scanEnd; offset++) {
+      if (bytes[offset] !== 0x47) continue;
+      if (offset + 188 >= bytes.length || bytes[offset + 188] !== 0x47) continue;
+      if (offset + 376 < bytes.length && bytes[offset + 376] !== 0x47) continue;
+      return true;
+    }
+    return false;
+  }
+
+  function hlsFmp4Bytes(data) {
+    var view = mp4DataView(data);
+    if (!view || view.byteLength < 8) return false;
+    var boxes = mp4Boxes(view, 0, Math.min(view.byteLength, 1024 * 1024));
+    for (var i = 0; i < boxes.length; i++) {
+      if (boxes[i].type === 'ftyp' || boxes[i].type === 'styp' || boxes[i].type === 'moof' || boxes[i].type === 'sidx') return true;
+    }
+    return false;
+  }
+
+  function detectHlsMediaContainer(data, seg) {
+    if (hlsMpegTsBytes(data)) return 'mpegts';
+    if (hlsFmp4Bytes(data)) return 'fmp4';
+    return hlsSegmentContainerHint(seg);
+  }
+
+  function bindHlsGenerationContainer(provider, seg, container) {
+    if (!seg || !container) return container;
+    seg._hlsContainer = container;
+    var parent = seg._parentSegment || seg;
+    if (parent) parent._hlsContainer = parent._hlsContainer || container;
+    var generationKey = seg._hlsTimestampGenerationKey || parent && parent._hlsTimestampGenerationKey || '';
+    var generation = provider && provider.hlsTimestampGenerationByKey && generationKey
+      ? provider.hlsTimestampGenerationByKey[generationKey]
+      : null;
+    if (generation && generation.container && generation.container !== container) {
+      provider.hlsContainerMismatchCount = (provider.hlsContainerMismatchCount || 0) + 1;
+      var mismatch = new Error('hls-container-generation-mismatch');
+      mismatch.code = 'HLS_CONTAINER_GENERATION_MISMATCH';
+      throw mismatch;
+    }
+    if (generation && !generation.container) generation.container = container;
+    if (provider) provider.hlsContainerDetectionCount = (provider.hlsContainerDetectionCount || 0) + 1;
+    return container;
+  }
+
   function readServiceWorkerSource(resp) {
     if (!resp || !resp.headers) return { swCached: false, swOffline: false, swSource: '' };
     var cached = headerValue(resp.headers, 'x-sw-cached') === '1' || headerValue(resp.headers, 'x-sw-cache') === '1';
@@ -6486,12 +9658,15 @@
       method: request.method || 'GET',
       headers: request.headers || {}
     };
-    if (opts && opts.signal) init.signal = opts.signal;
+    opts = opts || {};
+    var timedSignal = createTimedRequestSignal(opts.signal, networkTimeoutFor(type, opts));
+    init.signal = timedSignal.signal;
     if (request.body != null) init.body = request.body;
     var fetchUri = engine ? stampUri(engine, uri) : uri;
     var started = performance.now();
     return fetch(fetchUri, init).then(function (resp) {
       return resp.arrayBuffer().then(function (data) {
+        timedSignal.cleanup();
         return {
           uri: resp.url || fetchUri,
           originalUri: uri,
@@ -6501,7 +9676,52 @@
           timeMs: Math.max(0, performance.now() - started)
         };
       });
+    }).then(function (response) {
+      timedSignal.cleanup();
+      return response;
+    }, function (err) {
+      var timedOut = timedSignal.timedOut();
+      timedSignal.cleanup();
+      if (timedOut) throw networkTimeoutError();
+      throw err;
     });
+  }
+
+  function networkTimeoutFor(type, opts) {
+    var configured = Number(opts && opts.timeoutMs);
+    if (isFinite(configured) && configured > 0) return configured;
+    if (type === NativeNetworkingEngine.RequestType.MANIFEST) return MANIFEST_REQUEST_TIMEOUT_MS;
+    if (type === NativeNetworkingEngine.RequestType.SEGMENT) return SEGMENT_REQUEST_TIMEOUT_MS;
+    if (type === NativeNetworkingEngine.RequestType.KEY || type === NativeNetworkingEngine.RequestType.LICENSE) return AUX_REQUEST_TIMEOUT_MS;
+    return 30000;
+  }
+
+  function createTimedRequestSignal(externalSignal, timeoutMs) {
+    var controller = new AbortController();
+    var didTimeout = false;
+    function abortFromExternal() { controller.abort(); }
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener('abort', abortFromExternal, { once: true });
+    }
+    var timer = setTimeout(function () {
+      didTimeout = true;
+      controller.abort();
+    }, timeoutMs);
+    return {
+      signal: controller.signal,
+      timedOut: function () { return didTimeout; },
+      cleanup: function () {
+        clearTimeout(timer);
+        if (externalSignal) externalSignal.removeEventListener('abort', abortFromExternal);
+      }
+    };
+  }
+
+  function networkTimeoutError() {
+    var err = new Error('network-request-timeout');
+    err.name = 'TimeoutError';
+    return err;
   }
 
   function applyNetworkFilters(filters, type, target, phase, networking) {
@@ -6533,10 +9753,18 @@
     out.networkingFilterErrorCount = networkStats.filterErrorCount || 0;
     out.networkingTotalRequestMs = Math.round(networkStats.totalRequestMs || 0);
     out.networkHoldCount = networkStats.networkHoldCount || 0;
+    out.networkTimeoutCount = networkStats.networkTimeoutCount || 0;
     out.networkHeldRequestCount = networkStats.networkHeldRequestCount || 0;
     out.networkResumeCount = networkStats.networkResumeCount || 0;
     out.networkHoldReason = networkStats.networkHoldReason || "";
     out.networkHoldMs = Math.round(networkStats.networkHoldMs || 0);
+    out.stallWatchReportCount = engine && engine._stallWatchReportCount ? engine._stallWatchReportCount : 0;
+    out.stallWatchWaiting = !!(engine && engine._stallWatchWaiting);
+    out.playerState = engine && engine._state ? engine._state : 'idle';
+    out.terminalErrorCount = engine && engine._terminalErrorCount ? engine._terminalErrorCount : 0;
+    out.terminalErrorPhase = engine && engine._terminalErrorPhase ? engine._terminalErrorPhase : '';
+    out.terminalLoadGeneration = engine && engine._terminalErrorGeneration >= 0 ? engine._terminalErrorGeneration : -1;
+    out.providerTerminalQuiesced = !!(engine && engine._provider && engine._provider._terminalQuiesced);
     return out;
   }
 
@@ -6852,6 +10080,8 @@
       periodCount: periods.length,
       profile: profile,
       warnings: warnings,
+      publishTime: publishTime,
+      availabilityStartTime: availabilityStartTime,
       minimumUpdatePeriod: isFinite(minimumUpdatePeriod) ? minimumUpdatePeriod : 5,
       timeShiftBufferDepth: isFinite(timeShiftBufferDepth) ? timeShiftBufferDepth : 0,
       liveWindow: liveWindow,
@@ -7584,76 +10814,189 @@
     return (parseInt(m[1] || '0', 10) * 3600) + (parseInt(m[2] || '0', 10) * 60) + parseFloat(m[3] || '0');
   }
 
-  function appendBuffer(sb, data, appendWindow, timestampOffset) {
+  function mutateSourceBuffer(sb, mutation, options) {
+    options = options || {};
+    if (!sb) return Promise.reject(new Error(options.errorMessage || 'sourcebuffer-unavailable'));
     return queueSourceBuffer(sb, function () {
       return waitForSourceBufferIdle(sb).then(function () {
+        if (options.guard) options.guard();
         return new Promise(function (resolve, reject) {
+          var settled = false;
           var timeoutId = 0;
           function cleanup() {
             if (timeoutId) clearTimeout(timeoutId);
             sb.removeEventListener('updateend', onEnd);
             sb.removeEventListener('error', onError);
+            sb.removeEventListener('abort', onAbort);
           }
-          function onEnd() { cleanup(); resolve(); }
-          function onError() { cleanup(); reject(new Error('sourcebuffer-error')); }
+          function finish(err) {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (err) {
+              reject(err);
+              return;
+            }
+            try {
+              if (options.guard) options.guard();
+              resolve();
+            } catch (guardError) {
+              reject(guardError);
+            }
+          }
+          function onEnd() { finish(); }
+          function onError() { finish(new Error(options.errorMessage || 'sourcebuffer-error')); }
+          function onAbort() { finish(abortError()); }
           sb.addEventListener('updateend', onEnd);
           sb.addEventListener('error', onError);
+          sb.addEventListener('abort', onAbort);
           try {
-            if (appendWindow) {
-              if (appendWindow.end > sb.appendWindowStart) sb.appendWindowEnd = appendWindow.end;
-              sb.appendWindowStart = appendWindow.start;
-              sb.appendWindowEnd = appendWindow.end;
+            if (mutation() === false) {
+              finish();
+              return;
             }
-            if (isFinite(timestampOffset) && Math.abs((sb.timestampOffset || 0) - timestampOffset) > 0.001) {
-              sb.timestampOffset = timestampOffset;
-            }
-            sb.appendBuffer(data);
             timeoutId = setTimeout(function () {
+              if (settled) return;
+              if (!sb.updating) {
+                sb._nativeMutationMissedUpdateEndCount = (sb._nativeMutationMissedUpdateEndCount || 0) + 1;
+                finish();
+                return;
+              }
+              sb._nativeMutationTimeoutCount = (sb._nativeMutationTimeoutCount || 0) + 1;
+              var timeoutError = new Error(options.timeoutMessage || 'sourcebuffer-timeout');
               cleanup();
-              if (!sb.updating) resolve();
-              else reject(new Error('sourcebuffer-timeout'));
-            }, SOURCEBUFFER_WATCHDOG_MS);
-          } catch (e) { cleanup(); reject(e); }
+              if (sb.abort) {
+                try {
+                  sb.abort();
+                  sb._nativeMutationAbortCount = (sb._nativeMutationAbortCount || 0) + 1;
+                } catch (e) {}
+              }
+              finish(timeoutError);
+            }, options.timeoutMs || SOURCEBUFFER_WATCHDOG_MS);
+          } catch (err) {
+            finish(err);
+          }
         });
       });
     });
   }
 
-  function resetSourceBuffer(sb, currentTime) {
-    if (!sb.buffered.length) return Promise.resolve();
-    return queueSourceBuffer(sb, function () {
-      return waitForSourceBufferIdle(sb).then(function () {
-        return new Promise(function (resolve) {
-          function done() {
-            sb.removeEventListener('updateend', done);
-            resolve();
-          }
-          sb.addEventListener('updateend', done);
-          try { sb.remove(0, Math.max(0, currentTime + 1)); } catch (e) { done(); }
-        });
-      });
+  function appendBuffer(sb, data, appendWindow, timestampOffset, guard) {
+    return mutateSourceBuffer(sb, function () {
+      if (appendWindow) {
+        if (appendWindow.end > sb.appendWindowStart) sb.appendWindowEnd = appendWindow.end;
+        sb.appendWindowStart = appendWindow.start;
+        sb.appendWindowEnd = appendWindow.end;
+      }
+      if (isFinite(timestampOffset) && Math.abs((sb.timestampOffset || 0) - timestampOffset) > 0.001) {
+        sb.timestampOffset = timestampOffset;
+      }
+      sb.appendBuffer(data);
+    }, {
+      guard: guard,
+      errorMessage: 'sourcebuffer-error',
+      timeoutMessage: 'sourcebuffer-timeout'
     });
+  }
+
+  function sourceBufferIdentityGuard(provider, field, sourceBuffer) {
+    return function () {
+      if (!provider || provider.destroyed || provider[field] !== sourceBuffer) throw abortError();
+    };
+  }
+
+  function resetSourceBuffer(sb, currentTime, guard) {
+    if (!sb || !sb.buffered || !sb.buffered.length) return Promise.resolve(null);
+    var removedRange = null;
+    return mutateSourceBuffer(sb, function () {
+      if (!sb.buffered.length) return false;
+      var end = Math.min(Math.max(0, currentTime + 1), sb.buffered.end(sb.buffered.length - 1));
+      if (!isFinite(end) || end <= 0) return false;
+      removedRange = { start: 0, end: end };
+      sb.remove(0, end);
+    }, {
+      guard: guard,
+      errorMessage: 'sourcebuffer-reset-failed',
+      timeoutMessage: 'sourcebuffer-reset-timeout'
+    }).then(function () { return removedRange; });
+  }
+
+  function clearSourceBuffer(sb) {
+    if (!sb || !sb.buffered || !sb.buffered.length) return Promise.resolve(null);
+    var removedRange = null;
+    return mutateSourceBuffer(sb, function () {
+      if (!sb.buffered.length) return false;
+      var start = sb.buffered.start(0);
+      var end = sb.buffered.end(sb.buffered.length - 1);
+      if (!isFinite(start) || !isFinite(end) || end <= start) return false;
+      removedRange = { start: start, end: end };
+      sb.remove(start, end);
+    }, {
+      errorMessage: 'sourcebuffer-clear-failed',
+      timeoutMessage: 'sourcebuffer-clear-timeout'
+    }).then(function () { return removedRange; });
   }
 
   function trimBuffer(sb, removeEnd) {
     removeBufferBefore(sb, removeEnd).catch(function () {});
   }
 
-  function removeBufferBefore(sb, removeEnd) {
-    if (!sb || !sb.buffered.length || removeEnd <= 0) return Promise.resolve();
-    return queueSourceBuffer(sb, function () {
-      return waitForSourceBufferIdle(sb).then(function () {
-        if (!sb.buffered.length || sb.buffered.start(0) >= removeEnd) return Promise.resolve();
-        return new Promise(function (resolve) {
-          function done() {
-            sb.removeEventListener('updateend', done);
-            resolve();
-          }
-          sb.addEventListener('updateend', done);
-          try { sb.remove(sb.buffered.start(0), Math.min(removeEnd, sb.buffered.end(0))); } catch (e) { done(); }
-        });
-      });
-    });
+  function removeBufferBefore(sb, removeEnd, guard) {
+    if (!sb || !sb.buffered || !sb.buffered.length || removeEnd <= 0) return Promise.resolve(null);
+    var removedRange = null;
+    return mutateSourceBuffer(sb, function () {
+      if (!sb.buffered.length || sb.buffered.start(0) >= removeEnd) return false;
+      var end = Math.min(removeEnd, sb.buffered.end(0));
+      if (!isFinite(end) || end <= sb.buffered.start(0)) return false;
+      removedRange = { start: sb.buffered.start(0), end: end };
+      sb.remove(removedRange.start, end);
+    }, {
+      guard: guard,
+      errorMessage: 'sourcebuffer-remove-failed',
+      timeoutMessage: 'sourcebuffer-remove-timeout'
+    }).then(function () { return removedRange; });
+  }
+
+  function removeBufferAfter(sb, removeStart, guard) {
+    if (!sb || !sb.buffered || !sb.buffered.length || !isFinite(removeStart)) return Promise.resolve(null);
+    var removedRange = null;
+    return mutateSourceBuffer(sb, function () {
+      if (!sb.buffered.length) return false;
+      var lastEnd = sb.buffered.end(sb.buffered.length - 1);
+      if (!isFinite(lastEnd) || lastEnd <= removeStart) return false;
+      removedRange = { start: removeStart, end: lastEnd };
+      sb.remove(removeStart, lastEnd);
+    }, {
+      guard: guard,
+      errorMessage: 'sourcebuffer-remove-failed',
+      timeoutMessage: 'sourcebuffer-remove-timeout'
+    }).then(function () { return removedRange; });
+  }
+
+  function removeBufferRange(sb, removeStart, removeEnd, guard) {
+    if (
+      !sb
+      || !sb.buffered
+      || !sb.buffered.length
+      || !isFinite(removeStart)
+      || !isFinite(removeEnd)
+      || removeEnd <= removeStart
+    ) return Promise.resolve(null);
+    var removedRange = null;
+    return mutateSourceBuffer(sb, function () {
+      if (!sb.buffered.length) return false;
+      var firstStart = sb.buffered.start(0);
+      var lastEnd = sb.buffered.end(sb.buffered.length - 1);
+      var start = Math.max(removeStart, firstStart);
+      var end = Math.min(removeEnd, lastEnd);
+      if (!isFinite(start) || !isFinite(end) || end <= start) return false;
+      removedRange = { start: start, end: end };
+      sb.remove(start, end);
+    }, {
+      guard: guard,
+      errorMessage: 'sourcebuffer-remove-failed',
+      timeoutMessage: 'sourcebuffer-remove-timeout'
+    }).then(function () { return removedRange; });
   }
 
   function queueSourceBuffer(sb, op) {
@@ -7668,6 +11011,349 @@
 
   function appendQueueDepth(sb) {
     return sb && sb._nativeQueueDepth ? sb._nativeQueueDepth : 0;
+  }
+
+  function providerSourceBuffers(provider) {
+    if (!provider) return [];
+    return [provider.sb, provider.videoSb, provider.audioSb].filter(function (sb, index, list) {
+      return !!sb && list.indexOf(sb) === index;
+    });
+  }
+
+  function sourceBufferMutationStat(provider, field) {
+    return providerSourceBuffers(provider).reduce(function (total, sourceBuffer) {
+      return total + (sourceBuffer[field] || 0);
+    }, 0);
+  }
+
+  function sourceBufferHighestEnd(sb) {
+    if (!sb || !sb.buffered || !sb.buffered.length) return 0;
+    var end = 0;
+    for (var i = 0; i < sb.buffered.length; i++) end = Math.max(end, sb.buffered.end(i));
+    return end;
+  }
+
+  function synchronizeMediaSourceDuration(provider) {
+    if (!provider || provider.destroyed || !provider.mediaSource) return;
+    var sourceBuffers = providerSourceBuffers(provider);
+    Promise.all(sourceBuffers.map(waitForVodSourceBufferQueue)).then(function () {
+      if (!provider || provider.destroyed || !provider.mediaSource || provider.mediaSource.readyState !== 'open') return;
+      var duration = provider.live ? Infinity : Number(provider.duration);
+      if (!provider.live) {
+        if (!isFinite(duration) || duration <= 0) return;
+        for (var i = 0; i < sourceBuffers.length; i++) duration = Math.max(duration, sourceBufferHighestEnd(sourceBuffers[i]));
+      }
+      try {
+        if (provider.mediaSource.duration !== duration) provider.mediaSource.duration = duration;
+      } catch (e) {}
+    });
+  }
+
+  function applyProviderPresentationState(provider, live, duration) {
+    if (!provider) return;
+    var wasLive = provider.live === true;
+    provider.live = !!live;
+    if (isFinite(Number(duration)) && Number(duration) > 0) provider.duration = Number(duration);
+    if (provider.engine && provider.engine.setLive) provider.engine.setLive(provider.live);
+    if (wasLive && !provider.live) {
+      provider.liveToVodTransitionCount = (provider.liveToVodTransitionCount || 0) + 1;
+      if (provider.manifestRefreshTimer) {
+        clearTimeout(provider.manifestRefreshTimer);
+        provider.manifestRefreshTimer = 0;
+      }
+    }
+    synchronizeMediaSourceDuration(provider);
+  }
+
+  function playableSegmentEnd(segments) {
+    var end = 0;
+    for (var i = 0; segments && i < segments.length; i++) {
+      if (!segments[i].gap) end = Math.max(end, segments[i].end || 0);
+    }
+    return end;
+  }
+
+  function allSegmentsDeclaredGap(segments) {
+    return !!(segments && segments.length && segments.every(function (segment) { return !!segment.gap; }));
+  }
+
+  function assertHlsTrackTransitionCurrent(provider, generation) {
+    if (
+      !provider
+      || provider.destroyed
+      || generation !== (provider.trackTransitionGeneration || 0)
+      || !provider.mediaSource
+      || provider.mediaSource.readyState !== 'open'
+    ) throw abortError();
+  }
+
+  function captureHlsTrackSourceBufferState(provider, kind) {
+    var isAudio = kind === 'audio';
+    var sourceBuffer = isAudio ? provider.audioSb : provider.sb;
+    return {
+      exists: !!sourceBuffer,
+      sourceBuffer: sourceBuffer || null,
+      mime: (isAudio ? provider.audioSourceBufferMime : provider.videoSourceBufferMime) || '',
+      initKey: (isAudio ? provider._appendedAudioInitKey : provider._appendedVideoInitKey) || '',
+      initGenerationKey: (isAudio ? provider._appendedAudioInitGenerationKey : provider._appendedVideoInitGenerationKey) || '',
+      initSegment: (isAudio ? provider._sourceBufferAudioInitSegment : provider._sourceBufferVideoInitSegment)
+        || (isAudio ? provider.audioInitSegment : provider.initSegment)
+        || null
+    };
+  }
+
+  function snapshotOwnProperties(target) {
+    var properties = {};
+    if (!target) return properties;
+    for (var key in target) {
+      if (Object.prototype.hasOwnProperty.call(target, key)) properties[key] = target[key];
+    }
+    return properties;
+  }
+
+  function restoreOwnProperties(target, properties) {
+    if (!target) return;
+    for (var key in target) {
+      if (Object.prototype.hasOwnProperty.call(target, key) && !Object.prototype.hasOwnProperty.call(properties, key)) delete target[key];
+    }
+    for (var name in properties) {
+      if (Object.prototype.hasOwnProperty.call(properties, name)) target[name] = properties[name];
+    }
+  }
+
+  function snapshotHlsObjects(objects) {
+    return (objects || []).map(function (target) {
+      return { target: target, properties: snapshotOwnProperties(target) };
+    });
+  }
+
+  function hlsSegmentObjects(segments) {
+    var objects = [];
+    for (var i = 0; segments && i < segments.length; i++) {
+      objects.push(segments[i]);
+      var parts = segments[i].parts || [];
+      for (var p = 0; p < parts.length; p++) objects.push(parts[p]);
+    }
+    return objects;
+  }
+
+  function hlsPreloadHintObjects(provider) {
+    var objects = [];
+    function collect(track) {
+      var hints = track && track._preloadHintSegments ? track._preloadHintSegments : {};
+      for (var key in hints) {
+        if (Object.prototype.hasOwnProperty.call(hints, key) && objects.indexOf(hints[key]) === -1) objects.push(hints[key]);
+      }
+    }
+    collect(provider);
+    for (var i = 0; provider && provider.audioRenditions && i < provider.audioRenditions.length; i++) collect(provider.audioRenditions[i]);
+    return objects;
+  }
+
+  function restoreHlsObjects(snapshots) {
+    for (var i = 0; snapshots && i < snapshots.length; i++) {
+      restoreOwnProperties(snapshots[i].target, snapshots[i].properties);
+    }
+  }
+
+  function captureHlsTrackTransitionState(provider) {
+    var fields = [
+      'activeVariant', 'activeAudio', 'manualTrackId', 'lastSwitchAt', 'lastSwitchReason',
+      'segments', 'initSegment', 'audioSegments', 'audioInitSegment',
+      'isTsPlaylist', 'muxedTsAudio', 'lowLatencyPlaylist', 'partialSegmentCount',
+      'partialSegmentGapCount', 'partTargetDuration', 'preloadHints', 'serverControl',
+      'preloadHintCount', 'renditionReportCount', 'skippedSegmentCount',
+      'manifestCompatibilityWarnings', 'videoDuration', 'videoEndList', 'audioEndList',
+      'live', 'duration', 'manifestStartTime', 'mediaSequence', 'discontinuitySequence',
+      'discontinuityCount', 'targetDuration', 'mediaPlaylistUrl', 'liveWindow', 'mimeType',
+      'audioMimeType', 'suppressedVideoGapTrack', 'suppressedAudioGapTrack',
+      'suppressedGapTrackCount', '_preloadHintSegments'
+    ];
+    var values = {};
+    for (var i = 0; i < fields.length; i++) values[fields[i]] = provider[fields[i]];
+    return {
+      fields: values,
+      abrEnabled: !!(provider.engine && provider.engine._player && provider.engine._player.config.abr.enabled),
+      variants: snapshotHlsObjects(provider.variants),
+      audioRenditions: snapshotHlsObjects(provider.audioRenditions),
+      videoSegmentObjects: snapshotHlsObjects(hlsSegmentObjects(provider.segments)),
+      audioSegmentObjects: snapshotHlsObjects(hlsSegmentObjects(provider.activeAudio && provider.activeAudio.segments)),
+      preloadHintObjects: snapshotHlsObjects(hlsPreloadHintObjects(provider)),
+      playlistCursorByUrl: clonePlain(provider.playlistCursorByUrl || {}),
+      playlistResetCandidateByUrl: clonePlain(provider.playlistResetCandidateByUrl || {}),
+      playlistEpochByUrl: clonePlain(provider.playlistEpochByUrl || {}),
+      hlsTimestampGenerationByKey: clonePlain(provider.hlsTimestampGenerationByKey || {}),
+      videoSourceBuffer: captureHlsTrackSourceBufferState(provider, 'video'),
+      audioSourceBuffer: captureHlsTrackSourceBufferState(provider, 'audio')
+    };
+  }
+
+  function restoreHlsTrackTransitionState(provider, snapshot) {
+    if (!provider || !snapshot) return;
+    for (var key in snapshot.fields) {
+      if (Object.prototype.hasOwnProperty.call(snapshot.fields, key)) provider[key] = snapshot.fields[key];
+    }
+    restoreHlsObjects(snapshot.variants);
+    restoreHlsObjects(snapshot.audioRenditions);
+    restoreHlsObjects(snapshot.videoSegmentObjects);
+    restoreHlsObjects(snapshot.audioSegmentObjects);
+    restoreHlsObjects(snapshot.preloadHintObjects);
+    provider.playlistCursorByUrl = clonePlain(snapshot.playlistCursorByUrl || {});
+    provider.playlistResetCandidateByUrl = clonePlain(snapshot.playlistResetCandidateByUrl || {});
+    provider.playlistEpochByUrl = clonePlain(snapshot.playlistEpochByUrl || {});
+    provider.hlsTimestampGenerationByKey = clonePlain(snapshot.hlsTimestampGenerationByKey || {});
+    if (provider.engine && provider.engine._player) provider.engine._player.config.abr.enabled = snapshot.abrEnabled;
+  }
+
+  function removeHlsGapSourceBuffer(provider, kind, generation) {
+    if (!provider || !provider.mediaSource) return Promise.resolve();
+    var field = kind === 'audio' ? 'audioSb' : 'sb';
+    var sourceBuffer = provider[field];
+    if (!sourceBuffer) return Promise.resolve();
+    return waitForVodSourceBufferQueue(sourceBuffer).then(function () {
+      assertHlsTrackTransitionCurrent(provider, generation == null ? (provider.trackTransitionGeneration || 0) : generation);
+      try {
+        provider.mediaSource.removeSourceBuffer(sourceBuffer);
+        provider[field] = null;
+      } catch (e) {}
+    });
+  }
+
+  function sourceBufferCoversPlayableEnd(sb, expectedEnd) {
+    if (!isFinite(expectedEnd) || expectedEnd <= 0 || !sb || !sb.buffered) return true;
+    for (var i = 0; i < sb.buffered.length; i++) {
+      if (sb.buffered.start(i) < expectedEnd && sb.buffered.end(i) >= expectedEnd - 0.25) return true;
+    }
+    return false;
+  }
+
+  function providerPlayableEnd(provider) {
+    if (!provider) return 0;
+    if (provider.name === 'native-dash' || provider.activeVideo) {
+      return Math.max(
+        playableSegmentEnd(provider.activeVideo && provider.activeVideo.segments),
+        playableSegmentEnd(provider.audio && provider.audio.segments)
+      );
+    }
+    return Math.max(
+      playableSegmentEnd(provider.segments),
+      playableSegmentEnd(provider.audioSegments)
+    );
+  }
+
+  function prepareVodStreamRefill(provider) {
+    if (
+      !provider
+      || provider.live
+      || !provider.mediaSource
+      || provider.mediaSource.readyState !== 'ended'
+    ) return false;
+    // An all-gap presentation has no media object that could reopen MSE.
+    // Let the media element replay its already-finalized empty timeline
+    // without entering a refill state that can never complete.
+    if (providerPlayableEnd(provider) <= 0) {
+      clearVodEndOfStreamState(provider);
+      return false;
+    }
+    if (provider.vodEndOfStreamRefillPending) return true;
+    clearVodEndOfStreamState(provider);
+    provider.vodEndOfStreamRefillPending = true;
+    provider.vodEndOfStreamReopenCount = (provider.vodEndOfStreamReopenCount || 0) + 1;
+    provider.vodFinalDuration = 0;
+    return true;
+  }
+
+  function endedVodSchedulerIsIdle(provider) {
+    return !!(
+      provider
+      && provider.mediaSource
+      && provider.mediaSource.readyState === 'ended'
+      && !provider.vodEndOfStreamRefillPending
+    );
+  }
+
+  function vodSourceBufferBusy(sb) {
+    return !!(sb && (sb.updating || appendQueueDepth(sb) > 0));
+  }
+
+  function waitForVodSourceBufferQueue(sb) {
+    if (!sb) return Promise.resolve();
+    return Promise.resolve(sb._nativeQueue).catch(function () {}).then(function () {
+      return sb.updating ? waitForSourceBufferIdle(sb) : undefined;
+    });
+  }
+
+  function scheduleVodEndOfStream(provider, sourceBuffers, delayMs) {
+    if (
+      !provider
+      || provider.destroyed
+      || !provider.vodEndOfStreamPending
+      || provider._vodEndOfStreamScheduled
+    ) return;
+    provider._vodEndOfStreamScheduled = true;
+    Promise.all((sourceBuffers || []).filter(Boolean).map(waitForVodSourceBufferQueue)).then(function () {
+      if (provider.destroyed || !provider.vodEndOfStreamPending) {
+        provider._vodEndOfStreamScheduled = false;
+        return;
+      }
+      function retry() {
+        provider._vodEndOfStreamRetryTimer = 0;
+        provider._vodEndOfStreamScheduled = false;
+        if (!provider.destroyed && provider.vodEndOfStreamPending && provider._maybeEndVodStream) {
+          provider._maybeEndVodStream();
+        }
+      }
+      if (delayMs > 0) {
+        provider._vodEndOfStreamRetryTimer = setTimeout(retry, delayMs);
+      } else {
+        retry();
+      }
+    });
+  }
+
+  function finalizeVodEndOfStream(provider, sourceBuffers) {
+    if (!provider || provider.destroyed || !provider.mediaSource) return false;
+    if (provider.mediaSource.readyState === 'ended') {
+      provider.vodEndOfStreamPending = false;
+      provider._vodEndOfStreamRetryAttempt = 0;
+      return false;
+    }
+    if (provider.mediaSource.readyState !== 'open') return false;
+    sourceBuffers = (sourceBuffers || []).filter(Boolean);
+    if (sourceBuffers.some(vodSourceBufferBusy)) {
+      scheduleVodEndOfStream(provider, sourceBuffers, 0);
+      return false;
+    }
+    try {
+      provider.mediaSource.endOfStream();
+      provider.vodEndOfStreamPending = false;
+      provider._vodEndOfStreamRetryAttempt = 0;
+      if (provider._vodEndOfStreamRetryTimer) clearTimeout(provider._vodEndOfStreamRetryTimer);
+      provider._vodEndOfStreamRetryTimer = 0;
+      provider.vodEndOfStreamCount = (provider.vodEndOfStreamCount || 0) + 1;
+      provider.vodEndOfStreamRefillPending = false;
+      provider.vodFinalDuration = providerPlayableEnd(provider);
+      return true;
+    } catch (e) {
+      provider.vodEndOfStreamRetryCount = (provider.vodEndOfStreamRetryCount || 0) + 1;
+      provider._vodEndOfStreamRetryAttempt = (provider._vodEndOfStreamRetryAttempt || 0) + 1;
+      scheduleVodEndOfStream(
+        provider,
+        sourceBuffers,
+        Math.min(1000, 50 * Math.pow(2, Math.min(4, provider._vodEndOfStreamRetryAttempt - 1)))
+      );
+      return false;
+    }
+  }
+
+  function clearVodEndOfStreamState(provider) {
+    if (!provider) return;
+    provider.vodEndOfStreamPending = false;
+    provider.vodEndOfStreamRefillPending = false;
+    provider._vodEndOfStreamScheduled = false;
+    provider._vodEndOfStreamRetryAttempt = 0;
+    if (provider._vodEndOfStreamRetryTimer) clearTimeout(provider._vodEndOfStreamRetryTimer);
+    provider._vodEndOfStreamRetryTimer = 0;
   }
 
   function waitForSourceBufferIdle(sb) {
@@ -7934,6 +11620,48 @@
     });
   }
 
+  function startupBufferRequirement(provider, goal) {
+    var bufferGoal = provider && provider._bufferAheadGoal ? provider._bufferAheadGoal() : goal;
+    var required = Math.max(0, Math.min(Number(goal) || 0, Number(bufferGoal) || 0));
+    if (!provider || provider.live) return required;
+    var duration = 0;
+    var durationCandidates = [
+      provider.vodFinalDuration,
+      provider.videoDuration,
+      provider.duration,
+      provider.video && provider.video.duration
+    ];
+    for (var i = 0; i < durationCandidates.length; i++) {
+      var candidate = Number(durationCandidates[i]);
+      if (isFinite(candidate) && candidate > 0) {
+        duration = candidate;
+        break;
+      }
+    }
+    if (!duration) return required;
+    var target = provider.seekBufferPending
+      ? Number(provider.lastSeekTarget)
+      : Number(provider.video && provider.video.currentTime);
+    if (!isFinite(target)) target = 0;
+    return Math.max(0, Math.min(required, Math.max(0, duration - target)));
+  }
+
+  function markStartupBufferReady(provider) {
+    if (!provider || provider.destroyed || provider.startupBufferComplete) return false;
+    provider.startupBufferComplete = true;
+    provider.startupBufferMs = provider.startupBufferStartedAt
+      ? performance.now() - provider.startupBufferStartedAt
+      : 0;
+    if (provider.engine && provider.engine._telemetry) {
+      provider.engine._telemetry.record('startup-buffer-ready', { startupBufferMs: provider.startupBufferMs });
+    }
+    if (provider.engine && provider.engine._markStartupReady) {
+      return provider.engine._markStartupReady(provider, provider.loadGeneration);
+    }
+    if (provider.engine && provider.engine._setState) provider.engine._setState('ready');
+    return true;
+  }
+
   function seekToStartTime(engine, startTime) {
     var target = Number(startTime);
     if (!isFinite(target) || target < 0) return Promise.resolve();
@@ -7960,6 +11688,107 @@
       }
     } catch (e) {}
     return { start: 0, end: 0 };
+  }
+
+  function seekOperationMatches(provider, target) {
+    if (!provider || !(provider.activeSeekGeneration > 0)) return false;
+    if (!provider.seekBufferPending && !provider.seekInteractionPending) return false;
+    return Math.abs((Number(provider.lastSeekTarget) || 0) - target) <= 0.05;
+  }
+
+  function beginSeekOperation(provider, target) {
+    target = Number(target);
+    if (!isFinite(target)) target = provider && provider.video ? Number(provider.video.currentTime) || 0 : 0;
+    if (!seekOperationMatches(provider, target)) {
+      provider.seekGeneration = (provider.seekGeneration || 0) + 1;
+      provider.activeSeekGeneration = provider.seekGeneration;
+      provider.seekBufferPending = true;
+      provider.seekInteractionPending = true;
+      provider.lastSeekStartedAt = performance.now();
+    } else {
+      provider.seekInteractionPending = true;
+      if (!provider.lastSeekStartedAt) provider.lastSeekStartedAt = performance.now();
+    }
+    provider.lastSeekTarget = target;
+    if (provider.engine && provider.engine._setState) provider.engine._setState('seeking');
+    return { target: target, generation: provider.activeSeekGeneration };
+  }
+
+  function activeSeekGeneration(provider) {
+    if (provider.activeSeekGeneration > 0) return provider.activeSeekGeneration;
+    provider.seekGeneration = (provider.seekGeneration || 0) + 1;
+    provider.activeSeekGeneration = provider.seekGeneration;
+    return provider.activeSeekGeneration;
+  }
+
+  function finalizeSeekOperation(provider, generation) {
+    if (!provider || generation !== provider.activeSeekGeneration) return false;
+    if (provider.seekBufferPending || provider.seekInteractionPending) return false;
+    provider.completedSeekGeneration = generation;
+    if (
+      !provider.destroyed
+      && provider.engine
+      && provider.engine._setState
+      && !provider.engine._serverDown
+      && provider.engine._state !== 'error'
+      && provider.engine._state !== 'destroyed'
+    ) {
+      provider.engine._setState('ready');
+    }
+    return true;
+  }
+
+  function completeSeekBuffer(provider, generation, buffered) {
+    if (!provider) return false;
+    generation = generation || activeSeekGeneration(provider);
+    if (
+      provider.destroyed
+      || generation !== provider.activeSeekGeneration
+      || !provider.seekBufferPending
+    ) return false;
+    provider.seekBufferPending = false;
+    provider.seekBufferReadyCount = (provider.seekBufferReadyCount || 0) + 1;
+    if (buffered) provider.bufferedSeekCount = (provider.bufferedSeekCount || 0) + 1;
+    if (provider.engine && provider.engine._telemetry) {
+      provider.engine._telemetry.record('seek-buffer-ready', buffered ? { buffered: true } : undefined);
+    }
+    finalizeSeekOperation(provider, generation);
+    return true;
+  }
+
+  function finishSeekInteraction(provider, generation) {
+    if (!provider) return false;
+    generation = generation || provider.activeSeekGeneration;
+    if (!(generation > 0) || generation !== provider.activeSeekGeneration) return false;
+    if (provider.lastSeekStartedAt) provider.lastSeekMs = performance.now() - provider.lastSeekStartedAt;
+    provider.lastSeekStartedAt = 0;
+    provider.seekInteractionPending = false;
+    finalizeSeekOperation(provider, generation);
+    return true;
+  }
+
+  function invalidateSeekOperation(provider) {
+    if (!provider) return 0;
+    provider.seekGeneration = (provider.seekGeneration || 0) + 1;
+    provider.activeSeekGeneration = 0;
+    provider.seekBufferPending = false;
+    provider.seekInteractionPending = false;
+    provider.lastSeekStartedAt = 0;
+    return provider.seekGeneration;
+  }
+
+  function cancelSeekOperation(provider) {
+    invalidateSeekOperation(provider);
+    if (
+      !provider.destroyed
+      && provider.engine
+      && provider.engine._setState
+      && !provider.engine._serverDown
+      && provider.engine._state !== 'error'
+      && provider.engine._state !== 'destroyed'
+    ) {
+      provider.engine._setState('ready');
+    }
   }
 
   function clearMediaElement(video) {
@@ -8020,13 +11849,19 @@
     };
   }
 
-  function getBufferAhead(video) {
+  function getBufferAheadAt(video, currentTime, startTolerance) {
+    if (!video || !video.buffered) return 0;
     var buf = video.buffered;
-    var ct = video.currentTime || 0;
+    var ct = Number(currentTime) || 0;
+    var tolerance = startTolerance == null ? 0.5 : Math.max(0, Number(startTolerance) || 0);
     for (var i = 0; i < buf.length; i++) {
-      if (ct >= buf.start(i) - 0.5 && ct <= buf.end(i)) return buf.end(i) - ct;
+      if (ct >= buf.start(i) - tolerance && ct <= buf.end(i)) return Math.max(0, buf.end(i) - ct);
     }
     return 0;
+  }
+
+  function getBufferAhead(video) {
+    return getBufferAheadAt(video, video ? video.currentTime : 0, 0.5);
   }
 
   function updateEwma(provider, accumulatorKey, weightKey, sample, weight, halfLife) {
@@ -8187,12 +12022,218 @@
     return null;
   }
 
+  function bufferedRangeStartAtOrAfter(video, time) {
+    if (!video || !video.buffered) return null;
+    for (var i = 0; i < video.buffered.length; i++) {
+      var start = video.buffered.start(i);
+      var end = video.buffered.end(i);
+      if (end < time - 0.05) continue;
+      if (start <= time + 0.1) return Math.max(start, time);
+      return start;
+    }
+    return null;
+  }
+
+  function hlsDeclaredTrackGapAtPlayhead(segments, currentTime) {
+    if (!segments || !segments.length) return null;
+    var gapStart = 0;
+    var gapEnd = 0;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (!seg.gap || currentTime < seg.start - 0.15 || currentTime >= seg.end) continue;
+      gapStart = seg.start;
+      gapEnd = seg.end;
+      for (var j = i + 1; j < segments.length; j++) {
+        if (!segments[j].gap || segments[j].start > gapEnd + 0.05) break;
+        gapEnd = Math.max(gapEnd, segments[j].end);
+      }
+      break;
+    }
+    if (gapEnd <= gapStart) return null;
+    return { start: gapStart, end: gapEnd };
+  }
+
+  function hlsDeclaredGapAtPlayhead(provider) {
+    var currentTime = provider && provider.video ? (provider.video.currentTime || 0) : 0;
+    if (!provider) return null;
+    var tracks = [];
+    if (!provider.suppressedVideoGapTrack && provider.segments && provider.segments.length) {
+      tracks.push({ kind: 'video', segments: provider.segments, buffered: provider.sb ? provider.sb.buffered : provider.video.buffered });
+    }
+    if (provider.activeAudio && provider.audioSb) {
+      tracks.push({ kind: 'audio', segments: provider.audioSegments, buffered: provider.audioSb.buffered });
+    }
+    var declared = [];
+    for (var i = 0; i < tracks.length; i++) {
+      var gap = hlsDeclaredTrackGapAtPlayhead(tracks[i].segments, currentTime);
+      if (gap) declared.push({ kind: tracks[i].kind, start: gap.start, end: gap.end });
+    }
+    if (!declared.length) return null;
+    var gapStart = declared[0].start;
+    var gapEnd = declared[0].end;
+    for (var j = 1; j < declared.length; j++) {
+      gapStart = Math.min(gapStart, declared[j].start);
+      gapEnd = Math.max(gapEnd, declared[j].end);
+    }
+    var bufferedStart = bufferedRangeStartAtOrAfter(provider.video, gapEnd);
+    if (bufferedStart == null || bufferedStart > gapEnd + 0.25) return null;
+    for (var k = 0; k < tracks.length; k++) {
+      var trackStart = bufferedRangeStartAtOrAfter({ buffered: tracks[k].buffered }, bufferedStart);
+      if (trackStart == null || trackStart > bufferedStart + 0.25) return null;
+    }
+    return {
+      target: bufferedStart + 0.01,
+      size: gapEnd - gapStart,
+      track: declared.map(function (item) { return item.kind; }).join('+')
+    };
+  }
+
+  function bufferedGapAtPlayhead(video) {
+    if (!video || !video.buffered || video.buffered.length < 2) return null;
+    var currentTime = video.currentTime || 0;
+    for (var i = 0; i < video.buffered.length - 1; i++) {
+      var end = video.buffered.end(i);
+      var nextStart = video.buffered.start(i + 1);
+      if (currentTime >= video.buffered.start(i) - 0.05 && currentTime >= end - 0.15 && currentTime < nextStart) {
+        return { start: end, end: nextStart };
+      }
+    }
+    return null;
+  }
+
+  function representationDeclaresTimelineGap(rep, gap) {
+    var segments = rep && (rep.segments || rep.templateSegments);
+    if (!segments || !segments.length || !gap) return false;
+    var before = false;
+    var after = false;
+    for (var i = 0; i < segments.length; i++) {
+      var seg = segments[i];
+      if (seg.end <= gap.start + 0.15) before = true;
+      if (seg.start >= gap.end - 0.15) after = true;
+      if (seg.start < gap.end - 0.15 && seg.end > gap.start + 0.15) return false;
+    }
+    return before && after;
+  }
+
+  function dashDeclaredGapAtPlayhead(provider) {
+    var gap = bufferedGapAtPlayhead(provider && provider.video);
+    if (!gap) return null;
+    if (!representationDeclaresTimelineGap(provider.activeVideo, gap)) return null;
+    if (provider.audio && !representationDeclaresTimelineGap(provider.audio, gap)) return null;
+    return { target: gap.end + 0.01, size: gap.end - gap.start };
+  }
+
+  function jumpDeclaredManifestGap(provider, type) {
+    if (!provider || provider.destroyed || !provider.video || provider.video.seeking) return false;
+    var gap = type === 'hls' ? hlsDeclaredGapAtPlayhead(provider) : dashDeclaredGapAtPlayhead(provider);
+    if (!gap || gap.size <= 0) return false;
+    try {
+      assignInternalMediaTime(provider, gap.target);
+      provider.manifestGapJumpCount = (provider.manifestGapJumpCount || 0) + 1;
+      provider.lastManifestGapSize = gap.size;
+      provider.lastManifestGapTrack = gap.track || type;
+      provider.lastError = 'manifest-gap-jump';
+      if (provider.engine && provider.engine._telemetry) {
+        provider.engine._telemetry.record('gap-jump', {
+          lastGapSize: gap.size,
+          manifestGap: true
+        });
+      }
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
   function markSegmentsUnappended(rep) {
     if (!rep || !rep.segments) return;
     for (var i = 0; i < rep.segments.length; i++) {
       rep.segments[i].appended = false;
       rep.segments[i].state = 'pending';
     }
+  }
+
+  function segmentOverlapsRemovedRange(seg, range) {
+    if (!seg || !range || !isFinite(range.start) || !isFinite(range.end)) return false;
+    return seg.end > range.start + 0.001 && seg.start < range.end - 0.001;
+  }
+
+  function invalidateRepresentationSegmentLedger(rep, range, preserveSegment, fullReset) {
+    if (!rep) return 0;
+    if (fullReset) {
+      if (Object.prototype.hasOwnProperty.call(rep, '_appendedInitKey')) rep._appendedInitKey = '';
+      if (Object.prototype.hasOwnProperty.call(rep, '_lastAppendInitKey')) rep._lastAppendInitKey = '';
+      if (Object.prototype.hasOwnProperty.call(rep, '_lastAppendInitGenerationKey')) rep._lastAppendInitGenerationKey = '';
+    }
+    if (!rep.segments) return 0;
+    var invalidated = 0;
+    for (var i = 0; i < rep.segments.length; i++) {
+      var seg = rep.segments[i];
+      if (seg === preserveSegment || seg.state === 'expired' || seg.gap) continue;
+      if (!fullReset && !segmentOverlapsRemovedRange(seg, range)) continue;
+      if (seg.appended || seg.state !== 'pending') invalidated++;
+      seg.appended = false;
+      seg.state = 'pending';
+      delete seg._data;
+      delete seg._fetchStartedAt;
+      delete seg._appendStartedAt;
+      delete seg._appendOwner;
+      resetHlsPartState(seg);
+    }
+    return invalidated;
+  }
+
+  function uniqueRepresentations(items) {
+    var result = [];
+    for (var i = 0; i < items.length; i++) {
+      if (items[i] && result.indexOf(items[i]) === -1) result.push(items[i]);
+    }
+    return result;
+  }
+
+  function dashRepresentationsForSourceBuffer(provider, kind, primaryRep) {
+    var reps = kind === 'audio' ? (provider.audioReps || []) : (provider.videoReps || []);
+    return uniqueRepresentations(reps.concat([
+      primaryRep || null,
+      kind === 'audio' ? provider.audio : provider.activeVideo
+    ]));
+  }
+
+  function reconcileDashSegmentLedgers(provider, kind, range, primaryRep, preserveSegment, fullReset) {
+    if (!provider) return 0;
+    var reps = dashRepresentationsForSourceBuffer(provider, kind, primaryRep);
+    var invalidated = 0;
+    for (var i = 0; i < reps.length; i++) {
+      invalidated += invalidateRepresentationSegmentLedger(reps[i], range, preserveSegment, fullReset);
+    }
+    if (invalidated) {
+      provider.dashSegmentLedgerReconcileCount = (provider.dashSegmentLedgerReconcileCount || 0) + 1;
+      provider.dashSegmentLedgerInvalidationCount = (provider.dashSegmentLedgerInvalidationCount || 0) + invalidated;
+    }
+    return invalidated;
+  }
+
+  function hlsRepresentationsForSourceBuffer(provider, kind, primaryRep) {
+    if (kind !== 'audio') return uniqueRepresentations([provider, primaryRep]);
+    return uniqueRepresentations((provider.audioRenditions || []).concat([
+      provider.activeAudio,
+      provider._muxedAudioTrack,
+      primaryRep
+    ]));
+  }
+
+  function reconcileHlsSegmentLedgers(provider, kind, range, primaryRep, preserveSegment, fullReset) {
+    if (!provider) return 0;
+    var reps = hlsRepresentationsForSourceBuffer(provider, kind, primaryRep);
+    var invalidated = 0;
+    for (var i = 0; i < reps.length; i++) {
+      invalidated += invalidateRepresentationSegmentLedger(reps[i], range, preserveSegment, fullReset);
+    }
+    if (invalidated) {
+      provider.hlsSegmentLedgerReconcileCount = (provider.hlsSegmentLedgerReconcileCount || 0) + 1;
+      provider.hlsSegmentLedgerInvalidationCount = (provider.hlsSegmentLedgerInvalidationCount || 0) + invalidated;
+    }
+    return invalidated;
   }
 
   function markSegmentsCoveredByBuffer(rep, video) {
@@ -8238,6 +12279,13 @@
     }
   }
 
+  function prepareSegmentsForRefill(rep, bufferedSource, time, ahead) {
+    if (!rep) return;
+    markSegmentsUnappended(rep);
+    markSegmentsCoveredByBuffer(rep, bufferedSource);
+    markSegmentsForTime(rep, time, ahead);
+  }
+
   function isSegmentBusyOrDone(seg) {
     return seg.appended || seg.state === 'fetching' || seg.state === 'fetched' || seg.state === 'appending' || seg.state === 'appended';
   }
@@ -8245,17 +12293,33 @@
   function segmentsAppendedThroughEnd(segments, duration) {
     if (!segments || !segments.length) return false;
     var terminal = null;
+    var manifestEnd = 0;
     for (var i = 0; i < segments.length; i++) {
       var seg = segments[i];
+      manifestEnd = Math.max(manifestEnd, seg.end || 0);
+      if (seg.gap) continue;
       if (seg.end < 0.05) continue;
       if (!terminal || seg.end > terminal.end) terminal = seg;
     }
-    if (!terminal || (!terminal.appended && terminal.state !== 'appended')) return false;
+    // An all-gap rendition has no media bytes left to append. Closing it is
+    // preferable to waiting forever for an object the Playlist forbids us to
+    // request.
+    if (!terminal) return segments.every(function (seg) { return !!seg.gap; });
+    if (!terminal.appended && terminal.state !== 'appended') return false;
     // A finite VOD manifest is authoritative about its final segment. Earlier
     // segments may legitimately be absent after a seek or an ABR switch, and
     // requiring them all prevents MediaSource.endOfStream() forever. Keep the
     // duration check only as protection against a genuinely incomplete index.
-    return !(isFinite(duration) && duration > 0 && terminal.end < duration - Math.max(1, duration * 0.01));
+    var effectiveDuration = duration;
+    if (manifestEnd > terminal.end) {
+      var trailingEntriesAreGaps = segments.every(function (seg) {
+        return seg.end <= terminal.end + 0.001 || !!seg.gap;
+      });
+      if (trailingEntriesAreGaps && isFinite(effectiveDuration)) {
+        effectiveDuration = Math.max(0, effectiveDuration - (manifestEnd - terminal.end));
+      }
+    }
+    return !(isFinite(effectiveDuration) && effectiveDuration > 0 && terminal.end < effectiveDuration - Math.max(1, effectiveDuration * 0.01));
   }
 
   function segmentPriority(seg, currentTime, readyGoal) {
@@ -8308,6 +12372,7 @@
   function resetActiveSegmentRequests(rep) {
     if (!rep || !rep.segments) return;
     rep._appending = false;
+    rep._appendOwner = null;
     for (var i = 0; i < rep.segments.length; i++) {
       var seg = rep.segments[i];
       if (seg.state === 'fetching' || seg.state === 'fetched' || seg.state === 'appending') {
@@ -8315,6 +12380,8 @@
         seg.appended = false;
         delete seg._data;
         delete seg._fetchStartedAt;
+        delete seg._appendStartedAt;
+        delete seg._appendOwner;
       }
       resetActiveHlsPartRequests(seg);
     }
@@ -8441,6 +12508,8 @@
           old.gap = !!seg.gap;
           old._hlsPartialOnly = !!seg._hlsPartialOnly;
           old._hlsPlaylistUrl = seg._hlsPlaylistUrl || old._hlsPlaylistUrl;
+          old._hlsInitSegment = seg._hlsInitSegment || old._hlsInitSegment;
+          old._hlsTimestampGenerationKey = seg._hlsTimestampGenerationKey || old._hlsTimestampGenerationKey;
           if (isFinite(seg.programDateTimeMs)) old.programDateTimeMs = seg.programDateTimeMs;
           mergeHlsPartState(old, seg);
           old.parts = seg.parts || oldParts;
@@ -8480,6 +12549,8 @@
         old.independent = fresh.independent;
         old.gap = fresh.gap;
         old.key = fresh.key || old.key;
+        old._hlsInitSegment = fresh._hlsInitSegment || freshSeg._hlsInitSegment || old._hlsInitSegment;
+        old._hlsTimestampGenerationKey = fresh._hlsTimestampGenerationKey || old._hlsTimestampGenerationKey;
         old._parentSegment = freshSeg;
         old._hlsPart = true;
         old._hlsPreloadHint = false;
@@ -8493,7 +12564,10 @@
 
   function hlsSequenceKey(seg) {
     if (!seg || seg.mediaSequence == null || !seg._hlsPlaylistUrl) return '';
-    return seg._hlsPlaylistUrl + ':ms' + seg.mediaSequence + ':ds' + (seg.discontinuitySequence || 0);
+    return seg._hlsPlaylistUrl
+      + ':ms' + seg.mediaSequence
+      + ':ds' + (seg.discontinuitySequence || 0)
+      + ':map=' + hlsInitSegmentKey(seg._hlsInitSegment);
   }
 
   function markCompletedHlsParent(parent, previous) {
@@ -8529,6 +12603,7 @@
       part.discontinuity = !!(segment.discontinuity && i === 0);
       part.discontinuitySequence = segment.discontinuitySequence || 0;
       part.key = segment.key || null;
+      part._hlsInitSegment = part._hlsInitSegment || segment._hlsInitSegment || null;
       part._hlsPart = true;
       part._parentSegment = segment;
       if (!part.range && segment.range) part.range = null;
@@ -8575,6 +12650,8 @@
         hinted.gap = official.gap;
         hinted.key = official.key;
         hinted.range = official.range;
+        hinted._hlsInitSegment = official._hlsInitSegment || segments[i]._hlsInitSegment || hinted._hlsInitSegment;
+        hinted._hlsTimestampGenerationKey = official._hlsTimestampGenerationKey || hinted._hlsTimestampGenerationKey;
         hinted._parentSegment = segments[i];
         hinted._hlsPart = true;
         hinted._hlsPreloadHint = false;
@@ -8608,23 +12685,454 @@
     if (!track || !track.segments || !track.segments.length) return null;
     var tail = track.segments[track.segments.length - 1];
     if (tail.mediaSequence == null) return null;
+    var cursor = {
+      msn: tail.mediaSequence,
+      part: -1,
+      partial: false,
+      discontinuitySequence: tail.discontinuitySequence || 0,
+      programDateTimeMs: isFinite(tail.programDateTimeMs)
+        ? tail.programDateTimeMs + Math.max(0, tail.duration || 0) * 1000
+        : null
+    };
     if (tail._hlsPartialOnly) {
-      return {
-        msn: tail.mediaSequence,
-        part: Math.max(-1, ((tail.parts && tail.parts.length) || 0) - 1),
-        partial: true
-      };
+      cursor.part = Math.max(-1, ((tail.parts && tail.parts.length) || 0) - 1);
+      cursor.partial = true;
     }
-    return { msn: tail.mediaSequence, part: -1, partial: false };
+    return cursor;
+  }
+
+  function hlsTrackSignature(track) {
+    if (!track) return '';
+    var initSegment = track.initSegment || track.map || null;
+    var initKey = hlsInitSegmentKey(initSegment);
+    var segments = track.segments || [];
+    var values = [initKey, String(track.endList === true), String(track.isTsPlaylist === true)];
+    for (var i = 0; i < segments.length; i++) {
+      values.push(segmentKey(segments[i]) + ':gap=' + (segments[i].gap ? '1' : '0'));
+    }
+    return values.join('|');
+  }
+
+  function hlsTrackRefreshOutcome(kind, applied, stale, advanced, changed) {
+    return {
+      kind: kind,
+      applied: !!applied,
+      stale: !!stale,
+      advanced: !!advanced,
+      changed: !!changed,
+      failed: false,
+      error: null
+    };
+  }
+
+  function failedHlsTrackRefreshOutcome(kind, err) {
+    return {
+      kind: kind,
+      applied: false,
+      stale: false,
+      advanced: false,
+      changed: false,
+      failed: true,
+      error: err
+    };
+  }
+
+  function hlsPlaylistFetchOutcome(kind, text) {
+    return {
+      kind: kind,
+      text: text,
+      failed: false,
+      error: null
+    };
+  }
+
+  function settleHlsPlaylistFetch(fetchPromise, kind, timeoutMs) {
+    return new Promise(function (resolve) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        finish(failedHlsTrackRefreshOutcome(kind, new Error('hls-' + kind + '-playlist-refresh-timeout')));
+      }, timeoutMs);
+      function finish(outcome) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(outcome);
+      }
+      fetchPromise.then(function (text) {
+        finish(hlsPlaylistFetchOutcome(kind, text));
+      }, function (err) {
+        finish(failedHlsTrackRefreshOutcome(kind, err));
+      });
+    });
+  }
+
+  function settleHlsPlaylistApplication(kind, apply) {
+    try {
+      return Promise.resolve(apply()).then(function (outcome) {
+        return outcome || hlsTrackRefreshOutcome(kind, false, false, false, false);
+      }, function (err) {
+        return failedHlsTrackRefreshOutcome(kind, err);
+      });
+    } catch (err) {
+      return Promise.resolve(failedHlsTrackRefreshOutcome(kind, err));
+    }
+  }
+
+  function cloneHlsRefreshValue(value, sources, copies) {
+    if (value === null || typeof value !== 'object') return value;
+    if (value instanceof ArrayBuffer || ArrayBuffer.isView(value)) return value;
+    var existingIndex = sources.indexOf(value);
+    if (existingIndex !== -1) return copies[existingIndex];
+    var copy = Array.isArray(value) ? [] : {};
+    sources.push(value);
+    copies.push(copy);
+    for (var key in value) {
+      if (Object.prototype.hasOwnProperty.call(value, key)) {
+        copy[key] = cloneHlsRefreshValue(value[key], sources, copies);
+      }
+    }
+    return copy;
+  }
+
+  function createHlsPlaylistRefreshDraft(provider, selectedVariant, selectedAudio) {
+    var draft = Object.create(Object.getPrototypeOf(provider) || Object.prototype);
+    for (var key in provider) {
+      if (Object.prototype.hasOwnProperty.call(provider, key)) draft[key] = provider[key];
+    }
+    var videoSources = [];
+    var videoCopies = [];
+    draft.segments = cloneHlsRefreshValue(provider.segments || [], videoSources, videoCopies);
+    draft._preloadHintSegments = cloneHlsRefreshValue(provider._preloadHintSegments || {}, videoSources, videoCopies);
+    draft.playlistCursorByUrl = clonePlain(provider.playlistCursorByUrl || {});
+    draft.playlistResetCandidateByUrl = clonePlain(provider.playlistResetCandidateByUrl || {});
+    draft.playlistEpochByUrl = clonePlain(provider.playlistEpochByUrl || {});
+    draft.hlsTimestampGenerationByKey = clonePlain(provider.hlsTimestampGenerationByKey || {});
+    draft.manifestCompatibilityWarnings = (provider.manifestCompatibilityWarnings || []).slice();
+    draft.activeVariant = selectedVariant;
+    var audioDraft = null;
+    if (selectedAudio) {
+      audioDraft = {};
+      for (var audioKey in selectedAudio) {
+        if (Object.prototype.hasOwnProperty.call(selectedAudio, audioKey)) audioDraft[audioKey] = selectedAudio[audioKey];
+      }
+      var audioSources = [];
+      var audioCopies = [];
+      audioDraft.segments = cloneHlsRefreshValue(selectedAudio.segments || [], audioSources, audioCopies);
+      audioDraft._preloadHintSegments = cloneHlsRefreshValue(selectedAudio._preloadHintSegments || {}, audioSources, audioCopies);
+      draft.activeAudio = audioDraft;
+      draft.audioSegments = audioDraft.segments;
+      draft.audioInitSegment = audioDraft.initSegment || null;
+    }
+    draft._stagedTimelineRegions = [];
+    draft._addTimelineRegions = function (regions) {
+      if (regions && regions.length) this._stagedTimelineRegions = this._stagedTimelineRegions.concat(regions);
+    };
+    // Presentation changes affect the engine, MediaSource duration, and live
+    // refresh timers. A draft computes the values without publishing any of
+    // those side effects before both required tracks have been validated.
+    draft._syncPresentationState = function () {
+      var separateAudioPendingEnd = !!(this.activeAudio && this.audioEndList === false);
+      this.live = !this.videoEndList || separateAudioPendingEnd;
+      var duration = Math.max(
+        this.videoDuration || 0,
+        this.activeAudio && this.activeAudio.duration ? this.activeAudio.duration : 0
+      );
+      if (isFinite(duration) && duration > 0) this.duration = duration;
+    };
+    // Transmuxer setup can load code and mutate provider-owned adapters. The
+    // live commit replays the already-validated manifests and performs that
+    // work only after the transaction has been accepted.
+    draft._ensureTsTransmuxer = function () { return Promise.resolve(); };
+    return {
+      provider: draft,
+      variant: selectedVariant,
+      audio: audioDraft
+    };
   }
 
   function hlsCursorAdvanced(previous, current) {
-    if (!previous) return !!current;
-    if (!current) return false;
-    if (current.msn !== previous.msn) return current.msn > previous.msn;
-    if (previous.partial && !current.partial) return true;
-    if (!previous.partial && current.partial) return false;
-    return current.part > previous.part;
+    return compareHlsCursors(current, previous) > 0;
+  }
+
+  function hlsEpochTrackWindowsCompatible(videoTrack, audioTrack) {
+    var videoSegments = videoTrack && videoTrack.segments ? videoTrack.segments : [];
+    var audioSegments = audioTrack && audioTrack.segments ? audioTrack.segments : [];
+    if (!videoSegments.length || !audioSegments.length) return false;
+    var videoTail = videoSegments[videoSegments.length - 1];
+    var audioTail = audioSegments[audioSegments.length - 1];
+    if (!isFinite(videoTail.end) || !isFinite(audioTail.end)) return false;
+    var tolerance = Math.max(
+      0.5,
+      (videoTrack && videoTrack.targetDuration) || 0,
+      (audioTrack && audioTrack.targetDuration) || 0
+    ) * 2;
+    return Math.abs(videoTail.end - audioTail.end) <= tolerance;
+  }
+
+  function compareHlsCursors(current, previous) {
+    if (!previous) return current ? 1 : 0;
+    if (!current) return -1;
+    if (current.msn !== previous.msn) return current.msn > previous.msn ? 1 : -1;
+    if (previous.partial && !current.partial) return 1;
+    if (!previous.partial && current.partial) return -1;
+    if (current.part === previous.part) return 0;
+    return current.part > previous.part ? 1 : -1;
+  }
+
+  function copyHlsPlaylistCursor(cursor) {
+    if (!cursor) return null;
+    return {
+      msn: cursor.msn,
+      part: cursor.part,
+      partial: cursor.partial,
+      discontinuitySequence: cursor.discontinuitySequence || 0,
+      programDateTimeMs: isFinite(cursor.programDateTimeMs) ? cursor.programDateTimeMs : null
+    };
+  }
+
+  function acceptHlsPlaylistCursor(provider, url, parsed, kind) {
+    if (!provider) return true;
+    provider.playlistCursorByUrl = provider.playlistCursorByUrl || {};
+    provider.playlistResetCandidateByUrl = provider.playlistResetCandidateByUrl || {};
+    provider.playlistEpochByUrl = provider.playlistEpochByUrl || {};
+    var key = String(url || '');
+    var incoming = hlsDeliveryCursor(parsed);
+    var previous = provider.playlistCursorByUrl[key];
+    if (previous && incoming && compareHlsCursors(incoming, previous) < 0) {
+      var previousPdt = previous.programDateTimeMs;
+      var incomingPdt = incoming.programDateTimeMs;
+      var newerProgramDate = previousPdt != null && incomingPdt != null
+        && isFinite(previousPdt) && isFinite(incomingPdt) && incomingPdt > previousPdt + 250;
+      var newerDiscontinuity = (incoming.discontinuitySequence || 0) > (previous.discontinuitySequence || 0);
+      var dramaticDrop = previous.msn - incoming.msn >= Math.max(3, (parsed.segments && parsed.segments.length) || 0);
+      var confirmedAdvancingReset = false;
+      var candidate = provider.playlistResetCandidateByUrl[key];
+      if (!newerProgramDate && !newerDiscontinuity && provider.live && !parsed.endList && dramaticDrop) {
+        if (candidate && compareHlsCursors(incoming, candidate.cursor) > 0) {
+          confirmedAdvancingReset = true;
+        } else if (!candidate || compareHlsCursors(incoming, candidate.cursor) < 0) {
+          provider.playlistResetCandidateByUrl[key] = { cursor: copyHlsPlaylistCursor(incoming) };
+        }
+      }
+      if (!newerProgramDate && !newerDiscontinuity && !confirmedAdvancingReset) return false;
+      delete provider.playlistResetCandidateByUrl[key];
+      var previousEpoch = provider.playlistEpochByUrl[key];
+      parsed._hlsEpochReset = true;
+      parsed._hlsPlaylistEpoch = previousEpoch && previousEpoch.id ? previousEpoch.id + 1 : 1;
+      provider.playlistEpochResetCount = (provider.playlistEpochResetCount || 0) + 1;
+      provider.lastPlaylistEpochResetTrack = kind || '';
+    } else {
+      delete provider.playlistResetCandidateByUrl[key];
+    }
+    if (incoming && (!previous || compareHlsCursors(incoming, previous) >= 0)) {
+      provider.playlistCursorByUrl[key] = copyHlsPlaylistCursor(incoming);
+    } else if (parsed._hlsEpochReset && incoming) {
+      provider.playlistCursorByUrl[key] = copyHlsPlaylistCursor(incoming);
+    }
+    return true;
+  }
+
+  function clearHlsPreloadHintEpochState(provider) {
+    if (!provider) return;
+    var hints = provider._preloadHintSegments || {};
+    for (var key in hints) {
+      if (!Object.prototype.hasOwnProperty.call(hints, key)) continue;
+      hints[key]._hlsPreloadHintStale = true;
+      hints[key].state = 'expired';
+      delete hints[key]._data;
+      provider.preloadHintDiscardCount = (provider.preloadHintDiscardCount || 0) + 1;
+    }
+    provider._preloadHintSegments = {};
+  }
+
+  function hlsSegmentInitSegment(provider, track, seg) {
+    var parent = seg && (seg._parentSegment || seg);
+    if (seg && seg._hlsInitSegment) return seg._hlsInitSegment;
+    if (parent && parent._hlsInitSegment) return parent._hlsInitSegment;
+    var isAudio = track && track !== provider && track.kind === 'audio';
+    return isAudio
+      ? (track.initSegment || provider.audioInitSegment || null)
+      : (provider.initSegment || null);
+  }
+
+  function hlsTimestampGenerationKey(kind, url, segment) {
+    return (kind || 'video')
+      + ':' + String(url || segment && segment._hlsPlaylistUrl || '')
+      + ':epoch=' + (segment && segment._hlsPlaylistEpoch || 0)
+      + ':disc=' + (segment && segment.discontinuitySequence || 0)
+      + ':map=' + hlsInitSegmentKey(segment && segment._hlsInitSegment);
+  }
+
+  function assignHlsTimestampGenerations(provider, url, parsed, kind) {
+    if (!provider || !parsed || !parsed.segments) return;
+    provider.hlsTimestampGenerationByKey = provider.hlsTimestampGenerationByKey || {};
+    var previousKey = '';
+    var previousSequence = null;
+    for (var i = 0; i < parsed.segments.length; i++) {
+      var segment = parsed.segments[i];
+      if (!segment._hlsInitSegment) segment._hlsInitSegment = parsed.map || null;
+      var key = hlsTimestampGenerationKey(kind, url, segment);
+      var generation = provider.hlsTimestampGenerationByKey[key];
+      var isDiscontinuity = !!segment.discontinuity
+        || previousSequence != null && previousSequence !== (segment.discontinuitySequence || 0);
+      if (!generation) {
+        generation = {
+          key: key,
+          kind: kind || 'video',
+          playlistUrl: String(url || ''),
+          playlistEpoch: segment._hlsPlaylistEpoch || 0,
+          discontinuitySequence: segment.discontinuitySequence || 0,
+          initKey: hlsInitSegmentKey(segment._hlsInitSegment),
+          boundaryStart: segment.start,
+          previousKey: previousKey,
+          discontinuity: isDiscontinuity,
+          containerHint: hlsSegmentContainerHint(segment),
+          container: '',
+          mediaTimestampOffset: null,
+          mediaTimestampResolved: false
+        };
+        provider.hlsTimestampGenerationByKey[key] = generation;
+      } else if (isDiscontinuity) {
+        generation.discontinuity = true;
+      }
+      segment._hlsTimestampGenerationKey = key;
+      var parts = segment.parts || [];
+      for (var p = 0; p < parts.length; p++) {
+        parts[p]._hlsInitSegment = parts[p]._hlsInitSegment || segment._hlsInitSegment || null;
+        parts[p]._hlsTimestampGenerationKey = key;
+      }
+      previousKey = key;
+      previousSequence = segment.discontinuitySequence || 0;
+    }
+    var hints = parsed.preloadHints || [];
+    var tail = parsed.segments.length ? parsed.segments[parsed.segments.length - 1] : null;
+    for (var h = 0; h < hints.length; h++) {
+      hints[h]._hlsInitSegment = hints[h]._hlsInitSegment || tail && tail._hlsInitSegment || parsed.map || null;
+      hints[h]._hlsTimestampGenerationKey = tail ? tail._hlsTimestampGenerationKey : '';
+    }
+  }
+
+  function pruneHlsTimestampGenerations(provider) {
+    if (!provider || !provider.hlsTimestampGenerationByKey) return 0;
+    var retained = {};
+    function collectTrack(track) {
+      var segments = track && track.segments ? track.segments : [];
+      for (var i = 0; i < segments.length; i++) {
+        var segmentKey = segments[i]._hlsTimestampGenerationKey || '';
+        if (segmentKey) retained[segmentKey] = true;
+        var parts = segments[i].parts || [];
+        for (var p = 0; p < parts.length; p++) {
+          if (parts[p]._hlsTimestampGenerationKey) retained[parts[p]._hlsTimestampGenerationKey] = true;
+        }
+      }
+      var hints = track && track._preloadHintSegments ? track._preloadHintSegments : {};
+      for (var hintKey in hints) {
+        if (Object.prototype.hasOwnProperty.call(hints, hintKey) && hints[hintKey]._hlsTimestampGenerationKey) {
+          retained[hints[hintKey]._hlsTimestampGenerationKey] = true;
+        }
+      }
+    }
+    collectTrack(provider);
+    collectTrack(provider.activeAudio);
+    for (var a = 0; provider.audioRenditions && a < provider.audioRenditions.length; a++) collectTrack(provider.audioRenditions[a]);
+    var removedKeys = [];
+    for (var key in provider.hlsTimestampGenerationByKey) {
+      if (!Object.prototype.hasOwnProperty.call(provider.hlsTimestampGenerationByKey, key) || retained[key]) continue;
+      removedKeys.push(key);
+      delete provider.hlsTimestampGenerationByKey[key];
+    }
+    function pruneGenerationCache(cache) {
+      if (!cache || !removedKeys.length) return;
+      for (var cacheKey in cache) {
+        if (!Object.prototype.hasOwnProperty.call(cache, cacheKey)) continue;
+        for (var r = 0; r < removedKeys.length; r++) {
+          if (cacheKey.indexOf(':generation=' + removedKeys[r]) !== -1) {
+            delete cache[cacheKey];
+            break;
+          }
+        }
+      }
+    }
+    pruneGenerationCache(provider.hlsInitTimescaleByKey);
+    pruneGenerationCache(provider.hlsInitTrackInfoByKey);
+    if (provider.hlsTsTimelineByGeneration) {
+      for (var timelineIndex = 0; timelineIndex < removedKeys.length; timelineIndex++) {
+        delete provider.hlsTsTimelineByGeneration[removedKeys[timelineIndex]];
+      }
+    }
+    provider.hlsTimestampGenerationPruneCount = (provider.hlsTimestampGenerationPruneCount || 0) + removedKeys.length;
+    return removedKeys.length;
+  }
+
+  function applyHlsPlaylistEpoch(provider, url, parsed, previousSegments, kind) {
+    if (!provider || !parsed || !parsed.segments || !parsed.segments.length) return;
+    provider.playlistEpochByUrl = provider.playlistEpochByUrl || {};
+    var key = String(url || '');
+    var epoch = provider.playlistEpochByUrl[key];
+    var oldSegments = previousSegments || [];
+    var oldTail = oldSegments.length ? oldSegments[oldSegments.length - 1] : null;
+    if (parsed._hlsEpochReset) {
+      var oldOrigin = hlsProgramDateOrigin(oldSegments);
+      var newOrigin = hlsProgramDateOrigin(parsed.segments);
+      var first = parsed.segments[0];
+      var timelineStart = oldTail && isFinite(oldTail.end) ? oldTail.end : first.start;
+      if (oldOrigin && newOrigin) {
+        timelineStart = oldOrigin.time + (newOrigin.ms - oldOrigin.ms) / 1000;
+      }
+      var timelineOffset = timelineStart - first.start;
+      if (!isFinite(timelineOffset)) timelineOffset = 0;
+      var incomingDiscontinuity = first.discontinuitySequence || parsed.discontinuitySequence || 0;
+      var priorDiscontinuity = oldTail ? oldTail.discontinuitySequence || 0 : incomingDiscontinuity - 1;
+      var discontinuityOffset = Math.max(0, priorDiscontinuity + 1 - incomingDiscontinuity);
+      epoch = {
+        id: parsed._hlsPlaylistEpoch || 1,
+        timelineOffset: timelineOffset,
+        discontinuityOffset: discontinuityOffset,
+        mediaTimestampOffset: null,
+        mediaTimestampResolved: false,
+        kind: kind || ''
+      };
+      provider.playlistEpochByUrl[key] = epoch;
+      provider.lastPlaylistEpochResetOffset = timelineOffset;
+    } else if (!epoch && oldTail && oldTail._hlsPlaylistEpoch && isFinite(oldTail._hlsEpochManifestOffset)) {
+      var firstSegment = parsed.segments[0];
+      epoch = {
+        id: oldTail._hlsPlaylistEpoch,
+        timelineOffset: oldTail._hlsEpochManifestOffset,
+        discontinuityOffset: Math.max(0, (oldTail.discontinuitySequence || 0) - (firstSegment.discontinuitySequence || 0)),
+        mediaTimestampOffset: null,
+        mediaTimestampResolved: false,
+        kind: kind || ''
+      };
+      provider.playlistEpochByUrl[key] = epoch;
+    }
+    if (!epoch) return;
+    parsed._hlsPlaylistEpoch = epoch.id || 0;
+    var offset = Number(epoch.timelineOffset) || 0;
+    var discontinuityOffset = Number(epoch.discontinuityOffset) || 0;
+    for (var i = 0; i < parsed.segments.length; i++) {
+      var segment = parsed.segments[i];
+      segment.start += offset;
+      segment.end += offset;
+      segment.discontinuitySequence = (segment.discontinuitySequence || 0) + discontinuityOffset;
+      segment._hlsPlaylistEpoch = epoch.id || 0;
+      segment._hlsEpochManifestOffset = offset;
+      segment._hlsEpochTimestampOffset = epoch.mediaTimestampResolved ? epoch.mediaTimestampOffset : NaN;
+      if (parsed._hlsEpochReset && i === 0) segment.discontinuity = true;
+      var parts = segment.parts || [];
+      for (var p = 0; p < parts.length; p++) {
+        parts[p].start += offset;
+        parts[p].end += offset;
+        parts[p].discontinuitySequence = (parts[p].discontinuitySequence || 0) + discontinuityOffset;
+        parts[p]._hlsPlaylistEpoch = epoch.id || 0;
+        parts[p]._hlsPlaylistUrl = segment._hlsPlaylistUrl || parts[p]._hlsPlaylistUrl || '';
+        parts[p]._hlsEpochManifestOffset = offset;
+        parts[p]._hlsEpochTimestampOffset = epoch.mediaTimestampResolved ? epoch.mediaTimestampOffset : NaN;
+      }
+    }
+    parsed.duration += offset;
+    parsed.discontinuitySequence = (parsed.discontinuitySequence || 0) + discontinuityOffset;
+    if (parsed._hlsEpochReset) parsed.discontinuityCount = (parsed.discontinuityCount || 0) + 1;
   }
 
   function hlsBlockingReloadUrl(url, track) {
@@ -8772,6 +13280,8 @@
           url: hint.url,
           range: range,
           _hlsPlaylistUrl: source.playlistUrl || provider.mediaPlaylistUrl || '',
+          _hlsInitSegment: hint._hlsInitSegment || tail && tail._hlsInitSegment || source.initSegment || provider.initSegment || null,
+          _hlsTimestampGenerationKey: hint._hlsTimestampGenerationKey || tail && tail._hlsTimestampGenerationKey || '',
           _hlsPreloadHint: true,
           _hlsPart: true
         };
@@ -8779,6 +13289,201 @@
       if (!seg._hlsPreloadHintStale && !isSegmentBusyOrDone(seg) && seg.state !== 'failed' && seg.state !== 'expired') out.push(seg);
       break;
     }
+  }
+
+  var TS_TIMESTAMP_ROLLOVER_SECONDS = 8589934592 / 90000;
+  var TS_TIMESTAMP_ROLLOVER_HALF_SECONDS = TS_TIMESTAMP_ROLLOVER_SECONDS / 2;
+  // Keep decode timestamps positive while mapping the transport clock onto the
+  // manifest timeline. Unlike a first-fetched-segment origin, this fixed guard
+  // remains valid when an unbuffered seek requests an earlier segment.
+  var TS_DECODE_TIME_GUARD_SECONDS = 60;
+
+  function hlsTsTimelineGenerationKey(track, seg) {
+    var parent = seg && (seg._parentSegment || seg);
+    var generationKey = seg && seg._hlsTimestampGenerationKey
+      || parent && parent._hlsTimestampGenerationKey
+      || '';
+    if (generationKey) return generationKey;
+    return 'ts:'
+      + String(seg && seg._hlsPlaylistUrl || parent && parent._hlsPlaylistUrl || '')
+      + ':disc=' + (seg && seg.discontinuitySequence || parent && parent.discontinuitySequence || 0)
+      + ':track=' + (track && track.kind || 'video');
+  }
+
+  function prepareHlsTsTransmuxContext(provider, track, seg, data, preparedDemux) {
+    var demux = preparedDemux || demuxMpegTs(data);
+    var generationKey = hlsTsTimelineGenerationKey(track, seg);
+    provider.hlsTsTimelineByGeneration = provider.hlsTsTimelineByGeneration || {};
+    var timeline = provider.hlsTsTimelineByGeneration[generationKey];
+    if (!timeline) {
+      timeline = provider.hlsTsTimelineByGeneration[generationKey] = {
+        key: generationKey,
+        clockByPid: {},
+        decodeOrigin: null,
+        presentationAnchor: null,
+        presentationClockAtManifestZero: null,
+        timestampOffset: null,
+        firstPresentationByType: {},
+        maxManifestStart: null,
+        seenManifestStarts: {},
+        outOfOrderSegmentCount: 0,
+        rolloverCount: 0
+      };
+    }
+    timeline.seenManifestStarts = timeline.seenManifestStarts || {};
+    var manifestStart = hlsFiniteTimestamp(seg && seg.start) ? Number(seg.start) : 0;
+    var rawBounds = hlsTsDemuxTimestampBounds(demux, true);
+    var rawPresentationAnchor = hlsFiniteTimestamp(rawBounds.minPresentationTime)
+      ? rawBounds.minPresentationTime
+      : rawBounds.minDecodeTime;
+    if (!hlsFiniteTimestamp(timeline.presentationClockAtManifestZero) && hlsFiniteTimestamp(rawPresentationAnchor)) {
+      // Start in the second local 33-bit epoch. That leaves a complete epoch
+      // available below the initial segment, so seeking backward across a PTS
+      // rollover can still be represented without negative media timestamps.
+      timeline.presentationClockAtManifestZero = rawPresentationAnchor
+        + TS_TIMESTAMP_ROLLOVER_SECONDS
+        - manifestStart;
+      timeline.decodeOrigin = timeline.presentationClockAtManifestZero - TS_DECODE_TIME_GUARD_SECONDS;
+      timeline.presentationAnchor = TS_DECODE_TIME_GUARD_SECONDS;
+      timeline.timestampOffset = -TS_DECODE_TIME_GUARD_SECONDS;
+    }
+    var manifestStartKey = String(manifestStart);
+    if (
+      hlsFiniteTimestamp(timeline.maxManifestStart)
+      && manifestStart < timeline.maxManifestStart - 0.05
+      && !timeline.seenManifestStarts[manifestStartKey]
+    ) {
+      timeline.outOfOrderSegmentCount = (timeline.outOfOrderSegmentCount || 0) + 1;
+      provider.hlsTsOutOfOrderSegmentCount = (provider.hlsTsOutOfOrderSegmentCount || 0) + 1;
+    }
+    timeline.seenManifestStarts[manifestStartKey] = true;
+    timeline.maxManifestStart = hlsFiniteTimestamp(timeline.maxManifestStart)
+      ? Math.max(timeline.maxManifestStart, manifestStart)
+      : manifestStart;
+    var rollovers = normalizeHlsTsDemuxTimestamps(timeline, demux, manifestStart);
+    if (rollovers) {
+      provider.hlsTsTimestampRolloverCount = (provider.hlsTsTimestampRolloverCount || 0) + rollovers;
+    }
+    var bounds = hlsTsDemuxTimestampBounds(demux);
+    if (!hlsFiniteTimestamp(timeline.decodeOrigin) && hlsFiniteTimestamp(bounds.minDecodeTime)) {
+      timeline.decodeOrigin = bounds.minDecodeTime;
+      timeline.presentationAnchor = hlsFiniteTimestamp(bounds.minPresentationTime)
+        ? bounds.minPresentationTime - timeline.decodeOrigin
+        : 0;
+      timeline.timestampOffset = (hlsFiniteTimestamp(seg && seg.start) ? seg.start : 0) - timeline.presentationAnchor;
+    }
+    if (!timeline.firstPresentationByType || !countKeys(timeline.firstPresentationByType)) {
+      timeline.firstPresentationByType = bounds.firstPresentationByType;
+      if (hlsFiniteTimestamp(bounds.firstPresentationByType.audio) && hlsFiniteTimestamp(bounds.firstPresentationByType.video)) {
+        provider.hlsTsMuxedAvStartOffsetMs = (bounds.firstPresentationByType.audio - bounds.firstPresentationByType.video) * 1000;
+      }
+    }
+    return { demux: demux, timeline: timeline };
+  }
+
+  function normalizeHlsTsDemuxTimestamps(timeline, demux, manifestStart) {
+    if (!timeline || !demux) return 0;
+    timeline.clockByPid = timeline.clockByPid || {};
+    var hasManifestClock = hlsFiniteTimestamp(timeline.presentationClockAtManifestZero)
+      && hlsFiniteTimestamp(manifestStart);
+    var manifestClockReference = hasManifestClock
+      ? timeline.presentationClockAtManifestZero + Number(manifestStart)
+      : NaN;
+    var rollovers = 0;
+    var tracks = demux.tracks || [];
+    for (var t = 0; t < tracks.length; t++) {
+      var track = tracks[t];
+      var pidKey = String(track.pid == null ? t : track.pid);
+      var clock = timeline.clockByPid[pidKey] || (timeline.clockByPid[pidKey] = {
+        lastRaw: null,
+        wrapOffset: 0
+      });
+      var pesList = track.pes || [];
+      for (var p = 0; p < pesList.length; p++) {
+        var pes = pesList[p];
+        var rawDts = hlsFiniteTimestamp(pes.dts) ? pes.dts : (hlsFiniteTimestamp(pes.pts) ? pes.pts : null);
+        var rawPts = hlsFiniteTimestamp(pes.pts) ? pes.pts : rawDts;
+        var anchor = rawDts;
+        if (!hlsFiniteTimestamp(anchor)) continue;
+        if (hasManifestClock) {
+          var normalizedPtsFromManifest = hlsTsTimestampNear(rawPts, manifestClockReference);
+          var normalizedDtsFromManifest = hlsTsTimestampNear(rawDts, normalizedPtsFromManifest);
+          pes.normalizedDts = normalizedDtsFromManifest;
+          pes.normalizedPts = normalizedPtsFromManifest;
+          var normalizedCycle = Math.floor(normalizedDtsFromManifest / TS_TIMESTAMP_ROLLOVER_SECONDS);
+          var advancesClock = !hlsFiniteTimestamp(clock.lastManifestStart)
+            || Number(manifestStart) >= clock.lastManifestStart - 0.001;
+          if (advancesClock) {
+            if (clock.lastCycle != null && normalizedCycle > clock.lastCycle) {
+              rollovers += normalizedCycle - clock.lastCycle;
+            }
+            clock.lastRaw = anchor;
+            clock.lastNormalized = normalizedDtsFromManifest;
+            clock.lastCycle = normalizedCycle;
+            clock.lastManifestStart = Number(manifestStart);
+          }
+          continue;
+        }
+        if (hlsFiniteTimestamp(clock.lastRaw)) {
+          var delta = anchor - clock.lastRaw;
+          if (delta < -TS_TIMESTAMP_ROLLOVER_HALF_SECONDS) {
+            clock.wrapOffset += TS_TIMESTAMP_ROLLOVER_SECONDS;
+            rollovers++;
+          } else if (delta > TS_TIMESTAMP_ROLLOVER_HALF_SECONDS) {
+            clock.wrapOffset -= TS_TIMESTAMP_ROLLOVER_SECONDS;
+            rollovers++;
+          }
+        }
+        var normalizedDts = rawDts + clock.wrapOffset;
+        var normalizedPts = rawPts + clock.wrapOffset;
+        while (normalizedPts - normalizedDts > TS_TIMESTAMP_ROLLOVER_HALF_SECONDS) normalizedPts -= TS_TIMESTAMP_ROLLOVER_SECONDS;
+        while (normalizedDts - normalizedPts > TS_TIMESTAMP_ROLLOVER_HALF_SECONDS) normalizedPts += TS_TIMESTAMP_ROLLOVER_SECONDS;
+        pes.normalizedDts = normalizedDts;
+        pes.normalizedPts = normalizedPts;
+        clock.lastRaw = anchor;
+        clock.lastNormalized = normalizedDts;
+      }
+    }
+    timeline.rolloverCount = (timeline.rolloverCount || 0) + rollovers;
+    return rollovers;
+  }
+
+  function hlsTsTimestampNear(rawTimestamp, referenceTimestamp) {
+    if (!hlsFiniteTimestamp(rawTimestamp) || !hlsFiniteTimestamp(referenceTimestamp)) return rawTimestamp;
+    return rawTimestamp + Math.round(
+      (referenceTimestamp - rawTimestamp) / TS_TIMESTAMP_ROLLOVER_SECONDS
+    ) * TS_TIMESTAMP_ROLLOVER_SECONDS;
+  }
+
+  function hlsTsDemuxTimestampBounds(demux, rawOnly) {
+    var minDecodeTime = Infinity;
+    var minPresentationTime = Infinity;
+    var firstPresentationByType = {};
+    var tracks = demux && demux.tracks ? demux.tracks : [];
+    for (var t = 0; t < tracks.length; t++) {
+      var track = tracks[t];
+      var trackMinPresentation = Infinity;
+      var pesList = track.pes || [];
+      for (var p = 0; p < pesList.length; p++) {
+        var dts = !rawOnly && hlsFiniteTimestamp(pesList[p].normalizedDts) ? pesList[p].normalizedDts : pesList[p].dts;
+        var pts = !rawOnly && hlsFiniteTimestamp(pesList[p].normalizedPts) ? pesList[p].normalizedPts : pesList[p].pts;
+        if (hlsFiniteTimestamp(dts)) minDecodeTime = Math.min(minDecodeTime, dts);
+        if (hlsFiniteTimestamp(pts)) {
+          minPresentationTime = Math.min(minPresentationTime, pts);
+          trackMinPresentation = Math.min(trackMinPresentation, pts);
+        }
+      }
+      if (isFinite(trackMinPresentation) && track.type) firstPresentationByType[track.type] = trackMinPresentation;
+    }
+    return {
+      minDecodeTime: isFinite(minDecodeTime) ? minDecodeTime : NaN,
+      minPresentationTime: isFinite(minPresentationTime) ? minPresentationTime : NaN,
+      firstPresentationByType: firstPresentationByType
+    };
+  }
+
+  function hlsFiniteTimestamp(value) {
+    return value != null && isFinite(Number(value));
   }
 
   function createTsTransmuxerAdapter(contentType, codecs) {
@@ -8818,19 +13523,21 @@
   }
 
   FirstPartyTsTransmuxerAdapter.prototype.transmux = function (data, context) {
-    this.lastDemux = demuxMpegTs(data);
+    this.lastDemux = context && context.demux ? context.demux : demuxMpegTs(data);
     if (this.contentType === 'video') {
       return Promise.resolve(remuxH264ToFragmentedMp4(this.lastDemux, {
         codecs: this.codecs,
         height: context && context.activeVariant ? context.activeVariant.height : 0,
         sequenceNumber: this.sequenceNumber++,
+        timeline: context && context.timeline,
         width: context && context.activeVariant ? context.activeVariant.width : 0
       }));
     }
     if (this.contentType === 'audio') {
       return Promise.resolve(remuxAacToFragmentedMp4(this.lastDemux, {
         codecs: this.codecs,
-        sequenceNumber: this.sequenceNumber++
+        sequenceNumber: this.sequenceNumber++,
+        timeline: context && context.timeline
       }));
     }
     return Promise.reject(new Error('hls-first-party-ts-remuxer-unavailable'));
@@ -8859,6 +13566,19 @@
     var width = options.width || 0;
     var height = options.height || 0;
     var timescale = 90000;
+    var timeline = options.timeline || null;
+    var baseDecodeTime = hlsTsBaseDecodeTime(samples, timescale, timeline);
+    var compositionOffsetSampleCount = 0;
+    var maxCompositionOffsetTicks = 0;
+    for (var sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+      var sample = samples[sampleIndex];
+      var compositionOffset = hlsFiniteTimestamp(sample.pts) && hlsFiniteTimestamp(sample.dts)
+        ? Math.round((sample.pts - sample.dts) * timescale)
+        : 0;
+      sample.compositionOffset = compositionOffset;
+      if (compositionOffset) compositionOffsetSampleCount++;
+      maxCompositionOffsetTicks = Math.max(maxCompositionOffsetTicks, Math.abs(compositionOffset));
+    }
     var init = concatUint8Arrays([
       mp4Box('ftyp', mp4String('iso6'), mp4Uint32(1), mp4String('iso6'), mp4String('mp41')),
       mp4Moov({
@@ -8874,12 +13594,16 @@
     return {
       init: init.buffer,
       data: mp4VideoFragment({
-        baseDecodeTime: 0,
+        baseDecodeTime: baseDecodeTime,
         samples: samples,
         sequenceNumber: options.sequenceNumber || 1,
         timescale: timescale,
         trackId: 1
-      }).buffer
+      }).buffer,
+      compositionOffsetSampleCount: compositionOffsetSampleCount,
+      maxCompositionOffsetMs: maxCompositionOffsetTicks / timescale * 1000,
+      timelineGenerationKey: timeline && timeline.key || '',
+      timestampOffset: timeline && hlsFiniteTimestamp(timeline.timestampOffset) ? timeline.timestampOffset : NaN
     };
   }
 
@@ -8908,11 +13632,11 @@
       }
       samples.push({
         data: concatUint8Arrays(dataParts),
-        dts: pes.dts === null ? pes.pts : pes.dts,
+        dts: hlsFiniteTimestamp(pes.normalizedDts) ? pes.normalizedDts : (pes.dts === null ? pes.pts : pes.dts),
         duration: 0,
         keyframe: keyframe,
         nalUnits: units,
-        pts: pes.pts,
+        pts: hlsFiniteTimestamp(pes.normalizedPts) ? pes.normalizedPts : pes.pts,
         size: size
       });
     }
@@ -8945,13 +13669,26 @@
     return {
       init: init.buffer,
       data: mp4AudioFragment({
-        baseDecodeTime: 0,
+        baseDecodeTime: hlsTsBaseDecodeTime(samples, config.sampleRate || 44100, options.timeline || null),
         samples: samples,
         sequenceNumber: options.sequenceNumber || 1,
         timescale: config.sampleRate || 44100,
         trackId: 1
-      }).buffer
+      }).buffer,
+      compositionOffsetSampleCount: 0,
+      maxCompositionOffsetMs: 0,
+      timelineGenerationKey: options.timeline && options.timeline.key || '',
+      timestampOffset: options.timeline && hlsFiniteTimestamp(options.timeline.timestampOffset)
+        ? options.timeline.timestampOffset
+        : NaN
     };
+  }
+
+  function hlsTsBaseDecodeTime(samples, timescale, timeline) {
+    if (!samples || !samples.length || !timeline || !hlsFiniteTimestamp(timeline.decodeOrigin)) return 0;
+    var firstDts = hlsFiniteTimestamp(samples[0].dts) ? samples[0].dts : samples[0].pts;
+    if (!hlsFiniteTimestamp(firstDts)) return 0;
+    return Math.max(0, Math.round((firstDts - timeline.decodeOrigin) * timescale));
   }
 
   function aacSamplesFromPes(pesList) {
@@ -8966,10 +13703,10 @@
         samples.push({
           config: frame,
           data: payload,
-          dts: pes.dts === null ? pes.pts : pes.dts,
+          dts: hlsFiniteTimestamp(pes.normalizedDts) ? pes.normalizedDts : (pes.dts === null ? pes.pts : pes.dts),
           duration: 1024,
           keyframe: true,
-          pts: pes.pts,
+          pts: hlsFiniteTimestamp(pes.normalizedPts) ? pes.normalizedPts : pes.pts,
           size: payload.length
         });
       }
@@ -9004,6 +13741,7 @@
 
   function mp4Trun(samples, dataOffset) {
     var parts = [mp4Uint32(samples.length), mp4Uint32(dataOffset)];
+    var hasCompositionOffsets = samples.some(function (sample) { return sample.compositionOffset != null; });
     for (var i = 0; i < samples.length; i++) {
       var sample = samples[i];
       parts.push(
@@ -9011,8 +13749,9 @@
         mp4Uint32(sample.size),
         mp4Uint32(sample.keyframe ? 0x02000000 : 0x01010000)
       );
+      if (hasCompositionOffsets) parts.push(mp4Uint32(sample.compositionOffset || 0));
     }
-    return mp4FullBox.apply(null, ['trun', 0, 0x000701].concat(parts));
+    return mp4FullBox.apply(null, ['trun', hasCompositionOffsets ? 1 : 0, hasCompositionOffsets ? 0x000f01 : 0x000701].concat(parts));
   }
 
   function mp4Moov(track) {
@@ -9376,6 +14115,22 @@
     return new Uint8Array(data || 0);
   }
 
+  function copyHlsMediaBytes(data) {
+    var bytes = toUint8Array(data);
+    var copy = new Uint8Array(bytes.length);
+    copy.set(bytes);
+    return copy;
+  }
+
+  function hlsMediaBytesEqual(left, right) {
+    if (!left || !right) return false;
+    var a = toUint8Array(left);
+    var b = toUint8Array(right);
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+
   function concatUint8Arrays(chunks) {
     var length = 0;
     for (var i = 0; i < chunks.length; i++) length += chunks[i].length;
@@ -9458,7 +14213,8 @@
     var range = seg.range ? ':' + seg.range.start + '-' + seg.range.end : '';
     var hlsSeq = seg.mediaSequence != null ? ':ms' + seg.mediaSequence + ':ds' + (seg.discontinuitySequence || 0) : '';
     var hlsPart = seg.partIndex != null ? ':part' + seg.partIndex : (seg._hlsPreloadHint ? ':preload' : '');
-    return (seg.url || String(seg.start)) + range + hlsSeq + hlsPart;
+    var hlsMap = seg._hlsInitSegment ? ':map=' + hlsInitSegmentKey(seg._hlsInitSegment) : '';
+    return (seg.url || String(seg.start)) + range + hlsSeq + hlsPart + hlsMap;
   }
 
   function hlsInitSegmentKey(initSegment) {
@@ -9466,15 +14222,308 @@
     var range = initSegment.range
       ? ':' + initSegment.range.start + '-' + initSegment.range.end
       : '';
-    return String(initSegment.url || '') + range;
+    var encryption = '';
+    if (initSegment.key) {
+      var iv = initSegment.key.iv;
+      var ivHex = '';
+      if (iv && typeof iv.length === 'number') {
+        for (var i = 0; i < iv.length; i++) ivHex += ('0' + Number(iv[i]).toString(16)).slice(-2);
+      }
+      encryption = ':key=' + String(initSegment.key.uri || '') + ':iv=' + ivHex;
+    }
+    return String(initSegment.url || '') + range + encryption;
   }
 
-  function hlsFmp4TimestampOffset() {
-    // CMAF/fMP4 fragments carry their media timeline in tfdt. Applying the HLS
-    // playlist start again doubles timestamps (0, 2, 4... for 1s fragments) and
-    // creates permanent playback gaps. MPEG-TS is different: our transmuxed
-    // output is rebased and still uses hlsLiveTimestampOffset below.
-    return NaN;
+  function mp4DataView(data) {
+    if (data instanceof ArrayBuffer) return new DataView(data);
+    if (ArrayBuffer.isView(data)) return new DataView(data.buffer, data.byteOffset, data.byteLength);
+    return null;
+  }
+
+  function mp4Boxes(view, start, end) {
+    var boxes = [];
+    var position = Math.max(0, start || 0);
+    end = Math.min(view ? view.byteLength : 0, end == null ? (view ? view.byteLength : 0) : end);
+    while (view && position + 8 <= end) {
+      var size = view.getUint32(position);
+      var type = readType(view, position + 4);
+      var headerSize = 8;
+      if (size === 1) {
+        if (position + 16 > end) break;
+        size = view.getUint32(position + 8) * 4294967296 + view.getUint32(position + 12);
+        headerSize = 16;
+      } else if (size === 0) {
+        size = end - position;
+      }
+      if (!isFinite(size) || size < headerSize || position + size > end) break;
+      boxes.push({
+        start: position,
+        end: position + size,
+        size: size,
+        type: type,
+        headerSize: headerSize,
+        payloadStart: position + headerSize
+      });
+      position += size;
+    }
+    return boxes;
+  }
+
+  function mp4BoxOfType(boxes, type) {
+    for (var i = 0; i < boxes.length; i++) if (boxes[i].type === type) return boxes[i];
+    return null;
+  }
+
+  function mp4Uint64Number(view, position) {
+    if (position + 8 > view.byteLength) return NaN;
+    var high = view.getUint32(position);
+    var low = view.getUint32(position + 4);
+    var value = high * 4294967296 + low;
+    return Number.isSafeInteger(value) ? value : NaN;
+  }
+
+  function parseMp4InitTrackInfo(data) {
+    var view = mp4DataView(data);
+    if (!view) return [];
+    var moov = mp4BoxOfType(mp4Boxes(view, 0, view.byteLength), 'moov');
+    if (!moov) return [];
+    var tracks = [];
+    var traks = mp4Boxes(view, moov.payloadStart, moov.end).filter(function (box) { return box.type === 'trak'; });
+    for (var i = 0; i < traks.length; i++) {
+      var trakChildren = mp4Boxes(view, traks[i].payloadStart, traks[i].end);
+      var tkhd = mp4BoxOfType(trakChildren, 'tkhd');
+      var mdia = mp4BoxOfType(trakChildren, 'mdia');
+      if (!mdia) continue;
+      var mdiaChildren = mp4Boxes(view, mdia.payloadStart, mdia.end);
+      var mdhd = mp4BoxOfType(mdiaChildren, 'mdhd');
+      var hdlr = mp4BoxOfType(mdiaChildren, 'hdlr');
+      if (!mdhd || mdhd.payloadStart + 16 > mdhd.end) continue;
+      var mdhdVersion = view.getUint8(mdhd.payloadStart);
+      var timescalePosition = mdhd.payloadStart + (mdhdVersion === 1 ? 20 : 12);
+      if (timescalePosition + 4 > mdhd.end) continue;
+      var timescale = view.getUint32(timescalePosition);
+      var trackId = 0;
+      if (tkhd && tkhd.payloadStart + 16 <= tkhd.end) {
+        var tkhdVersion = view.getUint8(tkhd.payloadStart);
+        var trackIdPosition = tkhd.payloadStart + (tkhdVersion === 1 ? 20 : 12);
+        if (trackIdPosition + 4 <= tkhd.end) trackId = view.getUint32(trackIdPosition);
+      }
+      var handlerType = hdlr && hdlr.payloadStart + 12 <= hdlr.end
+        ? readType(view, hdlr.payloadStart + 8)
+        : '';
+      if (timescale > 0) tracks.push({ handlerType: handlerType, timescale: timescale, trackId: trackId });
+    }
+    return tracks;
+  }
+
+  function parseMp4FragmentTimestamp(data, expectedTrackId) {
+    var view = mp4DataView(data);
+    if (!view) return null;
+    var moof = mp4BoxOfType(mp4Boxes(view, 0, view.byteLength), 'moof');
+    if (!moof) return null;
+    var trafs = mp4Boxes(view, moof.payloadStart, moof.end).filter(function (box) { return box.type === 'traf'; });
+    for (var i = 0; i < trafs.length; i++) {
+      var children = mp4Boxes(view, trafs[i].payloadStart, trafs[i].end);
+      var tfhd = mp4BoxOfType(children, 'tfhd');
+      var tfdt = mp4BoxOfType(children, 'tfdt');
+      var trun = mp4BoxOfType(children, 'trun');
+      if (!tfdt || tfdt.payloadStart + 8 > tfdt.end) continue;
+      var trackId = tfhd && tfhd.payloadStart + 8 <= tfhd.end ? view.getUint32(tfhd.payloadStart + 4) : 0;
+      if (expectedTrackId && trackId && trackId !== expectedTrackId) continue;
+      var tfdtVersion = view.getUint8(tfdt.payloadStart);
+      var decodeTime = tfdtVersion === 1
+        ? mp4Uint64Number(view, tfdt.payloadStart + 4)
+        : view.getUint32(tfdt.payloadStart + 4);
+      if (!isFinite(decodeTime)) continue;
+      var compositionOffset = 0;
+      if (trun && trun.payloadStart + 12 <= trun.end) {
+        var trunVersion = view.getUint8(trun.payloadStart);
+        var flags = view.getUint32(trun.payloadStart) & 0xffffff;
+        var sampleCount = view.getUint32(trun.payloadStart + 4);
+        var cursor = trun.payloadStart + 8;
+        if (flags & 0x000001) cursor += 4;
+        if (flags & 0x000004) cursor += 4;
+        if (sampleCount > 0) {
+          if (flags & 0x000100) cursor += 4;
+          if (flags & 0x000200) cursor += 4;
+          if (flags & 0x000400) cursor += 4;
+          if ((flags & 0x000800) && cursor + 4 <= trun.end) {
+            compositionOffset = trunVersion === 1 ? view.getInt32(cursor) : view.getUint32(cursor);
+          }
+        }
+      }
+      return {
+        trackId: trackId,
+        decodeTime: decodeTime,
+        compositionOffset: compositionOffset,
+        presentationTime: decodeTime + compositionOffset
+      };
+    }
+    return null;
+  }
+
+  function hlsTrackKind(provider, track) {
+    return track && track !== provider && track.kind === 'audio' ? 'audio' : 'video';
+  }
+
+  function hlsTrackInitialTimestampGenerationKey(provider, track) {
+    var segments = track && track.segments ? track.segments : (track === provider ? provider.segments : []);
+    return segments && segments.length ? segments[0]._hlsTimestampGenerationKey || '' : '';
+  }
+
+  function hlsInitTimescaleKey(kind, initSegment, generationKey) {
+    return kind + ':' + hlsInitSegmentKey(initSegment) + (generationKey ? ':generation=' + generationKey : '');
+  }
+
+  function recordHlsInitTimescale(provider, track, initSegment, data, generationKey) {
+    if (!provider || !track || !initSegment || !data) return null;
+    var kind = hlsTrackKind(provider, track);
+    var wantedHandler = kind === 'audio' ? 'soun' : 'vide';
+    var tracks = parseMp4InitTrackInfo(data);
+    var selected = tracks.find(function (item) { return item.handlerType === wantedHandler; }) || tracks[0] || null;
+    if (!selected || !selected.timescale) {
+      provider.hlsInitTimescaleParseFailureCount = (provider.hlsInitTimescaleParseFailureCount || 0) + 1;
+      return null;
+    }
+    provider.hlsInitTimescaleByKey = provider.hlsInitTimescaleByKey || {};
+    provider.hlsInitTrackInfoByKey = provider.hlsInitTrackInfoByKey || {};
+    provider.hlsInitTimescaleByKey[hlsInitTimescaleKey(kind, initSegment, generationKey)] = selected;
+    provider.hlsInitTrackInfoByKey[hlsInitTimescaleKey(kind, initSegment, generationKey)] = tracks;
+    track._hlsMediaTimescale = selected.timescale;
+    track._hlsMediaTrackId = selected.trackId || 0;
+    return selected;
+  }
+
+  function appendHlsInitBuffer(provider, track, sb, initSegment, data, generationKey, guard) {
+    generationKey = generationKey || hlsTrackInitialTimestampGenerationKey(provider, track);
+    if (guard) guard();
+    var decrypt = provider && provider._decryptHlsInitIfNeeded
+      ? provider._decryptHlsInitIfNeeded(initSegment, data)
+      : Promise.resolve(data);
+    return decrypt.then(function (plainData) {
+      if (guard) guard();
+      recordHlsInitTimescale(provider, track, initSegment, plainData, generationKey);
+      return appendBuffer(sb, plainData, null, undefined, guard);
+    });
+  }
+
+  function hlsTrackTimestampInfo(provider, track, initSegment, generationKey) {
+    var kind = hlsTrackKind(provider, track);
+    var explicitInitSegment = !!initSegment;
+    initSegment = initSegment || (kind === 'audio'
+      ? (track && track.initSegment) || provider.audioInitSegment
+      : provider.initSegment);
+    var cached = provider.hlsInitTimescaleByKey
+      ? provider.hlsInitTimescaleByKey[hlsInitTimescaleKey(kind, initSegment, generationKey)]
+      : null;
+    if (cached) return cached;
+    // A track-level value describes only the most recently appended init. It
+    // must not leak across an explicit EXT-X-MAP boundary whose init has not
+    // been parsed yet.
+    if (!explicitInitSegment && track && track._hlsMediaTimescale) {
+      return { timescale: track._hlsMediaTimescale, trackId: track._hlsMediaTrackId || 0 };
+    }
+    return null;
+  }
+
+  function setHlsTrackEpochTimestampOffset(track, epochId, offset) {
+    var segments = track && track.segments ? track.segments : [];
+    for (var i = 0; i < segments.length; i++) {
+      if (segments[i]._hlsPlaylistEpoch !== epochId) continue;
+      segments[i]._hlsEpochTimestampOffset = offset;
+      var parts = segments[i].parts || [];
+      for (var p = 0; p < parts.length; p++) parts[p]._hlsEpochTimestampOffset = offset;
+    }
+  }
+
+  function setHlsTrackGenerationTimestampOffset(track, generationKey, offset) {
+    var segments = track && track.segments ? track.segments : [];
+    for (var i = 0; i < segments.length; i++) {
+      if (segments[i]._hlsTimestampGenerationKey !== generationKey) continue;
+      segments[i]._hlsTimestampOffset = offset;
+      var parts = segments[i].parts || [];
+      for (var p = 0; p < parts.length; p++) parts[p]._hlsTimestampOffset = offset;
+    }
+  }
+
+  function hlsFmp4TimestampOffset(provider, track, seg, data) {
+    // timestampOffset is sticky on SourceBuffer, so normal CMAF fragments must
+    // explicitly establish their own mapping after every timestamp generation.
+    // Derive it from the fragment's tfdt/first composition time; media sequence
+    // and target duration are delivery coordinates, not the embedded media clock.
+    if (!seg) return 0;
+    var parent = seg._parentSegment || seg;
+    var playlistUrl = seg._hlsPlaylistUrl || parent._hlsPlaylistUrl || '';
+    var generationKey = seg._hlsTimestampGenerationKey || parent._hlsTimestampGenerationKey || '';
+    var generation = provider && provider.hlsTimestampGenerationByKey && generationKey
+      ? provider.hlsTimestampGenerationByKey[generationKey]
+      : null;
+    var epoch = provider && provider.playlistEpochByUrl
+      ? provider.playlistEpochByUrl[String(playlistUrl)]
+      : null;
+    var timestampState = generation || (seg._hlsPlaylistEpoch ? epoch : null);
+    if (!timestampState) return 0;
+    if (timestampState.mediaTimestampResolved && isFinite(timestampState.mediaTimestampOffset)) {
+      seg._hlsTimestampOffset = timestampState.mediaTimestampOffset;
+      if (seg._hlsPlaylistEpoch) seg._hlsEpochTimestampOffset = timestampState.mediaTimestampOffset;
+      return timestampState.mediaTimestampOffset;
+    }
+    var initSegment = provider ? hlsSegmentInitSegment(provider, track, seg) : null;
+    var initInfo = provider ? hlsTrackTimestampInfo(provider, track, initSegment, generationKey) : null;
+    var timing = initInfo ? parseMp4FragmentTimestamp(data, initInfo.trackId) : null;
+    if (initInfo && timing && isFinite(seg.start) && isFinite(timing.presentationTime)) {
+      var presentationTime = timing.presentationTime / initInfo.timescale;
+      var offset = seg.start - presentationTime;
+      if (isFinite(offset)) {
+        timestampState.mediaTimestampOffset = offset;
+        timestampState.mediaTimestampResolved = true;
+        if (generation) setHlsTrackGenerationTimestampOffset(track, generationKey, offset);
+        if (epoch) {
+          epoch.mediaTimestampOffset = offset;
+          epoch.mediaTimestampResolved = true;
+        }
+        seg._hlsTimestampOffset = offset;
+        seg._hlsEpochTimestampOffset = offset;
+        if (!generation && seg._hlsPlaylistEpoch) {
+          setHlsTrackEpochTimestampOffset(track, seg._hlsPlaylistEpoch, offset);
+        }
+        provider.hlsFragmentTimestampParseCount = (provider.hlsFragmentTimestampParseCount || 0) + 1;
+        if (generation) {
+          provider.hlsTimestampGenerationResolutionCount = (provider.hlsTimestampGenerationResolutionCount || 0) + 1;
+          if (generation.discontinuity) {
+            provider.hlsDiscontinuityTimestampResolutionCount = (provider.hlsDiscontinuityTimestampResolutionCount || 0) + 1;
+          }
+          provider.lastHlsTimestampGenerationKey = generationKey;
+        }
+        provider.lastHlsFragmentDecodeTime = timing.decodeTime / initInfo.timescale;
+        provider.lastHlsFragmentTimestampOffset = offset;
+        return offset;
+      }
+    }
+    if (generation) {
+      if (provider) provider.hlsTimestampResolutionFailureCount = (provider.hlsTimestampResolutionFailureCount || 0) + 1;
+      var unresolved = new Error('hls-timestamp-unresolved');
+      unresolved.code = 'HLS_TIMESTAMP_UNRESOLVED';
+      unresolved.generationKey = generationKey;
+      throw unresolved;
+    }
+    if (provider && !timestampState.mediaTimestampFallbackRecorded) {
+      provider.hlsFragmentTimestampFallbackCount = (provider.hlsFragmentTimestampFallbackCount || 0) + 1;
+      timestampState.mediaTimestampFallbackRecorded = true;
+      if (generation && generation.discontinuity) {
+        provider.hlsDiscontinuityTimestampFallbackCount = (provider.hlsDiscontinuityTimestampFallbackCount || 0) + 1;
+      }
+    }
+    var fallback = isFinite(seg._hlsEpochManifestOffset)
+      ? seg._hlsEpochManifestOffset
+      : (epoch && seg._hlsPlaylistEpoch && isFinite(epoch.timelineOffset)
+        ? epoch.timelineOffset
+        : (generation && generation.discontinuity && isFinite(generation.boundaryStart)
+          ? generation.boundaryStart
+          : 0));
+    seg._hlsTimestampOffset = fallback;
+    seg._hlsEpochTimestampOffset = fallback;
+    return fallback;
   }
 
   function hlsLiveTimestampOffset(provider, track, seg) {
@@ -9483,17 +14532,50 @@
     return seg.start;
   }
 
-  function hlsAppendSegmentWithWatchdog(provider, track, seg, data) {
-    var append = provider._appendSegmentData(track, seg, data);
+  function sourceBufferContainsSegment(sb, seg) {
+    if (!sb || !sb.buffered || !seg || !isFinite(seg.start) || !isFinite(seg.end)) return false;
+    var probe = Math.max(seg.start, seg.end - 0.1);
+    return bufferedContains(sb.buffered, probe);
+  }
+
+  function sourceBufferCoversSegment(sb, seg) {
+    if (!sb || !sb.buffered || !seg || !isFinite(seg.start) || !isFinite(seg.end)) return false;
+    for (var i = 0; i < sb.buffered.length; i++) {
+      if (
+        sb.buffered.start(i) <= seg.start + 0.05
+        && sb.buffered.end(i) >= seg.end - 0.05
+      ) return true;
+    }
+    return false;
+  }
+
+  function hlsAppendTransactionBuffered(provider, track, seg, transaction) {
+    if (!hlsAppendTransactionIsCurrent(provider, transaction)) return false;
+    if (!sourceBufferContainsSegment(transaction.primarySourceBuffer, seg)) return false;
+    if (transaction.muxed && !sourceBufferContainsSegment(transaction.audioSourceBuffer, seg)) return false;
+    return true;
+  }
+
+  function hlsAppendSegmentWithWatchdog(provider, track, seg, data, appendTransaction) {
+    appendTransaction = appendTransaction || createHlsAppendTransaction(provider, track, seg);
+    var append = provider._appendSegmentData(track, seg, data, appendTransaction);
     return new Promise(function (resolve, reject) {
       var done = false;
       var timeoutId = setTimeout(function () {
         if (done) return;
         done = true;
-        if (segmentBuffered(provider.video, seg)) {
+        if (hlsAppendTransactionBuffered(provider, track, seg, appendTransaction)) {
+          if (appendTransaction.muxed) {
+            provider.hlsMuxedWatchdogCompletionCount = (provider.hlsMuxedWatchdogCompletionCount || 0) + 1;
+          }
           resolve();
         } else {
-          reject(new Error('hls-append-timeout'));
+          try {
+            assertHlsAppendTransactionCurrent(provider, appendTransaction);
+            reject(new Error('hls-append-timeout'));
+          } catch (err) {
+            reject(err);
+          }
         }
       }, SOURCEBUFFER_WATCHDOG_MS * 2);
       append.then(function (value) {
@@ -9880,6 +14962,7 @@
   window.PlayerEngine = PlayerEngine;
   window.NativeUrlProviderForTest = {
     load: NativeUrlProvider.prototype.load,
+    quiesce: NativeUrlProvider.prototype.quiesce,
     getStats: NativeUrlProvider.prototype.getStats,
     _onRuntimeError: NativeUrlProvider.prototype._onRuntimeError,
     resumeAfterServerRecovery: NativeUrlProvider.prototype.resumeAfterServerRecovery,
@@ -9892,6 +14975,7 @@
   };
   window.NativeDashProviderForTest = {
     _open: NativeDashProvider.prototype._open,
+    quiesce: NativeDashProvider.prototype.quiesce,
     _maybeEndVodStream: NativeDashProvider.prototype._maybeEndVodStream,
     _candidateVideos: NativeDashProvider.prototype._candidateVideos,
     _chooseForBudget: NativeDashProvider.prototype._chooseForBudget,
@@ -9899,6 +14983,7 @@
     _handleAppendFailure: NativeDashProvider.prototype._handleAppendFailure,
     _completeNativeRuntimeTerminal: NativeDashProvider.prototype._completeNativeRuntimeTerminal,
     _tryNativeRecovery: NativeDashProvider.prototype._tryNativeRecovery,
+    _reconcileSourceBufferConfiguration: NativeDashProvider.prototype._reconcileSourceBufferConfiguration,
     _prepareSegmentGeneration: NativeDashProvider.prototype._prepareSegmentGeneration,
     _rebuildSourceBufferForPeriod: NativeDashProvider.prototype._rebuildSourceBufferForPeriod,
     _initDataForSegment: NativeDashProvider.prototype._initDataForSegment,
@@ -9910,7 +14995,18 @@
     _scheduleMediaRequests: NativeDashProvider.prototype._scheduleMediaRequests,
     _buildSegmentCandidates: NativeDashProvider.prototype._buildSegmentCandidates,
     _startSegmentFetch: NativeDashProvider.prototype._startSegmentFetch,
+    _recoverMediaRequest: NativeDashProvider.prototype._recoverMediaRequest,
     _drainAppendQueue: NativeDashProvider.prototype._drainAppendQueue,
+    createDashAppendTransaction: createDashAppendTransaction,
+    dashAppendTransactionIsCurrent: dashAppendTransactionIsCurrent,
+    assertDashAppendTransactionCurrent: assertDashAppendTransactionCurrent,
+    beginDashControlTransition: beginDashControlTransition,
+    dashControlTransitionIsCurrent: dashControlTransitionIsCurrent,
+    assertDashControlTransitionCurrent: assertDashControlTransitionCurrent,
+    invalidateDashControlTransition: invalidateDashControlTransition,
+    markDashSourceBufferConfigurationMutation: markDashSourceBufferConfigurationMutation,
+    queueDashSourceBufferConfigurationReconciliation: queueDashSourceBufferConfigurationReconciliation,
+    commitDashSourceBufferConfiguration: commitDashSourceBufferConfiguration,
     _checkBufferMilestones: NativeDashProvider.prototype._checkBufferMilestones,
     _bufferAheadGoal: NativeDashProvider.prototype._bufferAheadGoal,
     _rebufferingGoal: NativeDashProvider.prototype._rebufferingGoal,
@@ -9930,13 +15026,17 @@
     _completeDrmTerminalError: NativeDashProvider.prototype._completeDrmTerminalError,
     _handleDrmMessage: NativeDashProvider.prototype._handleDrmMessage,
     _jumpSmallGap: NativeDashProvider.prototype._jumpSmallGap,
+    _jumpManifestGap: NativeDashProvider.prototype._jumpManifestGap,
     _refreshManifest: NativeDashProvider.prototype._refreshManifest,
+    _refreshPlaybackManifest: NativeDashProvider.prototype._refreshPlaybackManifest,
     _updateLiveWindowFromReps: NativeDashProvider.prototype._updateLiveWindowFromReps,
     _updateLivePositionStats: NativeDashProvider.prototype._updateLivePositionStats,
     _evictExpiredLiveSegmentState: NativeDashProvider.prototype._evictExpiredLiveSegmentState,
+    _switchVideo: NativeDashProvider.prototype._switchVideo,
     _switchAudio: NativeDashProvider.prototype._switchAudio,
     _maybeSwitchAuto: NativeDashProvider.prototype._maybeSwitchAuto,
     _flushPendingVideoSwitch: NativeDashProvider.prototype._flushPendingVideoSwitch,
+    _flushPendingDashControlTransition: NativeDashProvider.prototype._flushPendingDashControlTransition,
     _recordBandwidthSample: NativeDashProvider.prototype._recordBandwidthSample,
     _sampleFramePressure: sampleFramePressure,
     _recordRangeRecovery: NativeDashProvider.prototype._recordRangeRecovery,
@@ -9964,6 +15064,7 @@
     commitSeek: NativeDashProvider.prototype.commitSeek,
     cancelSeek: NativeDashProvider.prototype.cancelSeek,
     endSeek: NativeDashProvider.prototype.endSeek,
+    _completeSeekBuffer: NativeDashProvider.prototype._completeSeekBuffer,
     _onSeek: NativeDashProvider.prototype._onSeek,
     _clampSeekTarget: NativeDashProvider.prototype._clampSeekTarget,
     seekToLiveEdge: NativeDashProvider.prototype.seekToLiveEdge,
@@ -9976,9 +15077,35 @@
   };
   window.NativeHlsProviderForTest = {
     _open: NativeHlsProvider.prototype._open,
+    quiesce: NativeHlsProvider.prototype.quiesce,
+    _applyTrackLifecycle: NativeHlsProvider.prototype._applyTrackLifecycle,
+    _reconcileTrackLifecycle: NativeHlsProvider.prototype._reconcileTrackLifecycle,
+    _transitionTrackSourceBuffer: NativeHlsProvider.prototype._transitionTrackSourceBuffer,
+    _restoreTrackSourceBuffer: NativeHlsProvider.prototype._restoreTrackSourceBuffer,
+    _appendTrackInitIfNeeded: NativeHlsProvider.prototype._appendTrackInitIfNeeded,
+    _beginTrackTransition: NativeHlsProvider.prototype._beginTrackTransition,
+    _isTrackTransitionCurrent: NativeHlsProvider.prototype._isTrackTransitionCurrent,
+    _ownsTrackTransition: NativeHlsProvider.prototype._ownsTrackTransition,
+    _finishTrackTransition: NativeHlsProvider.prototype._finishTrackTransition,
+    _cancelTrackTransitionForViewerIntent: NativeHlsProvider.prototype._cancelTrackTransitionForViewerIntent,
+    _rollbackTrackTransition: NativeHlsProvider.prototype._rollbackTrackTransition,
+    _flushPendingTrackSwitch: NativeHlsProvider.prototype._flushPendingTrackSwitch,
+    _tick: NativeHlsProvider.prototype._tick,
+    _scheduleMediaRequests: NativeHlsProvider.prototype._scheduleMediaRequests,
+    _startSegmentFetch: NativeHlsProvider.prototype._startSegmentFetch,
+    _drainAppendQueue: NativeHlsProvider.prototype._drainAppendQueue,
+    _syncPresentationState: NativeHlsProvider.prototype._syncPresentationState,
     _maybeEndVodStream: NativeHlsProvider.prototype._maybeEndVodStream,
+    _prepareDiscontinuityAppend: NativeHlsProvider.prototype._prepareDiscontinuityAppend,
+    _refreshHlsGenerationInit: NativeHlsProvider.prototype._refreshHlsGenerationInit,
     _appendSegmentData: NativeHlsProvider.prototype._appendSegmentData,
+    _appendTransmuxedOutput: NativeHlsProvider.prototype._appendTransmuxedOutput,
     _recoverQuota: NativeHlsProvider.prototype._recoverQuota,
+    createHlsAppendTransaction: createHlsAppendTransaction,
+    invalidateHlsAppendTransactions: invalidateHlsAppendTransactions,
+    hlsAppendTransactionIsCurrent: hlsAppendTransactionIsCurrent,
+    hlsRecoveryTransactionIsCurrent: hlsRecoveryTransactionIsCurrent,
+    hlsAppendSegmentWithWatchdog: hlsAppendSegmentWithWatchdog,
     _handleAppendFailure: NativeHlsProvider.prototype._handleAppendFailure,
     _handleFatal: NativeHlsProvider.prototype._handleFatal,
     _completeNativeRuntimeTerminal: NativeHlsProvider.prototype._completeNativeRuntimeTerminal,
@@ -9988,13 +15115,30 @@
     _candidateVariants: NativeHlsProvider.prototype._candidateVariants,
     _chooseForBudget: NativeHlsProvider.prototype._chooseForBudget,
     _lowerVariant: NativeHlsProvider.prototype._lowerVariant,
+    _chooseAudioRendition: NativeHlsProvider.prototype._chooseAudioRendition,
     _fetchRange: NativeHlsProvider.prototype._fetchRange,
+    _decryptHlsInitIfNeeded: NativeHlsProvider.prototype._decryptHlsInitIfNeeded,
+    _decryptHlsResourceIfNeeded: NativeHlsProvider.prototype._decryptHlsResourceIfNeeded,
+    _fetchHlsKey: NativeHlsProvider.prototype._fetchHlsKey,
     _fetchPlaylistText: NativeHlsProvider.prototype._fetchPlaylistText,
     _loadStartupMediaPlaylists: NativeHlsProvider.prototype._loadStartupMediaPlaylists,
+    _loadMediaPlaylist: NativeHlsProvider.prototype._loadMediaPlaylist,
+    _loadAudioPlaylist: NativeHlsProvider.prototype._loadAudioPlaylist,
+    selectAudioTrack: NativeHlsProvider.prototype.selectAudioTrack,
     _refreshMediaPlaylist: NativeHlsProvider.prototype._refreshMediaPlaylist,
+    _recoverMediaRequest: NativeHlsProvider.prototype._recoverMediaRequest,
     _fetchReloadPlaylist: NativeHlsProvider.prototype._fetchReloadPlaylist,
     _playlistRefreshDelay: NativeHlsProvider.prototype._playlistRefreshDelay,
     hlsBlockingReloadUrl: hlsBlockingReloadUrl,
+    hlsDeliveryCursor: hlsDeliveryCursor,
+    acceptHlsPlaylistCursor: acceptHlsPlaylistCursor,
+    applyHlsPlaylistEpoch: applyHlsPlaylistEpoch,
+    assignHlsTimestampGenerations: assignHlsTimestampGenerations,
+    pruneHlsTimestampGenerations: pruneHlsTimestampGenerations,
+    detectHlsMediaContainer: detectHlsMediaContainer,
+    parseMp4InitTrackInfo: parseMp4InitTrackInfo,
+    parseMp4FragmentTimestamp: parseMp4FragmentTimestamp,
+    recordHlsInitTimescale: recordHlsInitTimescale,
     hlsPlayableSegments: hlsPlayableSegments,
     reconcileHlsPreloadHints: reconcileHlsPreloadHints,
     mergeSegmentState: mergeSegmentState,
@@ -10007,8 +15151,10 @@
     _ensureTsTransmuxer: NativeHlsProvider.prototype._ensureTsTransmuxer,
     _transmuxTsSegment: NativeHlsProvider.prototype._transmuxTsSegment,
     _jumpSmallGap: NativeHlsProvider.prototype._jumpSmallGap,
+    _jumpManifestGap: NativeHlsProvider.prototype._jumpManifestGap,
     reportStall: NativeHlsProvider.prototype.reportStall,
     chooseVariant: NativeHlsProvider.prototype.chooseVariant,
+    _switchVariant: NativeHlsProvider.prototype._switchVariant,
     getVariantTracks: NativeHlsProvider.prototype.getVariantTracks,
     selectVariantTrack: NativeHlsProvider.prototype.selectVariantTrack,
     _flushPendingVariantSwitch: NativeHlsProvider.prototype._flushPendingVariantSwitch,
@@ -10028,6 +15174,7 @@
     commitSeek: NativeHlsProvider.prototype.commitSeek,
     cancelSeek: NativeHlsProvider.prototype.cancelSeek,
     endSeek: NativeHlsProvider.prototype.endSeek,
+    _completeSeekBuffer: NativeHlsProvider.prototype._completeSeekBuffer,
     _onSeek: NativeHlsProvider.prototype._onSeek,
     _clampSeekTarget: NativeHlsProvider.prototype._clampSeekTarget,
     _seekBufferGoal: NativeHlsProvider.prototype._seekBufferGoal,
@@ -10041,8 +15188,18 @@
     _abortRequests: NativeHlsProvider.prototype._abortRequests,
     getStats: NativeHlsProvider.prototype.getStats
   };
+  window.NativePlayerSourceBufferForTest = {
+    append: appendBuffer,
+    clear: clearSourceBuffer,
+    reset: resetSourceBuffer,
+    removeBefore: removeBufferBefore,
+    removeAfter: removeBufferAfter,
+    removeRange: removeBufferRange
+  };
   window.NativeTsTransmuxerForTest = {
     demuxMpegTs: demuxMpegTs,
-    FirstPartyTsTransmuxerAdapter: FirstPartyTsTransmuxerAdapter
+    FirstPartyTsTransmuxerAdapter: FirstPartyTsTransmuxerAdapter,
+    normalizeHlsTsDemuxTimestamps: normalizeHlsTsDemuxTimestamps,
+    prepareHlsTsTransmuxContext: prepareHlsTsTransmuxContext
   };
 })();

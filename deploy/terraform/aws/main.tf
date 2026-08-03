@@ -11,7 +11,6 @@
 #   - 1x web server (t3.medium: 2 vCPU, 4GB RAM)
 #   - 1x extraction worker (t3.large: 2 vCPU, 8GB RAM)
 #   - 1x database server (t3.medium: 2 vCPU, 4GB RAM) running PostgreSQL + Redis
-#   - 1x storage server (t3.medium: 2 vCPU, 4GB RAM) running MinIO
 #   - VPC with private subnet
 #   - Security groups restricting access
 #   - EBS volumes for persistent data
@@ -229,7 +228,7 @@ resource "aws_security_group" "worker" {
 
 resource "aws_security_group" "internal" {
   name_prefix = "myyoutube-internal-"
-  description = "Internal services (DB, Redis, MinIO) security group"
+  description = "Internal database and Redis security group"
   vpc_id      = aws_vpc.main.id
 
   # SSH from admin
@@ -257,24 +256,6 @@ resource "aws_security_group" "internal" {
     to_port     = 6379
     protocol    = "tcp"
     cidr_blocks = ["10.0.0.0/16"]
-  }
-
-  # MinIO API from VPC
-  ingress {
-    description = "MinIO API"
-    from_port   = 9000
-    to_port     = 9000
-    protocol    = "tcp"
-    cidr_blocks = ["10.0.0.0/16"]
-  }
-
-  # MinIO Console from admin only
-  ingress {
-    description = "MinIO Console"
-    from_port   = 9001
-    to_port     = 9001
-    protocol    = "tcp"
-    cidr_blocks = var.ssh_allowed_ips
   }
 
   egress {
@@ -412,76 +393,6 @@ resource "aws_instance" "database" {
   }
 }
 
-resource "aws_instance" "storage" {
-  ami                    = data.aws_ami.ubuntu.id
-  instance_type          = var.storage_instance_type
-  key_name               = aws_key_pair.deploy.key_name
-  subnet_id              = aws_subnet.private.id
-  vpc_security_group_ids = [aws_security_group.internal.id]
-  private_ip             = "10.0.2.40"
-
-  root_block_device {
-    volume_size = 20
-    volume_type = "gp3"
-  }
-
-  user_data = <<-EOT
-    #!/bin/bash
-    set -e
-    apt-get update
-
-    # Install MinIO
-    curl -L https://dl.min.io/server/minio/release/linux-amd64/minio -o /usr/local/bin/minio
-    chmod +x /usr/local/bin/minio
-
-    # Install MinIO client
-    curl -L https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-    chmod +x /usr/local/bin/mc
-
-    # Create minio user and data directory
-    useradd -r -m -s /bin/false minio
-    mkdir -p /data/minio
-    chown minio:minio /data/minio
-
-    # Systemd service for MinIO
-    cat > /etc/systemd/system/minio.service << 'UNIT'
-    [Unit]
-    Description=MinIO Object Storage
-    After=network.target
-
-    [Service]
-    Type=simple
-    User=minio
-    Group=minio
-    ExecStart=/usr/local/bin/minio server /data/minio --address ":9000" --console-address ":9001"
-    Environment=MINIO_ROOT_USER=${var.s3_access_key}
-    Environment=MINIO_ROOT_PASSWORD=${var.s3_secret_key}
-    Restart=always
-    RestartSec=5
-    LimitNOFILE=65535
-
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
-
-    systemctl daemon-reload
-    systemctl enable --now minio
-
-    # Wait for MinIO to start, then create bucket
-    sleep 5
-    mc alias set local http://localhost:9000 ${var.s3_access_key} ${var.s3_secret_key}
-    mc mb --ignore-existing local/myyoutube
-
-    echo "Storage server provisioned."
-  EOT
-
-  tags = {
-    Name = "myyoutube-storage"
-    App  = "myyoutube"
-    Role = "storage"
-  }
-}
-
 # --- EBS Volumes (persistent storage) ---
 
 resource "aws_ebs_volume" "db_data" {
@@ -499,23 +410,6 @@ resource "aws_volume_attachment" "db_data" {
   device_name = "/dev/xvdf"
   volume_id   = aws_ebs_volume.db_data.id
   instance_id = aws_instance.database.id
-}
-
-resource "aws_ebs_volume" "minio_data" {
-  availability_zone = var.availability_zone
-  size              = var.storage_volume_size
-  type              = "gp3"
-
-  tags = {
-    Name = "myyoutube-minio-data"
-    App  = "myyoutube"
-  }
-}
-
-resource "aws_volume_attachment" "minio_data" {
-  device_name = "/dev/xvdg"
-  volume_id   = aws_ebs_volume.minio_data.id
-  instance_id = aws_instance.storage.id
 }
 
 # --- Elastic IP for Web Server ---

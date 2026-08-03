@@ -19,10 +19,19 @@
                 </div>
               </div>
             </a>
+            <% if (dl.status === 'complete') { %>
+              <button class="offline-prepare" type="button">Make available offline</button>
+            <% } %>
             <button class="download-delete" title="Delete">&times;</button>
           </div>
         <% } %>
       </div>
+    <% } %>
+    <% if (prevCursor || nextCursor) { %>
+      <nav class="pagination" aria-label="Download pages">
+        <% if (prevCursor) { %><a href="/downloads?cursor=<%= encodeURIComponent(prevCursor) %>">&larr; Previous</a><% } %>
+        <% if (nextCursor) { %><a href="/downloads?cursor=<%= encodeURIComponent(nextCursor) %>">Next &rarr;</a><% } %>
+      </nav>
     <% } %>
     <script>
     (function() {
@@ -35,10 +44,14 @@
         fetch('/downloads/' + videoId, { method: 'DELETE' }).then(function(r) {
           if (r.ok) {
             card.remove();
-            // Clean up IDB format files
-            if (typeof IDBHelpers !== 'undefined') IDBHelpers.deleteAllForVideo(videoId);
             if (navigator.serviceWorker && navigator.serviceWorker.controller) {
               navigator.serviceWorker.controller.postMessage({ type: 'delete-offline-video', videoId: videoId });
+            } else if (typeof IDBHelpers !== 'undefined') {
+              // Uncontrolled pages still need to remove their durable chunks.
+              IDBHelpers.deleteAllForVideo(videoId);
+            }
+            if (typeof IDBHelpers !== 'undefined' && IDBHelpers.deleteDownloadRecord) {
+              IDBHelpers.deleteDownloadRecord(videoId).catch(function () {});
             }
           }
           // Show empty message if no cards left

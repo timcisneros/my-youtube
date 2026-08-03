@@ -3,63 +3,81 @@
  */
 import db from '../db.js';
 import { cache, withYtSlot, VIDEO_DETAILS_TTL } from './shared.js';
-import { getClientVersion } from '../extractors.js';
+import { readJsonBounded } from '../lib/bounded-fetch.js';
+import { runBoundedSingleFlight } from '../lib/bounded-singleflight.js';
+import { getWatchNextSnapshot } from './watch-next.js';
 
 const inFlightVideoDetails = new Map<string, ReturnType<typeof fetchInitialVideoDetails>>();
+const inFlightEnrichment = new Map<string, Promise<unknown>>();
+const videoDetailsSingleFlight = { name: 'video_details', maxEntries: 500 } as const;
+const videoEnrichmentSingleFlight = { name: 'video_enrichment', maxEntries: 300 } as const;
+const VIDEO_ENRICHMENT_RETRY_MS = Math.max(60_000,
+  Number(process.env.VIDEO_ENRICHMENT_RETRY_MS) || 5 * 60_000);
+const LIVE_VIDEO_DETAILS_TTL_MS = Math.max(30_000,
+  Number(process.env.LIVE_VIDEO_DETAILS_TTL_MS) || 2 * 60_000);
 
 // Get video details via oEmbed (fast, ~100ms) — enough to render page instantly
 async function getVideoDetails(videoId) {
-  const cached = cache.videoDetails.get(videoId);
+  const cached = await cache.videoDetails.getAsync(videoId);
   if (cached && Date.now() < cached.expires) return cached.data;
   // Return stale enriched data rather than re-fetching incomplete oEmbed
   if (cached && cached.data.channelId) return cached.data;
-  const activeRequest = inFlightVideoDetails.get(videoId);
-  if (activeRequest !== undefined) return activeRequest;
+  return runBoundedSingleFlight(
+    inFlightVideoDetails,
+    videoId,
+    () => fetchInitialVideoDetails(videoId),
+    videoDetailsSingleFlight,
+  );
+}
 
-  const request = fetchInitialVideoDetails(videoId);
-  inFlightVideoDetails.set(videoId, request);
-  try {
-    return await request;
-  } finally {
-    if (inFlightVideoDetails.get(videoId) === request) inFlightVideoDetails.delete(videoId);
-  }
+// Cache-only lookup for the critical player document. A cold miss must not
+// start optional oEmbed traffic alongside the playback extraction.
+async function getCachedVideoDetails(videoId) {
+  const cached = await cache.videoDetails.getAsync(videoId);
+  return cached?.data || null;
 }
 
 async function fetchInitialVideoDetails(videoId) {
   let title = '', channelTitle = '', channelId = '';
 
   // oEmbed — fast, gives title + channel name
-  let oembedTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}&format=json`;
-    const oembedCtrl = new AbortController();
-    // Playback is the primary content on /watch. Do not let optional oEmbed
-    // metadata add several seconds to aggregate startup; the watch page fills
-    // richer metadata through /watch/details after the player is initialized.
-    oembedTimer = setTimeout(() => oembedCtrl.abort(), 750);
-    const res = await fetch(oembedUrl, { signal: oembedCtrl.signal, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', 'Referer': '', 'Cookie': '' } });
-    if (res.ok) {
-      const oembed = await res.json();
+    const oembed = await withYtSlot(async () => {
+      const oembedCtrl = new AbortController();
+      // Start the optional metadata deadline after admission; queue time is
+      // bounded separately and must not consume the network response budget.
+      const oembedTimer = setTimeout(() => oembedCtrl.abort(), 750);
+      try {
+        const response = await fetch(oembedUrl, { signal: oembedCtrl.signal, headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', 'Referer': '', 'Cookie': '' } });
+        if (!response.ok) {
+          await response.body?.cancel().catch(() => {});
+          return null;
+        }
+        return await readJsonBounded(response, 256 * 1024, 'oembed-response-too-large');
+      } finally {
+        clearTimeout(oembedTimer);
+      }
+    });
+    if (oembed) {
       title = oembed.title || '';
       channelTitle = oembed.author_name || '';
     }
   } catch {
     // Metadata is optional on the playback path.
-  } finally {
-    if (oembedTimer) clearTimeout(oembedTimer);
   }
 
   // Check DB for live status (persisted from previous extractions)
-  const liveStatus = db.getLiveStatus(videoId) || undefined;
+  const liveStatus = await db.getLiveStatus(videoId) || undefined;
 
   const data = { videoId, title, description: '', channelTitle, channelId, publishedAt: '', viewCount: null, likeCount: null, liveStatus };
   // Short TTL — full details will overwrite when fetched
-  cache.videoDetails.set(videoId, { data, expires: Date.now() + 5 * 60 * 1000 });
+  await cache.videoDetails.setAsync(videoId, { data, expires: Date.now() + 5 * 60 * 1000 });
   return data;
 }
 
 // Populate video details cache from a yt-dlp info object (avoids a second yt-dlp call)
-function cacheVideoDetailsFromInfo(videoId, info) {
+async function cacheVideoDetailsFromInfo(videoId, info) {
   const cached = cache.videoDetails.get(videoId);
   const title = (cached?.data?.title) || info.title || '';
   const channelTitle = (cached?.data?.channelTitle) || info.uploader || '';
@@ -82,148 +100,84 @@ function cacheVideoDetailsFromInfo(videoId, info) {
 
   // Save channel info to DB so the channel page can find it later
   if (channelId && channelTitle) {
-    const existing = db.getChannel(channelId);
+    const existing = await db.getChannel(channelId);
     if (!existing || !existing.title) {
-      db.upsertChannel(channelId, channelTitle, existing?.thumbnail || '');
+      await db.upsertChannel(channelId, channelTitle, existing?.thumbnail || '');
     }
   }
 
   const duration = info.duration || null;
   const liveStatus = info.live_status || (info.is_live ? 'is_live' : 'not_live');
-  if (duration != null) db.setDuration(videoId, duration, liveStatus);
-  else if (liveStatus !== 'not_live') db.setDuration(videoId, 0, liveStatus);
+  if (duration != null) void Promise.resolve(db.setDuration(videoId, duration, liveStatus)).catch(() => {});
+  else if (liveStatus !== 'not_live') void Promise.resolve(db.setDuration(videoId, 0, liveStatus)).catch(() => {});
   const videoTags = info.tags || info.keywords || [];
   if (Array.isArray(videoTags) && videoTags.length > 0) {
-    db.setVideoTags(videoId, videoTags.slice(0, 50));
+    void Promise.resolve(db.setVideoTags(videoId, videoTags.slice(0, 50))).catch(() => {});
   }
   if (description) {
-    db.setVideoDescription(videoId, description.slice(0, 2000));
+    void Promise.resolve(db.setVideoDescription(videoId, description.slice(0, 2000))).catch(() => {});
   }
   const data = { videoId, title, description, channelTitle, channelId, publishedAt, viewCount, likeCount, subscriberCount, duration, liveStatus };
   // Live streams get a short TTL — viewer count changes constantly
-  const ttl = isLive ? 2 * 60 * 1000 : VIDEO_DETAILS_TTL;
-  cache.videoDetails.set(videoId, { data, expires: Date.now() + ttl });
+  const ttl = isLive ? LIVE_VIDEO_DETAILS_TTL_MS : VIDEO_DETAILS_TTL;
+  await cache.videoDetails.setAsync(videoId, { data, expires: Date.now() + ttl });
   return data;
+}
+
+function shouldEnrichVideoDetails(videoData, now = Date.now()) {
+  if (videoData.detailsComplete === true) return false;
+  if (videoData.likeCount != null && videoData.viewCount != null && videoData.publishedAt && videoData.descriptionLinks) return false;
+  const attemptedAt = Number(videoData.enrichmentAttemptedAt) || 0;
+  return attemptedAt === 0 || now - attemptedAt >= VIDEO_ENRICHMENT_RETRY_MS;
 }
 
 // Enrich video details from Innertube next endpoint:
 // - Like count (yt-dlp returns NA for some videos)
 // - Description @handle -> channel ID mappings
 async function enrichFromNext(videoData) {
-  // Skip if already fully enriched
-  if (videoData.likeCount != null && videoData.viewCount != null && videoData.publishedAt && videoData.descriptionLinks) return;
-  return withYtSlot(() => _enrichFromNextInner(videoData));
+  if (!shouldEnrichVideoDetails(videoData)) return;
+  const active = inFlightEnrichment.get(videoData.videoId);
+  if (active !== undefined) {
+    const enriched = await active;
+    if (enriched !== undefined && enriched !== null && typeof enriched === 'object' && enriched !== videoData) {
+      Object.assign(videoData, enriched);
+    }
+    return enriched;
+  }
+  return runBoundedSingleFlight(inFlightEnrichment, videoData.videoId, async () => {
+    const completed = await _enrichFromNextInner(videoData);
+    const now = Date.now();
+    videoData.enrichmentAttemptedAt = now;
+    if (completed) videoData.detailsComplete = true;
+    const isLive = videoData.liveStatus === 'is_live' || videoData.liveStatus === 'is_upcoming';
+    const existing = cache.videoDetails.get(videoData.videoId);
+    const expires = completed
+      ? now + (isLive ? LIVE_VIDEO_DETAILS_TTL_MS : VIDEO_DETAILS_TTL)
+      : Math.max(Number(existing?.expires) || 0, now + VIDEO_ENRICHMENT_RETRY_MS);
+    await cache.videoDetails.setAsync(videoData.videoId, { data: videoData, expires });
+    return videoData;
+  }, videoEnrichmentSingleFlight);
 }
 async function _enrichFromNextInner(videoData) {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 6000);
-    const resp = await fetch('https://www.youtube.com/youtubei/v1/next', {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0' },
-      body: JSON.stringify({
-        videoId: videoData.videoId,
-        context: { client: { clientName: 'WEB', clientVersion: getClientVersion(), hl: 'en' } },
-      }),
-    });
-    if (!resp.ok) { clearTimeout(timer); return; }
-    const data = await resp.json();
-    clearTimeout(timer);
-    const contents = data?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
-    for (const item of contents) {
-      const primary = item.videoPrimaryInfoRenderer;
-      if (primary) {
-        if (!videoData.title) {
-          videoData.title = (primary.title?.runs || []).map((run) => run.text || '').join('') || primary.title?.simpleText || '';
-        }
-        // Like count
-        if (videoData.likeCount == null) {
-          const buttons = primary.videoActions?.menuRenderer?.topLevelButtons || [];
-          for (const btn of buttons) {
-            const likeTitle = btn.segmentedLikeDislikeButtonViewModel?.likeButtonViewModel?.likeButtonViewModel?.toggleButtonViewModel?.toggleButtonViewModel?.defaultButtonViewModel?.buttonViewModel?.title;
-            if (likeTitle != null) {
-              videoData.likeCount = String(likeTitle);
-            }
-          }
-        }
-        // View count
-        if (videoData.viewCount == null) {
-          const vc = primary.viewCount?.videoViewCountRenderer;
-          if (vc?.viewCount?.simpleText) {
-            videoData.viewCount = vc.viewCount.simpleText.replace(/[^\d]/g, '');
-          }
-        }
-        // Published date
-        if (!videoData.publishedAt) {
-          const dateStr = primary.dateText?.simpleText;
-          if (dateStr) {
-            try { videoData.publishedAt = new Date(dateStr).toISOString(); } catch {}
-          }
-        }
-      }
-      // Description and @handle links from structured data
-      const secInfo = item.videoSecondaryInfoRenderer;
-      const desc = secInfo?.attributedDescription;
-      if (desc) {
-        const content = desc.content || '';
-        // Fill description if missing (extraction failed)
-        if (!videoData.description && content) {
-          videoData.description = content.replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, '');
-        }
-        // @handle -> channel ID links
-        if (!videoData.descriptionLinks) {
-          const links = [];
-          for (const run of desc.commandRuns || []) {
-            const browseId = run.onTap?.innertubeCommand?.browseEndpoint?.browseId;
-            if (browseId && browseId.startsWith('UC')) {
-              const text = content.slice(run.startIndex, run.startIndex + run.length);
-              links.push({ text: text.trim().replace(/[\u200B-\u200F\u202A-\u202E\u2060\uFEFF]/g, ''), channelId: browseId });
-            }
-          }
-          videoData.descriptionLinks = links;
-        }
-      }
-      // Fill channel info from owner if missing
-      const owner = secInfo?.owner?.videoOwnerRenderer;
-      if (owner) {
-        if (!videoData.channelId) {
-          videoData.channelId = owner.navigationEndpoint?.browseEndpoint?.browseId || '';
-        }
-        if (!videoData.channelTitle) {
-          videoData.channelTitle = (owner.title?.runs || []).map(r => r.text).join('') || '';
-        }
-        if (videoData.subscriberCount == null) {
-          const subText = owner.subscriberCountText?.simpleText || '';
-          const subMatch = subText.match(/([\d.]+[KMB]?)/);
-          if (subMatch) videoData.subscriberCount = subMatch[1];
-        }
-      }
+    const snapshot = await getWatchNextSnapshot(videoData.videoId);
+    if (!videoData.title) videoData.title = snapshot.title;
+    if (videoData.likeCount == null) videoData.likeCount = snapshot.likeCount;
+    if (videoData.viewCount == null) videoData.viewCount = snapshot.viewCount;
+    if (!videoData.publishedAt) videoData.publishedAt = snapshot.publishedAt;
+    if (!videoData.description && snapshot.description) videoData.description = snapshot.description;
+    if (!videoData.descriptionLinks) videoData.descriptionLinks = snapshot.descriptionLinks.map(link => ({ ...link }));
+    if (!videoData.channelId) videoData.channelId = snapshot.channelId;
+    if (!videoData.channelTitle) videoData.channelTitle = snapshot.channelTitle;
+    if (videoData.subscriberCount == null) videoData.subscriberCount = snapshot.subscriberCount;
+    if (snapshot.relatedVideos.length > 0) {
+      void Promise.resolve(db.upsertRelatedVideos(videoData.videoId, snapshot.relatedVideos)).catch(() => {});
     }
-    // Extract related/suggested videos from sidebar
-    const secondary = data?.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results || [];
-    const relatedVideos: Array<{ videoId: string; title: string; channelTitle: string; channelId: string; publishedText: string }> = [];
-    for (const sItem of secondary) {
-      const r = sItem.compactVideoRenderer;
-      if (!r?.videoId) continue;
-      const chId = r.longBylineText?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId || '';
-      if (!chId) continue;
-      relatedVideos.push({
-        videoId: r.videoId,
-        title: (r.title?.simpleText || (r.title?.runs || []).map((x: { text: string }) => x.text).join('')) || '',
-        channelTitle: (r.longBylineText?.runs || []).map((x: { text: string }) => x.text).join('') || '',
-        channelId: chId,
-        publishedText: r.publishedTimeText?.simpleText || '',
-      });
-    }
-    if (relatedVideos.length > 0) {
-      void Promise.resolve(db.upsertRelatedVideos(videoData.videoId, relatedVideos.slice(0, 20)));
-    }
-
-    cache.videoDetails.set(videoData.videoId, { data: videoData, expires: Date.now() + VIDEO_DETAILS_TTL });
+    return snapshot.detailsFound;
   } catch (err) {
     console.warn('[enrichFromNext] failed for', videoData.videoId, err.message);
+    return false;
   }
 }
 
-export { getVideoDetails, cacheVideoDetailsFromInfo, enrichFromNext };
+export { getVideoDetails, getCachedVideoDetails, cacheVideoDetailsFromInfo, enrichFromNext, shouldEnrichVideoDetails };

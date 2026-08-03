@@ -1,7 +1,13 @@
 import { Router } from 'express';
 import { Readable } from 'stream';
 import { pipeline } from 'stream/promises';
+import { createHash } from 'crypto';
 import { getClientVersion, isYouTubeCdnUrl } from '../extractors.js';
+import { fetchWithBodyTimeout } from '../lib/bounded-fetch.js';
+import { readJsonBounded } from '../lib/bounded-fetch.js';
+import { runBoundedSingleFlight } from '../lib/bounded-singleflight.js';
+import { cache, withYtSlot } from '../youtube/shared.js';
+import { getWatchNextSnapshot } from '../youtube/watch-next.js';
 
 const router = Router();
 
@@ -31,12 +37,31 @@ function escapeHtml(s) {
 }
 
 const INNERTUBE_URL = 'https://www.youtube.com/youtubei/v1/next';
+const COMMENT_CACHE_TTL_MS = 60_000;
+const commentInflight = new Map<string, Promise<unknown>>();
+const commentSingleFlight = { name: 'comments', maxEntries: 300 } as const;
+
+function compactCommentCacheKey(key: string) {
+  return createHash('sha256').update(key).digest('base64url');
+}
 
 function fetchWithTimeout(url: string, opts: RequestInit, ms?: number) {
-  ms = ms || 10000;
-  var c = new AbortController();
-  var t = setTimeout(function () { c.abort(); }, ms);
-  return fetch(url, Object.assign({}, opts, { signal: c.signal })).finally(function () { clearTimeout(t); });
+  const timeoutMs = ms || 10000;
+  return withYtSlot(() => fetchWithBodyTimeout(url, opts, {
+    headerTimeoutMs: timeoutMs,
+    bodyIdleMs: timeoutMs,
+  }));
+}
+
+async function cachedCommentRequest<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const compactKey = compactCommentCacheKey(key);
+  const cached = await cache.comments.getAsync(compactKey);
+  if (cached && Date.now() < cached.expires) return cached.data;
+  return runBoundedSingleFlight(commentInflight as Map<string, Promise<T>>, compactKey, async () => {
+    const data = await fn();
+    cache.comments.set(compactKey, { data, expires: Date.now() + COMMENT_CACHE_TTL_MS });
+    return data;
+  }, commentSingleFlight);
 }
 function getInnertubeContext() {
   return {
@@ -50,57 +75,7 @@ function getInnertubeContext() {
 }
 
 async function getInitialContinuationToken(videoId) {
-  const res = await fetchWithTimeout(INNERTUBE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', 'Referer': '', 'Cookie': '' },
-    body: JSON.stringify({ context: getInnertubeContext(), videoId })
-  });
-  const data = await res.json();
-
-  // Path 1: twoColumnWatchNextResults → itemSectionRenderer with comment-item-section
-  const contents = data?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
-  for (const item of contents) {
-    const section = item.itemSectionRenderer;
-    if (!section) continue;
-    const id = section.sectionIdentifier || section.targetId || '';
-    if (id.includes('comment')) {
-      for (const sub of section.contents || []) {
-        if (sub.continuationItemRenderer) {
-          const token = sub.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token;
-          if (token) return token;
-        }
-      }
-    }
-  }
-
-  // Path 2: any itemSectionRenderer with a continuationItemRenderer (fallback)
-  for (const item of contents) {
-    const section = item.itemSectionRenderer;
-    if (!section) continue;
-    for (const sub of section.contents || []) {
-      if (sub.continuationItemRenderer) {
-        const token = sub.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token;
-        if (token) return token;
-      }
-    }
-  }
-
-  // Path 3: engagementPanels (mobile/alternate layout)
-  const panels = data?.engagementPanels || [];
-  for (const panel of panels) {
-    const ep = panel.engagementPanelSectionListRenderer;
-    if (!ep) continue;
-    const panelId = ep.panelIdentifier || '';
-    if (!panelId.includes('comment')) continue;
-    const continuation = ep.content?.sectionListRenderer?.contents?.[0]
-      ?.itemSectionRenderer?.contents?.[0]?.continuationItemRenderer;
-    if (continuation) {
-      const token = continuation.continuationEndpoint?.continuationCommand?.token;
-      if (token) return token;
-    }
-  }
-
-  return null;
+  return (await getWatchNextSnapshot(videoId)).commentContinuation;
 }
 
 function parseCommentItems(continuationItems, mutations) {
@@ -247,7 +222,11 @@ async function fetchReplies(token) {
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', 'Referer': '', 'Cookie': '' },
     body: JSON.stringify({ context: getInnertubeContext(), continuation: token })
   });
-  const data = await res.json();
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`YouTube replies returned ${res.status}`);
+  }
+  const data = await readJsonBounded(res, 4 * 1024 * 1024, 'replies-response-too-large');
   const endpoints = data?.onResponseReceivedEndpoints || [];
   let allItems = [];
   for (const ep of endpoints) {
@@ -260,13 +239,19 @@ async function fetchReplies(token) {
   return parseReplyItems(allItems, mutations);
 }
 
-async function fetchCommentsContinuation(token) {
+async function fetchCommentsContinuation(token, hop = 0, seen = new Set<string>()) {
+  if (hop >= 3 || seen.has(token)) return { comments: [], nextPageToken: null };
+  seen.add(token);
   const res = await fetchWithTimeout(INNERTUBE_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', 'Referer': '', 'Cookie': '' },
     body: JSON.stringify({ context: getInnertubeContext(), continuation: token })
   });
-  const data = await res.json();
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`YouTube comments returned ${res.status}`);
+  }
+  const data = await readJsonBounded(res, 4 * 1024 * 1024, 'comments-response-too-large');
   const endpoints = data?.onResponseReceivedEndpoints || [];
   let allItems = [];
   for (const ep of endpoints) {
@@ -280,7 +265,7 @@ async function fetchCommentsContinuation(token) {
       if (item.continuationItemRenderer) {
         const nextToken = item.continuationItemRenderer.continuationEndpoint?.continuationCommand?.token
           || item.continuationItemRenderer.button?.buttonRenderer?.command?.continuationCommand?.token;
-        if (nextToken) return fetchCommentsContinuation(nextToken);
+        if (nextToken) return fetchCommentsContinuation(nextToken, hop + 1, seen);
       }
     }
   }
@@ -292,17 +277,20 @@ async function fetchCommentsContinuation(token) {
 }
 
 async function getComments(videoId, pageToken) {
-  if (pageToken) return fetchCommentsContinuation(pageToken);
-  const token = await getInitialContinuationToken(videoId);
-  if (!token) return { comments: [], nextPageToken: null };
-  return fetchCommentsContinuation(token);
+  const key = pageToken ? `page:${pageToken}` : `video:${videoId}`;
+  return cachedCommentRequest(key, async () => {
+    if (pageToken) return fetchCommentsContinuation(pageToken);
+    const token = await getInitialContinuationToken(videoId);
+    if (!token) return { comments: [], nextPageToken: null };
+    return fetchCommentsContinuation(token);
+  });
 }
 
 router.get('/replies', async (req, res) => {
   try {
-    const token = req.query.token;
-    if (!token) return res.status(400).json({ error: 'Missing token' });
-    const result = await fetchReplies(token);
+    const token = typeof req.query.token === 'string' ? req.query.token : '';
+    if (!token || token.length > 4096) return res.status(400).json({ error: 'Missing or invalid token' });
+    const result = await cachedCommentRequest(`replies:${token}`, () => fetchReplies(token));
     res.json(result);
   } catch (err) {
     console.error('Replies error:', err.message);
@@ -312,7 +300,11 @@ router.get('/replies', async (req, res) => {
 
 router.get('/:videoId', async (req, res) => {
   try {
-    const data = await getComments(req.params.videoId, req.query.pageToken);
+    if (!/^[A-Za-z0-9_-]{11}$/.test(req.params.videoId)) return res.status(400).json({ error: 'Invalid video ID' });
+    const pageToken = typeof req.query.pageToken === 'string' && req.query.pageToken.length <= 4096
+      ? req.query.pageToken
+      : '';
+    const data = await getComments(req.params.videoId, pageToken);
     res.json(data);
   } catch (err) {
     console.error('Comments error:', err.code || '', err.errors?.[0]?.reason || '', err.message);
@@ -327,7 +319,7 @@ router.get('/avatar/:encoded', async (req, res) => {
     if (!isYouTubeCdnUrl(url)) {
       return res.status(400).end();
     }
-    const upstream = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', Referer: '', Cookie: '' } });
+    const upstream = await fetchWithBodyTimeout(url, { headers: { 'User-Agent': 'Mozilla/5.0', 'Accept-Language': '*', Referer: '', Cookie: '' } }, { headerTimeoutMs: 8000, bodyIdleMs: 8000 });
     if (!upstream.ok) return res.status(upstream.status).end();
     const ct = upstream.headers.get('content-type');
     if (ct) res.set('Content-Type', ct);

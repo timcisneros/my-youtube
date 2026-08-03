@@ -40,7 +40,7 @@ if (cliUsers.length > 0) {
   // Without raw SQL access, we check a few common patterns
   const candidates = ['admin', 'user', 'default', 'demo', 'test'];
   for (const uid of candidates) {
-    const watches = db.getAllWatchTimesForUser(uid);
+    const watches = await db.getAllWatchTimesForUser(uid);
     if (watches.length >= MIN_WATCHES) userIds.push(uid);
   }
   // Also check the subscriptions table for any user IDs
@@ -60,7 +60,7 @@ if (userIds.length === 0) {
 const results: UserResult[] = [];
 
 for (const userId of userIds) {
-  const allWatches = db.getAllWatchTimesForUser(userId)
+  const allWatches = (await db.getAllWatchTimesForUser(userId))
     .filter(wt => wt.duration > 0 && (wt.last_position === 0 || wt.last_position / wt.duration > 0.3))
     .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
 
@@ -76,17 +76,17 @@ for (const userId of userIds) {
   }));
 
   try {
-    db.runInSavepoint(() => {
+    await db.runInSavepoint(async () => {
       // Temporarily zero out held-out watches
       for (const wt of holdout) {
-        db.setWatchTime(userId, wt.video_id, 0, 0);
+        await db.setWatchTime(userId, wt.video_id, 0, 0);
       }
 
       // Clear explore cache so algorithm runs fresh
       cache.exploreVideos.delete(userId);
 
       // Run the algorithm
-      const result = getExploreVideos(userId, undefined, evalConfig);
+      const result = await getExploreVideos(userId, undefined, evalConfig);
       const recommendedIds = result.videos.map(v => v.videoId);
 
       // Check hits at different depths
@@ -115,7 +115,7 @@ for (const userId of userIds) {
     } else {
       // Unexpected error — restore data manually just in case
       for (const orig of originalData) {
-        db.setWatchTime(userId, orig.videoId, orig.position, orig.duration);
+        await db.setWatchTime(userId, orig.videoId, orig.position, orig.duration);
       }
       console.error(`Error evaluating user ${userId}:`, e);
     }
